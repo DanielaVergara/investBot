@@ -396,7 +396,7 @@ def test_valuation_adobe_regression(adobe_fixtures):
     balance_sheets = adobe_fixtures["balance_sheet"]
     quote = adobe_fixtures["quote"][0]
     profile = adobe_fixtures["profile"][0]
-    peers_metrics_ttm = adobe_fixtures["peers_metrics_ttm"]
+    peers_metrics = adobe_fixtures["peers_metrics"]
 
     # Orden cronológico (FMP entrega más reciente primero -> se invierte)
     eps_historial = [s["eps"] for s in reversed(income_statements)]
@@ -408,11 +408,12 @@ def test_valuation_adobe_regression(adobe_fixtures):
     eps_ttm = income_statements[0]["eps"]
     shares_outstanding = income_statements[0]["weightedAverageShsOutDil"]
 
-    # PER de cada peer derivado de earningsYieldTTM (1/earningsYieldTTM) — la
-    # API stable de FMP ya no expone `pe` directo (ver peers.get_peer_pe_average).
+    # PER de cada peer derivado de earningsYield (1/earningsYield, /key-metrics
+    # anual) — la API stable de FMP ya no expone `pe` directo, y
+    # /key-metrics-ttm es de pago en el plan gratuito (ver peers.get_peer_pe_average).
     per_promedio_peers = sum(
-        1 / v[0]["earningsYieldTTM"] for v in peers_metrics_ttm.values()
-    ) / len(peers_metrics_ttm)
+        1 / v[0]["earningsYield"] for v in peers_metrics.values()
+    ) / len(peers_metrics)
 
     y = 0.044  # FRED DGS20 fixture: 4.40% -> 0.044 decimal
 

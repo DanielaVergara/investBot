@@ -25,8 +25,8 @@ def _adobe_router(adobe_fixtures):
         symbol = request.url.params.get("symbol")
         if path == "/stable/quote":
             return httpx.Response(200, json=adobe_fixtures["quote"])
-        if path == "/stable/key-metrics-ttm":
-            peer_data = adobe_fixtures["peers_metrics_ttm"].get(symbol)
+        if path == "/stable/key-metrics":
+            peer_data = adobe_fixtures["peers_metrics"].get(symbol)
             if peer_data:
                 return httpx.Response(200, json=peer_data)
             return httpx.Response(200, json=[])

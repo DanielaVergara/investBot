@@ -111,17 +111,19 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
     per_result = rules.calculate_per(precio_actual, eps_ttm)
     ps = rules.calculate_ps(market_cap, revenue)
 
-    # Peers (Decisión #9, PER derivado de key-metrics-ttm tras migración a stable)
+    # Peers (Decisión #9, PER derivado de key-metrics anual — key-metrics-ttm
+    # es un endpoint de pago en el plan gratuito actual de FMP, ver peers.py)
     async def _get_metrics_for_peer(peer_ticker: str) -> Optional[dict]:
         try:
-            return await fmp_client.get_key_metrics_ttm(
-                clients.fmp_http, clients.fmp_api_key, peer_ticker
+            data = await fmp_client.get_key_metrics(
+                clients.fmp_http, clients.fmp_api_key, peer_ticker, limit=1
             )
         except fmp_client.FMPError:
             return None
+        return data[0] if data else None
 
     peer_result = await peers.get_peer_pe_average(
-        get_key_metrics_ttm_fn=_get_metrics_for_peer, sector=sector, own_ticker=ticker
+        get_peer_metrics_fn=_get_metrics_for_peer, sector=sector, own_ticker=ticker
     )
 
     # Y (Decisión #7 revisada)

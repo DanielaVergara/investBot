@@ -189,22 +189,3 @@ async def get_key_metrics(
     return data if isinstance(data, list) else []
 
 
-async def get_key_metrics_ttm(
-    client: httpx.AsyncClient, api_key: str, ticker: str
-) -> Optional[dict]:
-    """Key metrics TTM — usado solo para el PER de peers (Decisión #9 revisada
-    tras la migración a la API stable). A diferencia de `/key-metrics` (anual,
-    marketCap del cierre del año fiscal), `earningsYieldTTM` acá se calcula con
-    el marketCap actual (verificado: coincide con el de `/quote` en vivo), así
-    que `1 / earningsYieldTTM` da un PER trailing comparable al que daba el
-    campo `pe` de la API legacy — con una sola llamada por peer, mismo
-    presupuesto de requests que antes."""
-    data = await _get(
-        client,
-        "/key-metrics-ttm",
-        {"symbol": ticker, "apikey": api_key},
-        endpoint_label="/key-metrics-ttm",
-    )
-    if isinstance(data, list) and data:
-        return data[0]
-    return None

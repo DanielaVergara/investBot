@@ -205,26 +205,3 @@ async def test_get_profile_y_key_metrics():
     client2 = _client_with_handler(handler2)
     metrics = await fmp_client.get_key_metrics(client2, "test-key", "ADBE")
     assert metrics[0]["roe"] == 0.5
-
-
-async def test_get_key_metrics_ttm_devuelve_primer_elemento():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["symbol"] = request.url.params.get("symbol")
-        return httpx.Response(200, json=[{"earningsYieldTTM": 0.025}])
-
-    client = _client_with_handler(handler)
-    metrics = await fmp_client.get_key_metrics_ttm(client, "test-key", "MSFT")
-    assert captured["path"] == "/stable/key-metrics-ttm"
-    assert captured["symbol"] == "MSFT"
-    assert metrics["earningsYieldTTM"] == 0.025
-
-
-async def test_get_key_metrics_ttm_lista_vacia_devuelve_none():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=[])
-
-    client = _client_with_handler(handler)
-    assert await fmp_client.get_key_metrics_ttm(client, "test-key", "NOPE") is None
