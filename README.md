@@ -22,6 +22,14 @@ degradado", un único diseño calculado con datos crudos gratuitos.
 
 **Límite del plan gratuito: 250 requests/día.**
 
+**Base URL: la API "stable" de FMP (`https://financialmodelingprep.com/stable/...`,
+ticker vía query param `symbol=`).** La API legacy (`/api/v3/...`, ticker en
+el path) fue discontinuada por FMP para cuentas creadas después del
+31/08/2025 — verificado en el despliegue real con una key nueva (cualquier
+llamada a `/api/v3/...` devuelve `"Legacy Endpoint"`, no es un problema de key
+inválida). El migrado a `stable` no cambia el diseño ni el presupuesto de
+requests, solo la forma de la URL.
+
 Endpoints de datos crudos usados (todos gratuitos):
 - `/quote`
 - `/profile` (sector, beta, market cap)
@@ -29,7 +37,8 @@ Endpoints de datos crudos usados (todos gratuitos):
 - `/balance-sheet-statement` (anual)
 - `/cash-flow-statement` (anual)
 - `/key-metrics`
-- `/search` (resolución nombre → ticker)
+- `/key-metrics-ttm` (solo para el PER de peers — ver más abajo)
+- `/search-symbol` (resolución nombre → ticker)
 
 **Nunca se depende de** `/dcf`, `/sector-pe-ratio` ni `/treasury-rates`
 (endpoints precalculados del tier pago/premium, disponibilidad gratuita no
@@ -37,7 +46,10 @@ verificada). En su lugar:
 - El PER promedio "de sector" se aproxima con un **set fijo de 3-5 peers
   hardcodeados por sector** (`src/investbot/peers.py`), documentado en cada
   respuesta como "PER promedio de un set fijo de comparables, no del sector
-  completo".
+  completo". La API stable ya no expone un campo `pe` directo en `/quote`
+  (deprecado junto con la API legacy) — el PER de cada peer se deriva como
+  `1 / earningsYieldTTM` desde `/key-metrics-ttm` (misma 1 llamada por peer
+  que antes, mismo presupuesto de requests).
 - El DCF se calcula internamente (proyección de FCF + WACC simplificado +
   valor terminal por perpetuidad de Gordon Growth), sin llamar a `/dcf`.
 - La tasa libre de riesgo (Y) **no viene de FMP** — ver siguiente sección.
@@ -48,7 +60,7 @@ verificada). En su lugar:
 |---|---|---|
 | Datos propios del ticker | 6 | `/quote`, `/profile`, `/income-statement`, `/balance-sheet-statement`, `/cash-flow-statement`, `/key-metrics` |
 | Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | `/search` |
-| Peers para el modelo de Múltiplos | 3-5 | `/quote` por peer |
+| Peers para el modelo de Múltiplos | 3-5 | `/key-metrics-ttm` por peer |
 | **Total por consulta completa** | **9-12** | |
 
 Con 250 requests/día, el bot soporta **entre ~20 y ~27 consultas completas de
@@ -197,8 +209,8 @@ src/investbot/
   security.py        filtro global de chat_id, rate-limit en memoria
   onboarding.py       ConversationHandler de 8 preguntas + scoring de perfil
   query_handler.py    handler de texto libre, orquesta todo el análisis
-  fmp_client.py        wrapper HTTP a FMP (solo endpoints gratuitos)
-  peers.py             set fijo de peers por sector + promedio de PER
+  fmp_client.py        wrapper HTTP a FMP stable (solo endpoints gratuitos)
+  peers.py             set fijo de peers por sector + promedio de PER (vía key-metrics-ttm)
   treasury_client.py   FRED (DGS20) + fallback Treasury.gov
   rules.py              ratios financieros + pilares de buena empresa
   valuation.py           motor propio de valoración (3 modelos + promedio parcial)

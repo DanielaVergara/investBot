@@ -1,0 +1,5 @@
+{
+  "MSFT": [{"symbol": "MSFT", "earningsYieldTTM": 0.03333333333333333}],
+  "ORCL": [{"symbol": "ORCL", "earningsYieldTTM": 0.030303030303030304}],
+  "CRM": [{"symbol": "CRM", "earningsYieldTTM": 0.028011204481792717}]
+}

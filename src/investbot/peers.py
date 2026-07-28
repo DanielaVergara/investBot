@@ -43,28 +43,33 @@ def get_peers_for_sector(sector: str, own_ticker: str) -> list[str]:
 
 async def get_peer_pe_average(
     *,
-    get_quote_fn: Callable[[str], Awaitable[Optional[dict]]],
+    get_key_metrics_ttm_fn: Callable[[str], Awaitable[Optional[dict]]],
     sector: str,
     own_ticker: str,
 ) -> PeerAverageResult:
-    """Promedia el PER (`pe`) de los peers del sector, excluyendo al propio ticker.
+    """Promedia el PER de los peers del sector, excluyendo al propio ticker.
 
-    `get_quote_fn` es una función inyectada (normalmente
-    `fmp_client.get_quote` parcialmente aplicada con el cliente HTTP y la API
-    key) que devuelve el dict de `/quote` para un ticker, o `None` si falló —
-    los peers con error o sin campo `pe` numérico se excluyen del promedio
-    sin abortar la consulta completa.
+    `get_key_metrics_ttm_fn` es una función inyectada (normalmente
+    `fmp_client.get_key_metrics_ttm` parcialmente aplicada con el cliente HTTP
+    y la API key) que devuelve el dict de `/key-metrics-ttm` para un ticker, o
+    `None` si falló. La API stable de FMP ya no expone un campo `pe` directo en
+    `/quote` (deprecado junto con la API legacy) — el PER se deriva como
+    `1 / earningsYieldTTM`, que usa el market cap actual (no el de cierre del
+    último año fiscal, a diferencia de `/key-metrics` sin TTM). Los peers con
+    error, sin `earningsYieldTTM` numérico, o con `earningsYieldTTM` <= 0
+    (utilidades negativas o nulas) se excluyen del promedio sin abortar la
+    consulta completa.
     """
     peers = get_peers_for_sector(sector, own_ticker)
     pes: list[float] = []
     usados: list[str] = []
     for peer in peers:
-        quote = await get_quote_fn(peer)
-        if not quote:
+        metrics = await get_key_metrics_ttm_fn(peer)
+        if not metrics:
             continue
-        pe = quote.get("pe")
-        if isinstance(pe, (int, float)) and pe > 0:
-            pes.append(float(pe))
+        earnings_yield = metrics.get("earningsYieldTTM")
+        if isinstance(earnings_yield, (int, float)) and earnings_yield > 0:
+            pes.append(1.0 / float(earnings_yield))
             usados.append(peer)
     if not pes:
         return PeerAverageResult(per_promedio=None, peers_usados=[])

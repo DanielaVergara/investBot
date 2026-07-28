@@ -29,7 +29,10 @@ Todos dentro de la tolerancia ±1% exigida por `qa`.
 
 - `EPS_TTM = 20.00` (año fiscal más reciente), historial de 5 años
   `[13.84, 15.17, 16.63, 18.23, 20.00]` → CAGR (`g`) ≈ 9.64%.
-- `PER promedio de peers = 32.9` (peers sintéticos con PE 30.0/33.0/35.7).
+- `PER promedio de peers = 32.9` (peers sintéticos con PE 30.0/33.0/35.7,
+  expresado en `peers_metrics_ttm.json` como `earningsYieldTTM` = 1/PE — la
+  API stable de FMP ya no expone `pe` directo en `/quote`, ver
+  `fmp_client.get_key_metrics_ttm`/`peers.get_peer_pe_average`).
   → Múltiplos = 20.00 × 32.9 = 658.00.
 - `Y = 0.044` (4.4%, plausible para el rendimiento del bono del tesoro EEUU a
   20 años) → Graham = 20.00 × (8.5 + 2×9.64) × 4.4 / 4.4 ≈ 555.64.
@@ -45,3 +48,14 @@ Todos dentro de la tolerancia ±1% exigida por `qa`.
 **Antes de ir a producción real**, este fixture debe reemplazarse por una
 captura real de FMP/FRED con una API key válida — queda documentado como
 pendiente explícito (ver reporte de cierre de `implementer`).
+
+**Actualización 2026-07-28:** al desplegar en el VPS con una key real se
+confirmó que la API legacy (`/api/v3/...`) fue discontinuada por FMP para
+cuentas nuevas — el bot migró a la API "stable" (`/stable/...`, ticker vía
+`symbol=`). Los **nombres de campo** de este fixture (`totalCurrentAssets`,
+`operatingCashFlow`, `capitalExpenditure`, `eps`, `netIncome`,
+`earningsYieldTTM`, etc.) se verificaron contra respuestas reales de
+`/stable/quote`, `/profile`, `/income-statement`, `/balance-sheet-statement`,
+`/cash-flow-statement` y `/key-metrics-ttm` para AAPL — siguen siendo
+sintéticos en sus **valores** (siguen reproduciendo el caso Adobe de la spec),
+pero la **forma** del JSON ya no es hipotética.

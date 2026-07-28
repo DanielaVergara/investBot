@@ -1,8 +1,13 @@
 """Wrapper HTTP a Financial Modeling Prep — solo endpoints gratuitos.
 
+Usa la API "stable" de FMP (`/stable/...`, ticker como query param `symbol=`)
+— la API legacy (`/api/v3/...`, ticker en el path) fue discontinuada por FMP
+para cuentas creadas después del 31/08/2025 (verificado con una key real
+durante el despliegue, error "Legacy Endpoint" en cualquier llamada a v3).
+
 `/quote`, `/income-statement`, `/balance-sheet-statement`, `/cash-flow-statement`,
-`/key-metrics`, `/profile`, `/search`. Nunca usa `/dcf`, `/sector-pe-ratio` ni
-`/treasury-rates` (Decisión de diseño #8).
+`/key-metrics`, `/key-metrics-ttm`, `/profile`, `/search-symbol`. Nunca usa
+`/dcf`, `/sector-pe-ratio` ni `/treasury-rates` (Decisión de diseño #8).
 
 Cumple los criterios de `security` (sección 2 y 3):
 - El cliente HTTP (`httpx.AsyncClient`) se recibe **inyectado**, nunca
@@ -25,7 +30,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://financialmodelingprep.com/api/v3"
+BASE_URL = "https://financialmodelingprep.com/stable"
 DEFAULT_TIMEOUT = 10.0
 
 
@@ -81,9 +86,9 @@ async def search_company(
     """Resolución nombre/ticker → lista de coincidencias (Decisión de diseño #2)."""
     data = await _get(
         client,
-        "/search",
+        "/search-symbol",
         {"query": query, "limit": limit, "apikey": api_key},
-        endpoint_label="/search",
+        endpoint_label="/search-symbol",
     )
     return data if isinstance(data, list) else []
 
@@ -92,7 +97,10 @@ async def get_quote(
     client: httpx.AsyncClient, api_key: str, ticker: str
 ) -> Optional[dict]:
     data = await _get(
-        client, f"/quote/{ticker}", {"apikey": api_key}, endpoint_label="/quote"
+        client,
+        "/quote",
+        {"symbol": ticker, "apikey": api_key},
+        endpoint_label="/quote",
     )
     if isinstance(data, list) and data:
         return data[0]
@@ -103,7 +111,10 @@ async def get_profile(
     client: httpx.AsyncClient, api_key: str, ticker: str
 ) -> Optional[dict]:
     data = await _get(
-        client, f"/profile/{ticker}", {"apikey": api_key}, endpoint_label="/profile"
+        client,
+        "/profile",
+        {"symbol": ticker, "apikey": api_key},
+        endpoint_label="/profile",
     )
     if isinstance(data, list) and data:
         return data[0]
@@ -120,8 +131,8 @@ async def get_income_statement(
 ) -> list[dict]:
     data = await _get(
         client,
-        f"/income-statement/{ticker}",
-        {"period": period, "limit": limit, "apikey": api_key},
+        "/income-statement",
+        {"symbol": ticker, "period": period, "limit": limit, "apikey": api_key},
         endpoint_label="/income-statement",
     )
     return data if isinstance(data, list) else []
@@ -137,8 +148,8 @@ async def get_balance_sheet_statement(
 ) -> list[dict]:
     data = await _get(
         client,
-        f"/balance-sheet-statement/{ticker}",
-        {"period": period, "limit": limit, "apikey": api_key},
+        "/balance-sheet-statement",
+        {"symbol": ticker, "period": period, "limit": limit, "apikey": api_key},
         endpoint_label="/balance-sheet-statement",
     )
     return data if isinstance(data, list) else []
@@ -154,8 +165,8 @@ async def get_cash_flow_statement(
 ) -> list[dict]:
     data = await _get(
         client,
-        f"/cash-flow-statement/{ticker}",
-        {"period": period, "limit": limit, "apikey": api_key},
+        "/cash-flow-statement",
+        {"symbol": ticker, "period": period, "limit": limit, "apikey": api_key},
         endpoint_label="/cash-flow-statement",
     )
     return data if isinstance(data, list) else []
@@ -171,8 +182,29 @@ async def get_key_metrics(
 ) -> list[dict]:
     data = await _get(
         client,
-        f"/key-metrics/{ticker}",
-        {"period": period, "limit": limit, "apikey": api_key},
+        "/key-metrics",
+        {"symbol": ticker, "period": period, "limit": limit, "apikey": api_key},
         endpoint_label="/key-metrics",
     )
     return data if isinstance(data, list) else []
+
+
+async def get_key_metrics_ttm(
+    client: httpx.AsyncClient, api_key: str, ticker: str
+) -> Optional[dict]:
+    """Key metrics TTM — usado solo para el PER de peers (Decisión #9 revisada
+    tras la migración a la API stable). A diferencia de `/key-metrics` (anual,
+    marketCap del cierre del año fiscal), `earningsYieldTTM` acá se calcula con
+    el marketCap actual (verificado: coincide con el de `/quote` en vivo), así
+    que `1 / earningsYieldTTM` da un PER trailing comparable al que daba el
+    campo `pe` de la API legacy — con una sola llamada por peer, mismo
+    presupuesto de requests que antes."""
+    data = await _get(
+        client,
+        "/key-metrics-ttm",
+        {"symbol": ticker, "apikey": api_key},
+        endpoint_label="/key-metrics-ttm",
+    )
+    if isinstance(data, list) and data:
+        return data[0]
+    return None

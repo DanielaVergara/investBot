@@ -30,7 +30,7 @@ def adobe_fixtures():
         "income_statement": load_fixture("adobe", "income_statement.json"),
         "balance_sheet": load_fixture("adobe", "balance_sheet.json"),
         "cash_flow": load_fixture("adobe", "cash_flow.json"),
-        "peers_quotes": load_fixture("adobe", "peers_quotes.json"),
+        "peers_metrics_ttm": load_fixture("adobe", "peers_metrics_ttm.json"),
         "fred_dgs20": load_fixture("adobe", "fred_dgs20.json"),
     }
 

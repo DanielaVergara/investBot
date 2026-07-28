@@ -22,23 +22,23 @@ ALLOWED_CHAT_ID = 555
 def _adobe_router(adobe_fixtures):
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if "/quote/" in path:
-            symbol = path.rsplit("/", 1)[-1]
-            if symbol == "ADBE":
-                return httpx.Response(200, json=adobe_fixtures["quote"])
-            peer_data = adobe_fixtures["peers_quotes"].get(symbol)
+        symbol = request.url.params.get("symbol")
+        if path == "/stable/quote":
+            return httpx.Response(200, json=adobe_fixtures["quote"])
+        if path == "/stable/key-metrics-ttm":
+            peer_data = adobe_fixtures["peers_metrics_ttm"].get(symbol)
             if peer_data:
                 return httpx.Response(200, json=peer_data)
             return httpx.Response(200, json=[])
-        if "/profile/" in path:
+        if path == "/stable/profile":
             return httpx.Response(200, json=adobe_fixtures["profile"])
-        if "/income-statement/" in path:
+        if path == "/stable/income-statement":
             return httpx.Response(200, json=adobe_fixtures["income_statement"])
-        if "/balance-sheet-statement/" in path:
+        if path == "/stable/balance-sheet-statement":
             return httpx.Response(200, json=adobe_fixtures["balance_sheet"])
-        if "/cash-flow-statement/" in path:
+        if path == "/stable/cash-flow-statement":
             return httpx.Response(200, json=adobe_fixtures["cash_flow"])
-        if "/search" in path:
+        if path == "/stable/search-symbol":
             return httpx.Response(
                 200, json=[{"symbol": "ADBE", "name": "Adobe Inc."}]
             )
