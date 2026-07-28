@@ -1,0 +1,18 @@
+# InvestBot — desarrollo local.
+# Sin puertos publicados (long polling, Decisión de diseño #1) y sin Traefik.
+
+services:
+  investbot-bot:
+    build: .
+    container_name: investbot-bot-dev
+    env_file:
+      - .env
+    volumes:
+      - investbot_data_dev:/data
+      # Bind mount de código para iterar sin rebuild en dev (opcional; comentar
+      # si se prefiere el snapshot de la imagen).
+      - ./src:/app/src:ro
+    restart: unless-stopped
+
+volumes:
+  investbot_data_dev:

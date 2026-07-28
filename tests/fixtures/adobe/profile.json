@@ -1,0 +1,13 @@
+[
+  {
+    "symbol": "ADBE",
+    "companyName": "Adobe Inc.",
+    "sector": "Technology",
+    "industry": "Software - Infrastructure",
+    "beta": 1.1,
+    "price": 333.00,
+    "mktCap": 153180000000,
+    "currency": "USD",
+    "exchangeShortName": "NASDAQ"
+  }
+]

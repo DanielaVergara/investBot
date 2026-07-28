@@ -1,0 +1,31 @@
+# InvestBot — producción (VPS compartido con FoodMindAI, servicio Docker
+# separado, sin red ni base de datos compartida).
+#
+# Sin Traefik, sin puertos publicados — long polling saliente únicamente
+# (Decisión de diseño #1). Límites de memoria/CPU para no afectar la
+# disponibilidad de FoodMindAI en el mismo VPS (criterio de `security`,
+# sección 5).
+
+services:
+  investbot-bot:
+    build: .
+    image: investbot-bot:latest
+    container_name: investbot-bot
+    env_file:
+      - .env
+    volumes:
+      - investbot_data:/data
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Sin `ports:` — no expone ningún puerto público (long polling saliente).
+    # Sin `networks:` compartida con FoodMindAI — red por defecto de este
+    # proyecto Compose únicamente.
+
+volumes:
+  investbot_data:

@@ -1,0 +1,205 @@
+"""Tests de `fmp_client.py` — cliente HTTP inyectado, sin red real.
+
+Usa `httpx.MockTransport` para simular respuestas de FMP. Ningún test toca
+`financialmodelingprep.com` de verdad.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from investbot import fmp_client
+
+SECRET_KEY = "SECRETO123"
+
+
+def _client_with_handler(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_search_company_usa_params_no_fstring(adobe_fixtures):
+    """Verifica que la key/query viajan como params (nunca concatenados en la URL)."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["query_param"] = request.url.params.get("query")
+        return httpx.Response(200, json=[{"symbol": "ADBE", "name": "Adobe Inc."}])
+
+    client = _client_with_handler(handler)
+    result = await fmp_client.search_company(client, "test-key", "Adobe")
+    assert result[0]["symbol"] == "ADBE"
+    assert captured["query_param"] == "Adobe"
+    assert "apikey=test-key" in captured["url"]  # httpx lo agrega vía params=, url-encoded
+
+
+async def test_get_quote_devuelve_primer_elemento(adobe_fixtures):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=adobe_fixtures["quote"])
+
+    client = _client_with_handler(handler)
+    quote = await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert quote["symbol"] == "ADBE"
+    assert quote["price"] == 333.00
+
+
+async def test_get_quote_lista_vacia_devuelve_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = _client_with_handler(handler)
+    assert await fmp_client.get_quote(client, "test-key", "NOPE") is None
+
+
+async def test_search_company_sin_resultados():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = _client_with_handler(handler)
+    result = await fmp_client.search_company(client, "test-key", "asdfasdfasdf")
+    assert result == []
+
+
+async def test_search_company_multiples_resultados():
+    matches = [
+        {"symbol": "AAPL", "name": "Apple Inc."},
+        {"symbol": "APLE", "name": "Apple Hospitality REIT"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=matches)
+
+    client = _client_with_handler(handler)
+    result = await fmp_client.search_company(client, "test-key", "Apple")
+    assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Manejo de errores HTTP — nunca propaga la excepción cruda de httpx
+# ---------------------------------------------------------------------------
+
+
+async def test_error_401_no_filtra_api_key():
+    """Criterio de `security` sección 3: una respuesta 401 con la key en la
+    URL mockeada no debe dejar la key en el mensaje de la excepción ni en
+    ningún log."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert SECRET_KEY in str(request.url)  # confirma que la key sí viaja en la request
+        return httpx.Response(401, json={"error": "Invalid API key"})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, SECRET_KEY, "ADBE")
+
+    assert SECRET_KEY not in str(exc_info.value)
+
+
+async def test_error_401_no_filtra_api_key_en_logs(caplog):
+    import logging
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "Invalid API key"})
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(fmp_client.FMPError):
+            await fmp_client.get_quote(client, SECRET_KEY, "ADBE")
+
+    assert SECRET_KEY not in caplog.text
+
+
+async def test_error_429_rate_limit_mensaje_claro():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "Limit reached"})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert "cupo diario" in str(exc_info.value)
+
+
+async def test_error_5xx_mensaje_generico():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert "500" in str(exc_info.value)
+
+
+async def test_timeout_traducido_a_fmp_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("timed out", request=request)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert "no respondió a tiempo" in str(exc_info.value)
+
+
+async def test_connect_error_traducido_a_fmp_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert "No pude conectarme" in str(exc_info.value)
+
+
+async def test_respuesta_no_json_traducido_a_fmp_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json")
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError):
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+
+
+async def test_income_statement_llama_endpoint_correcto():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["period"] = request.url.params.get("period")
+        return httpx.Response(200, json=[{"eps": 20.0}])
+
+    client = _client_with_handler(handler)
+    await fmp_client.get_income_statement(client, "test-key", "ADBE")
+    assert "/income-statement/ADBE" in captured["path"]
+    assert captured["period"] == "annual"
+
+
+async def test_balance_sheet_y_cash_flow_devuelven_listas():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"totalCurrentAssets": 100}])
+
+    client = _client_with_handler(handler)
+    balance = await fmp_client.get_balance_sheet_statement(client, "test-key", "ADBE")
+    assert balance[0]["totalCurrentAssets"] == 100
+
+    def handler2(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"operatingCashFlow": 100}])
+
+    client2 = _client_with_handler(handler2)
+    cash_flow = await fmp_client.get_cash_flow_statement(client2, "test-key", "ADBE")
+    assert cash_flow[0]["operatingCashFlow"] == 100
+
+
+async def test_get_profile_y_key_metrics():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"sector": "Technology"}])
+
+    client = _client_with_handler(handler)
+    profile = await fmp_client.get_profile(client, "test-key", "ADBE")
+    assert profile["sector"] == "Technology"
+
+    def handler2(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"roe": 0.5}])
+
+    client2 = _client_with_handler(handler2)
+    metrics = await fmp_client.get_key_metrics(client2, "test-key", "ADBE")
+    assert metrics[0]["roe"] == 0.5

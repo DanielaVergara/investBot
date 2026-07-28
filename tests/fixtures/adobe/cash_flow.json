@@ -1,0 +1,37 @@
+[
+  {
+    "date": "2025-11-28",
+    "symbol": "ADBE",
+    "period": "FY",
+    "operatingCashFlow": 9200000000,
+    "capitalExpenditure": -1200000000
+  },
+  {
+    "date": "2024-11-29",
+    "symbol": "ADBE",
+    "period": "FY",
+    "operatingCashFlow": 8518518518,
+    "capitalExpenditure": -1111111111
+  },
+  {
+    "date": "2023-12-01",
+    "symbol": "ADBE",
+    "period": "FY",
+    "operatingCashFlow": 7887517146,
+    "capitalExpenditure": -1028806584
+  },
+  {
+    "date": "2022-12-02",
+    "symbol": "ADBE",
+    "period": "FY",
+    "operatingCashFlow": 7303256617,
+    "capitalExpenditure": -952598689
+  },
+  {
+    "date": "2021-12-03",
+    "symbol": "ADBE",
+    "period": "FY",
+    "operatingCashFlow": 6762274645,
+    "capitalExpenditure": -882035823
+  }
+]

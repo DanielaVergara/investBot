@@ -1,0 +1,8 @@
+[
+  {"symbol": "AAPL", "name": "Apple Inc.", "currency": "USD", "stockExchange": "NASDAQ", "exchangeShortName": "NASDAQ"},
+  {"symbol": "APLE", "name": "Apple Hospitality REIT, Inc.", "currency": "USD", "stockExchange": "NYSE", "exchangeShortName": "NYSE"},
+  {"symbol": "APLD", "name": "Applied Digital Corporation", "currency": "USD", "stockExchange": "NASDAQ", "exchangeShortName": "NASDAQ"},
+  {"symbol": "APLM", "name": "Apollomics Inc.", "currency": "USD", "stockExchange": "NASDAQ", "exchangeShortName": "NASDAQ"},
+  {"symbol": "APLT", "name": "Applied UV, Inc.", "currency": "USD", "stockExchange": "NASDAQ", "exchangeShortName": "NASDAQ"},
+  {"symbol": "APLE2", "name": "Apple Related Co (ejemplo, 6ta coincidencia — debe descartarse)", "currency": "USD", "stockExchange": "NYSE", "exchangeShortName": "NYSE"}
+]

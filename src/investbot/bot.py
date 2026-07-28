@@ -1,0 +1,124 @@
+"""Entrypoint — `Application` en modo long polling (Decisión de diseño #1).
+
+Sin webhook, sin puerto expuesto, sin ruta en Traefik. El proceso falla al
+arrancar (fail-closed) si `TELEGRAM_ALLOWED_CHAT_ID` no está seteada o no es
+un entero válido — ver `security.get_allowed_chat_id()`.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+import httpx
+from telegram import Update
+from telegram.error import Conflict
+from telegram.ext import Application, TypeHandler
+
+from investbot import db, onboarding, query_handler, security
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    """Loggers de httpx/httpcore/telegram fijados a WARNING en producción
+    (criterio de `security`, sección 2) — nunca DEBUG/INFO por defecto, porque
+    filtrarían el token de Telegram (va en el path de la URL) y las API keys
+    de FMP/FRED (van como query param) en texto plano.
+    """
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    for noisy_logger in ("httpx", "httpcore", "telegram"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+
+async def _on_error(update: object, context) -> None:
+    error = context.error
+    if isinstance(error, Conflict):
+        security.log_conflict_error(logger)
+        return
+    logger.exception("Error no manejado procesando un update", exc_info=error)
+
+
+def build_application(
+    *,
+    telegram_token: str,
+    allowed_chat_id: int,
+    db_path: str,
+    fmp_api_key: str,
+    fred_api_key: str | None,
+) -> Application:
+    application = Application.builder().token(telegram_token).build()
+
+    def get_conn():
+        return db.get_connection(db_path)
+
+    # Handler global de máxima prioridad — cubre TODOS los tipos de update
+    # (mensajes, callback_query, etc.) antes de que lleguen a cualquier otro
+    # handler (criterio de `security`, sección 1).
+    application.add_handler(
+        TypeHandler(Update, security.build_chat_id_gate(allowed_chat_id)), group=-1
+    )
+
+    application.add_handler(onboarding.build_onboarding_handler(get_conn))
+
+    fmp_http = httpx.AsyncClient()
+    fred_http = httpx.AsyncClient()
+    treasury_gov_http = httpx.AsyncClient()
+    clients = query_handler.Clients(
+        fmp_http=fmp_http,
+        fred_http=fred_http,
+        treasury_gov_http=treasury_gov_http,
+        fmp_api_key=fmp_api_key,
+        fred_api_key=fred_api_key,
+    )
+    rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
+    for handler in query_handler.build_query_handlers(get_conn, clients, rate_limiter):
+        application.add_handler(handler)
+
+    application.add_error_handler(_on_error)
+
+    return application
+
+
+def main() -> None:
+    configure_logging()
+
+    # Fail-closed: si esto lanza, el proceso termina con traceback + exit != 0.
+    allowed_chat_id = security.get_allowed_chat_id()
+
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not telegram_token:
+        logger.error("TELEGRAM_BOT_TOKEN no está seteada. Abortando.")
+        sys.exit(1)
+
+    fmp_api_key = os.environ.get("FMP_API_KEY")
+    if not fmp_api_key:
+        logger.error("FMP_API_KEY no está seteada. Abortando.")
+        sys.exit(1)
+
+    fred_api_key = os.environ.get("FRED_API_KEY")
+    db_path = os.environ.get("INVESTBOT_DB_PATH", "/data/investbot.db")
+
+    conn = db.get_connection(db_path)
+    db.init_db(conn)
+    conn.close()
+
+    application = build_application(
+        telegram_token=telegram_token,
+        allowed_chat_id=allowed_chat_id,
+        db_path=db_path,
+        fmp_api_key=fmp_api_key,
+        fred_api_key=fred_api_key,
+    )
+
+    logger.info("InvestBot arrancando en modo long polling (chat_id=%s)", allowed_chat_id)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

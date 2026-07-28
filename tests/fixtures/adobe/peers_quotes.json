@@ -1,0 +1,5 @@
+{
+  "MSFT": [{"symbol": "MSFT", "name": "Microsoft Corporation", "price": 410.0, "pe": 30.0}],
+  "ORCL": [{"symbol": "ORCL", "name": "Oracle Corporation", "price": 155.0, "pe": 33.0}],
+  "CRM": [{"symbol": "CRM", "name": "Salesforce, Inc.", "price": 270.0, "pe": 35.7}]
+}
