@@ -64,9 +64,10 @@ lugar:
 | Datos propios del ticker | 6 | `/quote`, `/profile`, `/income-statement`, `/balance-sheet-statement`, `/cash-flow-statement`, `/key-metrics` |
 | Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | `/search` |
 | Peers para el modelo de Múltiplos | 3-5 | `/key-metrics` (anual) por peer |
-| **Total por consulta completa** | **9-12** | |
+| Contexto de mercado (VIX, no depende del ticker consultado) | 1 | `/quote (symbol=^VIX)` |
+| **Total por consulta completa** | **10-13** | |
 
-Con 250 requests/día, el bot soporta **entre ~20 y ~27 consultas completas de
+Con 250 requests/día, el bot soporta **entre ~19 y ~25 consultas completas de
 empresa por día** — muy por encima del uso esperado de un solo usuario con
 consultas esporádicas. No hay caché ni rate-limit adicional a nivel de
 aplicación más allá de un límite defensivo de 10 consultas/minuto (protección
