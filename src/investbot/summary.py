@@ -74,6 +74,12 @@ _MODELOS_ORDEN = [
     ("dcf", "valor_justo_dcf"),
 ]
 
+_MODELO_FORMULAS = {
+    "multiplos": "EPS (TTM) × PER promedio/mínimo/máximo de los peers del sector",
+    "graham": "EPS (TTM) × (8.5 + 2×g) × 4.4 / Y, con g = CAGR histórico de EPS",
+    "dcf": "proyección de Flujo de Caja Libre a 5 años + valor terminal, descontados al WACC",
+}
+
 
 def _fmt_money(value: float) -> str:
     return f"${value:,.2f}"
@@ -117,6 +123,9 @@ def build_valuation_scenarios_section(
             f"- {modelo_label}: {_cell(pesimista, campo)} | "
             f"{_cell(conservador, campo)} | {_cell(optimista, campo)}"
         )
+        formula = _MODELO_FORMULAS.get(modelo_key)
+        if formula:
+            lines.append(f"  _(fórmula: {formula})_")
         for escenario_nombre, escenario in (
             ("Pesimista", pesimista),
             ("Conservador", conservador),
@@ -322,19 +331,31 @@ def build_summary(
 
     ratios_lines = ["*Ratios clave:*"]
     if ratios.get("ratio_liquidez") is not None:
-        ratios_lines.append(f"- Liquidez: {ratios['ratio_liquidez']:.2f} (según la foto)")
+        ratios_lines.append(
+            f"- Liquidez: {ratios['ratio_liquidez']:.2f} (según la foto)"
+            " _(fórmula: Activos Circulantes / Pasivos Circulantes)_"
+        )
     elif ratios.get("liquidez_sin_pasivos_circulantes"):
         ratios_lines.append("- Liquidez: sin deuda de corto plazo — señal muy positiva")
     if ratios.get("margen_bruto") is not None:
-        ratios_lines.append(f"- Margen bruto: {ratios['margen_bruto']*100:.1f}%")
+        ratios_lines.append(
+            f"- Margen bruto: {ratios['margen_bruto']*100:.1f}%"
+            " _(fórmula: (Ventas − Costo de Ventas) / Ventas)_"
+        )
     if ratios.get("per") is not None:
-        ratios_lines.append(f"- PER: {ratios['per']:.2f}")
+        ratios_lines.append(
+            f"- PER: {ratios['per']:.2f}"
+            " _(fórmula: Precio de la Acción / EPS)_"
+        )
     elif ratios.get("per_no_aplicable"):
         ratios_lines.append(
             "- PER: no aplica (EPS negativo o cero) — mirá el P/S como referencia"
         )
     if ratios.get("ps") is not None:
-        ratios_lines.append(f"- P/S (Precio-Ventas): {ratios['ps']:.2f}")
+        ratios_lines.append(
+            f"- P/S (Precio-Ventas): {ratios['ps']:.2f}"
+            " _(fórmula: Capitalización de Mercado / Ventas Totales)_"
+        )
 
     valuation_section = build_valuation_scenarios_section(
         scenarios, precio_actual, n_peers_validos
@@ -346,6 +367,8 @@ def build_summary(
     risk_section = build_risk_fit_section(risk_fit)
 
     transparency_lines = [
+        "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
+        "obtenidos de Financial Modeling Prep (FMP)._",
         f"_Nota de transparencia: {peers_note}_",
     ]
     if treasury_source:
