@@ -22,7 +22,17 @@ import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
-from investbot import db, fmp_client, peers, risk_fit, rules, summary, treasury_client, valuation
+from investbot import (
+    db,
+    fmp_client,
+    market_context,
+    peers,
+    risk_fit,
+    rules,
+    summary,
+    treasury_client,
+    valuation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,28 +168,54 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
         "market_cap": market_cap or 0.0,
     }
 
-    valuation_result = valuation.compute_valuation(
+    # Spec Patch Iter-3: 3 escenarios (Pesimista/Conservador/Optimista) de los
+    # 3 modelos, reutilizando exactamente los mismos datos ya resueltos
+    # arriba — ninguna llamada HTTP adicional. `scenarios.conservador` es
+    # campo a campo idéntico a lo que devolvía `compute_valuation(...)` antes
+    # de este patch (sigue existiendo sin cambios, pero ya no hace falta
+    # llamarla aparte: sería recalcular lo mismo).
+    scenarios = valuation.compute_valuation_scenarios(
         eps_ttm=eps_ttm,
         eps_historial=eps_historial,
-        per_promedio_peers=peer_result.per_promedio,
+        peer_average=peer_result,
         fcf_historial=fcf_historial,
         y=y_value,
         wacc_inputs=wacc_inputs,
         shares_outstanding=shares_outstanding or 0.0,
     )
+    conservador = scenarios.conservador
 
     pillars = rules.evaluate_pillars(
         revenue_historial=revenue_historial,
         net_income_historial=net_income_historial,
         liquidity=liquidity,
         barata=(
-            precio_actual < valuation_result.valor_justo_total
-            if valuation_result.valor_justo_total is not None
+            precio_actual < conservador.valor_justo_total
+            if conservador.valor_justo_total is not None
             else None
         ),
     )
 
     risk_fit_result = risk_fit.evaluate_risk_fit(beta, perfil)
+
+    # Contexto de mercado (Spec Patch Iter-3, sección 6) — cero llamadas HTTP
+    # nuevas: momentum usa campos ya presentes en `quote` (ya obtenido
+    # arriba); la comparación con peers reutiliza `peer_result` (ya
+    # calculado arriba para el modelo de Múltiplos).
+    momentum_result = market_context.calculate_momentum(
+        price=precio_actual or 0.0,
+        year_high=quote.get("yearHigh"),
+        year_low=quote.get("yearLow"),
+        price_avg_50=quote.get("priceAvg50"),
+        price_avg_200=quote.get("priceAvg200"),
+    )
+    peer_comparison_result = market_context.compare_to_peers(
+        per_propio=per_result.per,
+        per_minimo_peers=peer_result.per_minimo,
+        per_promedio_peers=peer_result.per_promedio,
+        per_maximo_peers=peer_result.per_maximo,
+        peers_usados=peer_result.peers_usados,
+    )
 
     ratios_dict = {
         "ratio_liquidez": liquidity.ratio_liquidez,
@@ -201,6 +237,22 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
         "beta": risk_fit_result.beta,
         "etiqueta_activo": risk_fit_result.etiqueta_activo,
     }
+    momentum_dict = {
+        "pct_vs_year_high": momentum_result.pct_vs_year_high,
+        "pct_vs_year_low": momentum_result.pct_vs_year_low,
+        "pct_vs_avg_50": momentum_result.pct_vs_avg_50,
+        "pct_vs_avg_200": momentum_result.pct_vs_avg_200,
+        "etiqueta": momentum_result.etiqueta,
+    }
+    peer_comparison_dict = {
+        "per_propio": peer_comparison_result.per_propio,
+        "per_minimo_peers": peer_comparison_result.per_minimo_peers,
+        "per_promedio_peers": peer_comparison_result.per_promedio_peers,
+        "per_maximo_peers": peer_comparison_result.per_maximo_peers,
+        "peers_usados": peer_comparison_result.peers_usados,
+        "posicion": peer_comparison_result.posicion,
+        "motivo_no_comparable": peer_comparison_result.motivo_no_comparable,
+    }
 
     return summary.build_summary(
         ticker=ticker,
@@ -208,7 +260,10 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
         precio_actual=precio_actual or 0.0,
         ratios=ratios_dict,
         pillars=pillars_dict,
-        valuation=valuation_result.as_dict(),
+        scenarios=scenarios.as_dict(),
+        n_peers_validos=len(peer_result.peers_usados),
+        momentum=momentum_dict,
+        peer_comparison=peer_comparison_dict,
         risk_fit=risk_fit_dict,
         treasury_source=treasury_source,
     )

@@ -41,6 +41,13 @@ TERMINAL_GROWTH_RATE = 0.025  # 2.5% — supuesto explícito de largo plazo (per
 DCF_PROJECTION_YEARS = 5
 CAGR_MIN_N_AÑOS = 2  # piso B2: al menos 3 registros anuales (n_años = registros - 1)
 
+# Spec Patch [Iter-3], sección 1 — desplazamientos absolutos (puntos porcentuales
+# en fracción decimal) para los escenarios Pesimista/Optimista alrededor del
+# escenario Conservador. Constantes documentadas, ajustables sin que sea una
+# "regresión" de un criterio verde (mismo tratamiento que MARKET_RISK_PREMIUM).
+DELTA_G = 0.03  # ±3pp — Graham (g) y g_fcf del DCF
+DELTA_WACC = 0.01  # ±1pp — WACC del DCF
+
 
 def calculate_cagr(
     valor_reciente: float, valor_antiguo: float, n_años: int
@@ -95,6 +102,14 @@ def calculate_graham_fair_value(
 
     B4: `None` si `eps_ttm <= 0`. B1: `None` si `g` es `None` (CAGR no
     calculable) o si `y <= 0` (tasa libre de riesgo inválida/no disponible).
+
+    Guarda (Spec Patch Iter-3, sección 1 — cierra un hueco preexistente de
+    Iter-2/B1): si el multiplicador `(8.5 + 2×g_pct) <= 0`, se devuelve `None`
+    en vez de un "valor justo" negativo o cero sin sentido de negocio. Con `g`
+    muy negativo (empresa con EPS fuertemente decreciente) esto puede ocurrir
+    incluso en el escenario conservador — la guarda aplica por igual, sin
+    distinguir escenario, motivo por el cual vive aquí y no en
+    `compute_valuation_scenarios`.
     """
     if eps_ttm is None or eps_ttm <= 0:
         return None
@@ -105,6 +120,8 @@ def calculate_graham_fair_value(
     g_pct = g * 100
     y_pct = y * 100
     multiplicador = 8.5 + 2 * g_pct
+    if multiplicador <= 0:
+        return None
     return eps_ttm * multiplicador * GRAHAM_HISTORICAL_YIELD / y_pct
 
 
@@ -171,6 +188,7 @@ def calculate_dcf_fair_value(
     shares_outstanding: float,
     terminal_growth: float = TERMINAL_GROWTH_RATE,
     years: int = DCF_PROJECTION_YEARS,
+    g_fcf_override: Optional[float] = None,
 ) -> Optional[float]:
     """DCF por acción: proyección de FCF a `years` + valor terminal (Gordon Growth).
 
@@ -178,6 +196,11 @@ def calculate_dcf_fair_value(
     orden que `/cash-flow-statement`). El CAGR propio de FCF se calcula
     internamente con `calculate_cagr()` (misma guarda B1/B2) — si no es
     calculable, el modelo completo devuelve `None` (excluido del promedio).
+
+    `g_fcf_override` (Spec Patch Iter-3, sección 1): si se provee, se usa este
+    valor de `g_fcf` en vez de recalcularlo desde `fcf_historial` — permite a
+    `compute_valuation_scenarios` desplazar el crecimiento proyectado
+    (`g_fcf ∓ DELTA_G`) sin triplicar la lógica de proyección/descuento.
     """
     if not fcf_historial or len(fcf_historial) < CAGR_MIN_N_AÑOS + 1:
         return None
@@ -193,9 +216,12 @@ def calculate_dcf_fair_value(
     fcf_antiguo = fcf_historial[0]
     n_años = len(fcf_historial) - 1
 
-    g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años)
-    if g_fcf is None:
-        return None
+    if g_fcf_override is not None:
+        g_fcf = g_fcf_override
+    else:
+        g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años)
+        if g_fcf is None:
+            return None
 
     fcf_proyectado = []
     fcf = fcf_reciente
@@ -294,6 +320,14 @@ def compute_valuation(
             result.modelos_excluidos.append(ModeloExcluido("graham", "y_no_disponible"))
         else:
             result.valor_justo_graham = calculate_graham_fair_value(eps_ttm, g_eps, y)
+            if result.valor_justo_graham is None:
+                # Guarda de multiplicador (Spec Patch Iter-3, sección 1): g_eps,
+                # y y eps_ttm ya son válidos aquí — el único motivo restante por
+                # el que `calculate_graham_fair_value` puede devolver `None` es
+                # `(8.5 + 2×g_pct) <= 0`.
+                result.modelos_excluidos.append(
+                    ModeloExcluido("graham", "graham_multiplicador_no_positivo")
+                )
 
     # --- DCF ---
     n_años_fcf = len(fcf_historial) - 1 if fcf_historial else 0
@@ -330,6 +364,218 @@ def compute_valuation(
     result.valor_justo_total = sum(valores) / len(valores) if valores else None
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Spec Patch [Iter-3] — escenarios Pesimista/Conservador/Optimista + [Iter-4]
+# (C1-C3). `compute_valuation(...)` arriba no cambia — sigue siendo,
+# conceptualmente, el escenario conservador; estas funciones son la capa
+# nueva que reutiliza sus mismos bloques de cálculo con parámetros
+# desplazados (sin triplicar lógica de negocio, criterio de `qa` Iter-1
+# sección 6).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScenarioValuationResult:
+    valor_justo_multiplos: Optional[float] = None
+    valor_justo_graham: Optional[float] = None
+    valor_justo_dcf: Optional[float] = None
+    valor_justo_total: Optional[float] = None
+    modelos_excluidos: list[ModeloExcluido] = field(default_factory=list)  # nivel 1 + nivel 2
+
+    def as_dict(self) -> dict:
+        return {
+            "valor_justo_multiplos": self.valor_justo_multiplos,
+            "valor_justo_graham": self.valor_justo_graham,
+            "valor_justo_dcf": self.valor_justo_dcf,
+            "valor_justo_total": self.valor_justo_total,
+            "modelos_excluidos": [
+                {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos
+            ],
+        }
+
+
+@dataclass
+class ValuationScenarios:
+    pesimista: ScenarioValuationResult
+    conservador: ScenarioValuationResult  # idéntico, campo a campo, a compute_valuation()
+    optimista: ScenarioValuationResult
+    modelos_excluidos_base: list[ModeloExcluido] = field(default_factory=list)  # solo nivel 1
+
+    def as_dict(self) -> dict:
+        return {
+            "pesimista": self.pesimista.as_dict(),
+            "conservador": self.conservador.as_dict(),
+            "optimista": self.optimista.as_dict(),
+            "modelos_excluidos_base": [
+                {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos_base
+            ],
+        }
+
+
+def classify_scenario(
+    precio_actual: float, valor_justo_total: Optional[float]
+) -> Optional[bool]:
+    """`True` = barata (precio < valor justo), `False` = cara, `None` = no
+    determinable (`valor_justo_total` es `None` en ese escenario — los 3
+    modelos quedaron excluidos justo en ese escenario). Función pura, sin I/O
+    (Spec Patch Iter-3, sección 3)."""
+    if valor_justo_total is None:
+        return None
+    return precio_actual < valor_justo_total
+
+
+def compute_valuation_scenarios(
+    *,
+    eps_ttm: float,
+    eps_historial: list[float],
+    peer_average,  # peers.PeerAverageResult — no se importa el tipo para evitar ciclo de import
+    fcf_historial: list[float],
+    y: Optional[float],
+    wacc_inputs: dict,
+    shares_outstanding: float,
+    delta_g: float = DELTA_G,
+    delta_wacc: float = DELTA_WACC,
+) -> ValuationScenarios:
+    """Calcula los 3 escenarios (Pesimista/Conservador/Optimista) de los 3
+    modelos (Spec Patch Iter-3, secciones 1-2).
+
+    Recibe `peer_average` (`peers.PeerAverageResult` completo, con
+    `per_minimo`/`per_promedio`/`per_maximo`) en vez de 3 floats sueltos —
+    aclaración de implementación sobre el hueco de firma que dejó abierto
+    `qa` en su revisión de Iter-3 (sección 4).
+
+    Dos niveles de exclusión (sección 2 del patch):
+    - Nivel 1 (`modelos_excluidos_base`): dato de entrada inválido
+      independientemente del escenario (EPS TTM<=0, historial insuficiente,
+      Y no disponible, market_cap<=0, 0 peers con PER válido) — igual en los
+      3 escenarios, reportado una sola vez.
+    - Nivel 2 (dentro de `ScenarioValuationResult.modelos_excluidos` de cada
+      escenario): el dato de base es válido, pero el desplazamiento
+      pesimista/optimista empuja un valor intermedio fuera de rango
+      matemáticamente válido (guarda de multiplicador de Graham, o
+      `wacc <= terminal_growth` en el DCF).
+
+    El escenario conservador usa exactamente los mismos parámetros que
+    `compute_valuation(...)` — por diseño, produce un resultado campo a campo
+    idéntico.
+    """
+    eps_no_positivo = eps_ttm is None or eps_ttm <= 0
+
+    # --- Nivel 1: Múltiplos ---
+    if eps_no_positivo:
+        nivel1_multiplos = ModeloExcluido("multiplos", "eps_ttm_no_positivo")
+    elif peer_average.per_promedio is None:
+        nivel1_multiplos = ModeloExcluido("multiplos", "per_peers_no_disponible")
+    else:
+        nivel1_multiplos = None
+    multiplos_valido = nivel1_multiplos is None
+
+    # --- Nivel 1: Graham (depende del CAGR de EPS, "g") ---
+    n_años_eps = len(eps_historial) - 1 if eps_historial else 0
+    eps_antiguo = eps_historial[0] if eps_historial else None
+    eps_reciente = eps_historial[-1] if eps_historial else None
+    g_eps = calculate_cagr(eps_reciente, eps_antiguo, n_años_eps)
+
+    if eps_no_positivo:
+        nivel1_graham = ModeloExcluido("graham", "eps_ttm_no_positivo")
+    elif g_eps is None:
+        motivo = _motivo_cagr_invalido(eps_reciente, eps_antiguo, n_años_eps, "eps")
+        nivel1_graham = ModeloExcluido("graham", motivo)
+    elif y is None or y <= 0:
+        nivel1_graham = ModeloExcluido("graham", "y_no_disponible")
+    else:
+        nivel1_graham = None
+    graham_valido = nivel1_graham is None
+
+    # --- Nivel 1: DCF (depende del CAGR de FCF y del WACC conservador) ---
+    n_años_fcf = len(fcf_historial) - 1 if fcf_historial else 0
+    fcf_antiguo = fcf_historial[0] if fcf_historial else None
+    fcf_reciente = fcf_historial[-1] if fcf_historial else None
+    g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años_fcf)
+    wacc_conservador = calculate_wacc(y=y or 0.0, **wacc_inputs) if y is not None else None
+
+    if g_fcf is None:
+        motivo = _motivo_cagr_invalido(fcf_reciente, fcf_antiguo, n_años_fcf, "fcf")
+        nivel1_dcf = ModeloExcluido("dcf", motivo)
+    elif wacc_conservador is None:
+        nivel1_dcf = ModeloExcluido("dcf", "wacc_no_calculable")
+    else:
+        nivel1_dcf = None
+    dcf_valido = nivel1_dcf is None
+
+    modelos_excluidos_base = [
+        m for m in (nivel1_multiplos, nivel1_graham, nivel1_dcf) if m is not None
+    ]
+
+    def _escenario(
+        per_peers: Optional[float], g_delta: float, wacc_delta: float
+    ) -> ScenarioValuationResult:
+        scenario = ScenarioValuationResult()
+
+        # --- Múltiplos ---
+        if not multiplos_valido:
+            scenario.modelos_excluidos.append(nivel1_multiplos)
+        else:
+            scenario.valor_justo_multiplos = calculate_multiplos_fair_value(
+                eps_ttm, per_peers
+            )
+            if scenario.valor_justo_multiplos is None:  # pragma: no cover - defensivo
+                scenario.modelos_excluidos.append(
+                    ModeloExcluido("multiplos", "per_peers_no_disponible")
+                )
+
+        # --- Graham ---
+        if not graham_valido:
+            scenario.modelos_excluidos.append(nivel1_graham)
+        else:
+            g_escenario = g_eps + g_delta
+            scenario.valor_justo_graham = calculate_graham_fair_value(
+                eps_ttm, g_escenario, y
+            )
+            if scenario.valor_justo_graham is None:
+                scenario.modelos_excluidos.append(
+                    ModeloExcluido("graham", "graham_multiplicador_no_positivo")
+                )
+
+        # --- DCF ---
+        if not dcf_valido:
+            scenario.modelos_excluidos.append(nivel1_dcf)
+        else:
+            wacc_escenario = wacc_conservador + wacc_delta
+            g_fcf_escenario = g_fcf + g_delta
+            scenario.valor_justo_dcf = calculate_dcf_fair_value(
+                fcf_historial=fcf_historial,
+                wacc=wacc_escenario,
+                shares_outstanding=shares_outstanding,
+                g_fcf_override=g_fcf_escenario,
+            )
+            if scenario.valor_justo_dcf is None:
+                scenario.modelos_excluidos.append(ModeloExcluido("dcf", "dcf_no_calculable"))
+
+        valores = [
+            v
+            for v in (
+                scenario.valor_justo_multiplos,
+                scenario.valor_justo_graham,
+                scenario.valor_justo_dcf,
+            )
+            if v is not None
+        ]
+        scenario.valor_justo_total = sum(valores) / len(valores) if valores else None
+        return scenario
+
+    pesimista = _escenario(peer_average.per_minimo, -delta_g, +delta_wacc)
+    conservador = _escenario(peer_average.per_promedio, 0.0, 0.0)
+    optimista = _escenario(peer_average.per_maximo, +delta_g, -delta_wacc)
+
+    return ValuationScenarios(
+        pesimista=pesimista,
+        conservador=conservador,
+        optimista=optimista,
+        modelos_excluidos_base=modelos_excluidos_base,
+    )
 
 
 def _motivo_cagr_invalido(

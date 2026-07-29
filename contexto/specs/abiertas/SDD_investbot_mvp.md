@@ -1429,3 +1429,189 @@ Lo que **falta** antes de scope freeze: **C1, C2, C3** — 3 casos límite reale
 
 ### Si `architect` resuelve C1-C3
 El pipeline no necesita volver a `security` (mismo criterio que Iter-2: son cambios de lógica de presentación/clasificación pura, sin I/O nuevo, sin secretos nuevos, sin vector de input externo nuevo). `qa` confirma en una pasada corta y el pipeline va directo a `implementer`.
+
+---
+
+## Spec Patch [Iter-4] para: SDD_investbot_mvp.md — C1-C3 (huecos del Spec Patch Iter-3)
+
+**Rol:** `architect`. **Fecha:** 2026-07-28. **Alcance:** acotado exactamente a los 3 bloqueantes C1-C3 reportados por `qa` en "Bloqueantes para `architect` — antes de scope freeze de Iter-3". No reabre las secciones 1-6 del Spec Patch Iter-3, ni `security` Iter-3, ni los puntos 1/2/4/5 de `qa` Iter-3 (mismo criterio de alcance que Iter-2 aplicó a B1-B5).
+
+### Criterio que falló
+
+`qa` no pudo convertir en tests deterministas 3 casos límite porque el Spec Patch Iter-3 no define un resultado esperado para ellos:
+
+- **C1** — interacción no definida entre "0 de 3 modelos" (Iter-2) y la clasificación barata/cara por escenario (Iter-3): cuando el conservador ya tiene `valor_justo_total=None` por exclusión de nivel 1 de los 3 modelos, no está dicho qué hace `summary.py` con la sección de clasificación.
+- **C2** — `calculate_momentum` solo define `"no_disponible"` cuando faltan **los dos** promedios móviles; no define el caso real de que falte solo uno.
+- **C3** — `compare_to_peers` no replica el caso degenerado de 1 solo peer válido que la sección 1 de Iter-3 ya resolvió para Múltiplos.
+
+### Ajuste de diseño
+
+#### C1 — Clasificación barata/cara cuando los 3 escenarios quedan sin `valor_justo_total`
+
+**Confirmación de la premisa de `qa` (para que quede escrito, no solo asumido):** por construcción, **`valor_justo_total=None` en el escenario conservador implica lo mismo en pesimista y optimista**. El escenario conservador usa exactamente los mismos parámetros que ya usa `compute_valuation()` hoy (sección 5 del Iter-3: "escenario conservador es, literalmente, ese mismo cálculo") — así que "conservador con 0 de 3 modelos" es, por definición, el caso ya existente `test_valuation_0_de_3_modelos` de Iter-2, que ocurre únicamente por exclusión de **nivel 1** (dato base inválido: historial insuficiente + EPS TTM≤0 simultáneos, u otra combinación que invalide los 3 modelos en la base). La propia regla de la sección 2 de Iter-3 ("un modelo excluido a nivel 1 lo está en los 3 escenarios por igual") garantiza que ese mismo motivo de exclusión aplica sin excepción a pesimista y optimista. No existe un camino en el diseño donde el conservador esté en `None` por los 3 modelos y algún otro escenario no lo esté — la implicación es estructural, no un caso a verificar aparte.
+
+**Decisión (adopta la recomendación de `qa` tal cual, sin ajustes):** cuando los 3 escenarios tienen `valor_justo_total=None` (equivalente extendido de `test_valuation_0_de_3_modelos`), `summary.py` **omite por completo la sección de clasificación barata/cara** — no muestra ni la frase consolidada ni el desglose de 3 líneas. El mensaje ya existente de Iter-2 ("no fue posible valorar la empresa con los datos disponibles... igual te muestro el resto del análisis abajo") ya comunica que no hay nada que clasificar; desglosar 3 veces "no se pudo determinar" sería ruido redundante, no transparencia adicional.
+
+**Regla de combinación de la sección 3 de Iter-3 — orden de evaluación actualizado (única parte de esa sección que este patch toca):**
+```
+1. Si valor_justo_total es None en el escenario conservador (y, por construcción, también en
+   pesimista y optimista — ver justificación arriba):
+   → NO se muestra la sección de clasificación barata/cara. Ya se mostró el mensaje de
+     Iter-2 de "no fue posible valorar la empresa".
+2. En cualquier otro caso (conservador tiene valor_justo_total no-None; a lo sumo 1 o 2 de
+   los 3 escenarios son None — nunca los 3, por la implicación de arriba):
+   → se aplica la regla ya definida en la sección 3 de Iter-3 sin cambios: consolidar si
+     los escenarios no-None coinciden, desglosar si no coinciden o si alguno es None
+     ("no se pudo determinar en este escenario" para ese caso puntual).
+```
+El resto de la sección 3 de Iter-3 (formato del desglose por modelo, celdas `N/D`, notas de transparencia) no cambia.
+
+**Criterios de aceptación (testeables):**
+- [ ] `test_combinar_clasificacion_omitida_0_de_3_modelos`: con `pesimista.valor_justo_total=None`, `conservador.valor_justo_total=None`, `optimista.valor_justo_total=None` (mismos datos que `test_valuation_0_de_3_modelos` de Iter-2, extendidos a los 3 escenarios), `summary.py` no incluye ninguna línea de clasificación barata/cara en la respuesta — ni consolidada ni desglosada.
+- [ ] Test de regresión explícito: `test_valuation_0_de_3_modelos` (Iter-2, ya existente) sigue pasando sin modificar — este patch no le agrega ninguna aserción nueva a ese test, la aserción nueva vive en el test de `summary.py` de arriba.
+- [ ] Test que confirma la implicación estructural: dado cualquier fixture donde `compute_valuation()` (función sin cambios) retorne `valor_justo_total=None`, `compute_valuation_scenarios(...)` retorna `valor_justo_total=None` en los 3 escenarios (no solo en conservador) — cierra la premisa de este patch con evidencia de test, no solo con el argumento de diseño de arriba.
+
+---
+
+#### C2 — `calculate_momentum` con exactamente un promedio móvil ausente
+
+**Decisión (adopta la recomendación de `qa` tal cual, sin ajustes):** la guarda de `etiqueta="no_disponible"` se extiende de "faltan los dos promedios móviles" a **"falta cualquiera de los dos"** (`price_avg_50` es `None` **o** `price_avg_200` es `None`). Las 3 etiquetas cualitativas (`impulso_positivo`/`impulso_negativo`/`mixto`) quedan definidas exclusivamente sobre la comparación simultánea contra ambos promedios — calcular una etiqueta con un solo dato disponible sería una fracción de esa definición, no una aproximación razonable: un precio por encima de su promedio de 50 días sin saber su posición respecto al de 200 días no permite distinguir, por ejemplo, un rebote de corto plazo dentro de una tendencia bajista de largo plazo de un verdadero "impulso positivo" — mostrar cualquiera de las 3 etiquetas igual sería inventar una lectura que los datos disponibles no sostienen.
+
+**Ajuste al contrato de `calculate_momentum` (sección 6.1 de Iter-3, se reemplaza solo esta parte del docstring):**
+```python
+def calculate_momentum(
+    *, price: float, year_high: Optional[float], year_low: Optional[float],
+    price_avg_50: Optional[float], price_avg_200: Optional[float],
+) -> MomentumResult:
+    """Nunca lanza excepción; campos faltantes producen None puntual.
+
+    etiqueta:
+      - "no_disponible" si falta price_avg_50 O price_avg_200 (cualquiera de
+        los dos, no solo si faltan ambos — Spec Patch Iter-4, C2). Las 3
+        etiquetas cualitativas requieren la comparación simultánea contra
+        ambos promedios; con un solo dato disponible no hay suficiente
+        información para una lectura de tendencia confiable.
+      - "impulso_positivo" si price > price_avg_50 y price > price_avg_200.
+      - "impulso_negativo" si price < price_avg_50 y price < price_avg_200.
+      - "mixto" en cualquier otro caso con ambos datos presentes.
+    """
+```
+
+**Criterios de aceptación (testeables):**
+- [ ] `test_momentum_no_disponible_falta_avg_50`: `price_avg_50=None`, `price_avg_200=150.0` (dato presente) → `etiqueta="no_disponible"`.
+- [ ] `test_momentum_no_disponible_falta_avg_200`: `price_avg_50=180.0` (dato presente), `price_avg_200=None` → `etiqueta="no_disponible"`.
+- [ ] `test_momentum_no_disponible_faltan_ambos`: caso ya existente en la sección 6.1 de Iter-3 (sin cambios) — sigue retornando `"no_disponible"`.
+- [ ] Los 3 tests de etiquetas cualitativas ya listados en Iter-3 (`_impulso_positivo/_negativo/_mixto`) no cambian — siguen requiriendo ambos promedios presentes.
+
+---
+
+#### C3 — `compare_to_peers` con exactamente 1 peer válido
+
+**Decisión (adopta la recomendación de `qa` tal cual, sin ajustes):** se trata igual que el caso ya resuelto en la sección 1 de Iter-3 para Múltiplos — con exactamente 1 peer válido, `per_minimo_peers == per_promedio_peers == per_maximo_peers` (mismo valor), y no hay un rango real contra el cual comparar. `posicion="no_comparable"` en este caso también, con un motivo explícito distinto al de "0 peers" o "EPS no positivo" — nunca `"en_linea"`/`"mas_barata"`/`"mas_cara"`, que sugerirían un rango real inexistente.
+
+**Ajuste a la estructura de datos de `PeerComparisonResult` (sección 6.2 de Iter-3, se agrega un campo, mismo patrón que `ModeloExcluido`/`motivo` de Iter-2 y `per_no_aplicable`/`liquidez_sin_pasivos_circulantes` de B3/B4):**
+```python
+@dataclass
+class PeerComparisonResult:
+    per_propio: Optional[float]
+    per_minimo_peers: Optional[float]
+    per_promedio_peers: Optional[float]
+    per_maximo_peers: Optional[float]
+    peers_usados: list[str]
+    posicion: str  # "mas_barata" | "en_linea" | "mas_cara" | "no_comparable"
+    motivo_no_comparable: Optional[str] = None
+    # "eps_no_positivo" | "sin_peers_validos" | "un_solo_peer_valido" (nuevo, Spec Patch Iter-4, C3)
+    # None cuando posicion != "no_comparable".
+
+def compare_to_peers(
+    *, per_propio: Optional[float], per_minimo_peers: Optional[float],
+    per_promedio_peers: Optional[float], per_maximo_peers: Optional[float],
+    peers_usados: list[str],
+) -> PeerComparisonResult:
+    """Función pura, sin I/O.
+
+    posicion="no_comparable" con motivo_no_comparable en 3 casos (Spec Patch
+    Iter-4 agrega el tercero):
+      - "eps_no_positivo" si per_propio es None.
+      - "sin_peers_validos" si len(peers_usados) == 0.
+      - "un_solo_peer_valido" si len(peers_usados) == 1 (per_minimo_peers ==
+        per_promedio_peers == per_maximo_peers, no hay rango real contra el
+        cual comparar, aunque los 3 campos numéricos existan).
+    """
+```
+
+`summary.py` (sección 6.3 de Iter-3) muestra, para el caso nuevo, una frase equivalente a la ya definida para los otros 2 motivos: `"Solo 1 comparable con PER válido en tu set de peers — no hay rango suficiente para comparar."`, en vez de "en línea con tus comparables".
+
+**Criterios de aceptación (testeables):**
+- [ ] `test_compare_to_peers_no_comparable_un_solo_peer_valido`: con `peers_usados=["MSFT"]` (1 solo), `per_minimo_peers == per_promedio_peers == per_maximo_peers == 27.9` y `per_propio` = cualquier valor (mayor, menor o igual a 27.9) → `posicion="no_comparable"`, `motivo_no_comparable="un_solo_peer_valido"` — nunca `"en_linea"`/`"mas_barata"`/`"mas_cara"`, independientemente de dónde caiga `per_propio`.
+- [ ] Los 2 tests de `_no_comparable` ya listados en Iter-3 se renombran/ajustan para incluir el campo nuevo: `test_compare_to_peers_no_comparable_eps_negativo` → `motivo_no_comparable="eps_no_positivo"`; `test_compare_to_peers_no_comparable_sin_peers_validos` → `motivo_no_comparable="sin_peers_validos"`.
+- [ ] Los 3 tests de `_mas_barata/_en_linea/_mas_cara` ya listados en Iter-3 agregan la aserción `motivo_no_comparable is None` (ya que `posicion != "no_comparable"` en esos casos) y usan `len(peers_usados) >= 2` en su fixture, para no solapar accidentalmente con el caso degenerado de este patch.
+
+---
+
+### Confirmación de los números de Adobe (`DELTA_G`/`DELTA_WACC`) — sin ajuste necesario
+
+Se confirma, con la evidencia numérica que `qa` ya trazó en su punto 1 (tabla con Múltiplos 600.00/658.00/714.00, Graham 435.64/555.64/675.64, DCF 225.64/288.82/376.50, Total 420.43/500.82/588.71): `DELTA_G=0.03` y `DELTA_WACC=0.01` **no necesitan ajuste** — con el fixture real de Adobe, ninguna de las guardas nuevas o existentes (multiplicador de Graham, `wacc<=terminal_growth`, <2 peers válidos) se activa en ningún escenario, y la relación `pesimista ≤ conservador ≤ optimista` (420.43 ≤ 500.82 ≤ 588.71) se cumple. `implementer` debe dejar esta tabla (o su equivalente calculado por el propio test) como comentario en `test_valuation_adobe_scenarios`, tal como `qa` recomendó, para que quede trazable sin tener que repetir la verificación a mano.
+
+### Confirmación de buckets de cobertura
+
+Se confirma, sin ajustes, la decisión de `qa` (dentro de su rol, no requería pasar por `architect`, pero se documenta aquí para que quede en un solo lugar junto con el resto de las decisiones de esta iteración): `market_context.py` → bucket de 70% ("resto", mismo nivel que `rules.py` — información contextual, no el motor de Valor Justo en sí); `peers.py` → bucket de 95% (alimenta directamente 2 de los 3 valores del escenario de Múltiplos desde este mismo Iter-3, y ya era una omisión preexistente de Iter-1 que correspondía corregir). Sin cambios en el umbral total del proyecto (≥75%).
+
+### Criterios que NO cambian
+
+Todo lo demás del Spec Patch Iter-3 (secciones 1-6), `security` Iter-3, y los puntos 1, 2 (salvo la regla de combinación actualizada arriba), 4 y 5 de `qa` Iter-3 siguen vigentes sin cambios. En particular:
+- `DELTA_G=0.03`, `DELTA_WACC=0.01`, PER mínimo/promedio/máximo de peers para Múltiplos — sin cambios, confirmados arriba.
+- La guarda de multiplicador de Graham `(8.5+2×g_pct)>0` y la guarda existente `wacc<=terminal_growth` — sin cambios.
+- `classify_scenario(...)` y los 4 tests de clasificación de escenario individual (`_barata/_cara/_none`) — sin cambios.
+- El formato de desglose por modelo (Pesimista | Conservador | Optimista) en `summary.py`, las celdas `N/D` de exclusión puntual, y la sección "Contexto de mercado" (momentum + comparación con peers) — sin cambios salvo los 3 ajustes puntuales de C1-C3 arriba.
+- Pregunta abierta (f) (VIX/Fear & Greed) — sigue pendiente, sin cambios, no bloquea este patch.
+- Ninguna de las 5 secciones de `security` (Iter-1) ni la sección de `security` Iter-3 — sin cambios; C1-C3 son ajustes de lógica de presentación/clasificación pura (sin I/O, sin secretos, sin input externo nuevo), mismo criterio que ya eximió a Iter-2 y a Iter-3 de volver a pasar por `security`.
+
+---
+
+### Handoff → qa
+
+**Specs producidas:** este Spec Patch [Iter-4], agregado al final de `SDD_investbot_mvp.md` (no reemplaza ninguna sección anterior).
+
+**Lo que `qa` debe confirmar (pasada corta, mismo patrón que su confirmación de Iter-2):**
+- [ ] C1: la regla de combinación actualizada (omitir la sección de clasificación cuando los 3 escenarios son `None`) es testeable sin ambigüedad, y no introduce un caso nuevo no cubierto (ej. ¿qué pasa si 2 de 3 son `None` pero no los 3? — ya cubierto por la rama 2 de la regla de combinación, sin cambios respecto a Iter-3).
+- [ ] C2: la guarda extendida de `calculate_momentum` (falta cualquiera de los dos promedios) no deja un caso intermedio sin definir.
+- [ ] C3: el campo nuevo `motivo_no_comparable` en `PeerComparisonResult` es suficiente para un assert determinista en los 3 casos de `"no_comparable"`, y no rompe los tests ya existentes de `_mas_barata/_en_linea/_mas_cara`.
+
+**Si `qa` confirma los 3 puntos:** el pipeline va **directo a `implementer`** — no vuelve a pasar por `security` (C1-C3 no tocan I/O, secretos, ni input externo nuevo, mismo criterio que ya se aplicó a B1-B5 de Iter-2 y al resto de Iter-3).
+
+**Si `qa` encuentra que alguno de los 3 sigue sin ser testeable de forma determinista:** vuelve a `architect` con diagnóstico puntual de cuál de los 3 quedó incompleto — no se reabren los otros 2 que sí queden confirmados (Regla 2 de `pipeline.md`, criterios congelados).
+
+---
+
+## Confirmación de qa — Spec Patch Iter-4 [2026-07-28]
+
+**Rol:** `qa`. Pasada corta de confirmación sobre el Spec Patch [Iter-4] — no repite el análisis de Iter-3 (esa sección sigue congelada, salvo la regla de combinación actualizada que este mismo patch toca).
+
+### C1-C3, uno por uno
+
+- **C1** — Sin ambigüedad. La regla de combinación de 2 pasos no se solapa ni contradice la revisión de Iter-3 para el caso de un solo escenario en `None` (`test_combinar_clasificacion_con_none`): esa rama sigue viviendo, sin cambios, dentro del paso 2 ("desglosar ... o si alguno es None"). El paso 1 solo se activa cuando `conservador.valor_justo_total is None`, y la garantía estructural del propio patch (un modelo excluido a nivel 1 lo está en los 3 escenarios por igual) hace que ese caso sea siempre "los 3 en None" — nunca "conservador en None pero pesimista/optimista no". El caso intermedio real (2 de 3 en `None`, con conservador no-None — posible por exclusiones de nivel 2 en pesimista u optimista, ej. guarda de multiplicador de Graham o `wacc<=terminal_growth` disparándose solo en un escenario) cae en el paso 2 sin ambigüedad: "alguno es None" → desglosar, con "no se pudo determinar en este escenario" para las filas en `None`. No queda ningún caso de los 4 posibles (0, 1, 2 o 3 escenarios en `None`) sin regla asignada. Test de regresión (`test_valuation_0_de_3_modelos` sin nuevas aserciones) y test nuevo de `summary.py` (`test_combinar_clasificacion_omitida_0_de_3_modelos`) están correctamente separados — confirmado, tal como se documentó en el patch.
+
+- **C2** — Sin ambigüedad y sin cuarto caso suelto. Las combinaciones posibles de `(price_avg_50, price_avg_200)` son exactamente 4: ambos presentes, falta solo 50, falta solo 200, faltan ambos. Los 3 tests nuevos/existentes de `"no_disponible"` (`_falta_avg_50`, `_falta_avg_200`, `_faltan_ambos`) cubren las 3 combinaciones con al menos un dato ausente. La cuarta combinación (ambos presentes) no queda huérfana: la cubren los 3 tests cualitativos ya existentes de Iter-3 (`_impulso_positivo/_negativo/_mixto`), que en conjunto son exhaustivos sobre esa rama (`price` por encima de ambos, por debajo de ambos, o "cualquier otro caso" = mixto). Las 4 combinaciones de input tienen test asignado — no hay un quinto caso posible dado que la firma de la función solo tiene esos 2 parámetros opcionales relevantes a la guarda.
+
+- **C3** — Alcanza para assert determinista en los 3 sub-casos y no rompe lo existente. `test_compare_to_peers_no_comparable_un_solo_peer_valido` fija `posicion="no_comparable"` y `motivo_no_comparable="un_solo_peer_valido"` con `per_propio` mayor, menor o igual al único peer — los 3 sub-casos dan el mismo resultado por diseño (no hay rango real, así que la posición de `per_propio` es irrelevante), lo cual es precisamente la propiedad que hay que verificar (que nunca se cuela `"mas_barata"/"en_linea"/"mas_cara"` aunque el valor lo "sugiera"). El patch ya identificó y resolvió el riesgo de ruptura: los tests existentes de `_mas_barata/_en_linea/_mas_cara` posiblemente usaban fixtures de 1 peer por simplicidad, lo cual ahora colisionaría con la regla nueva — el patch lo previene exigiéndoles `len(peers_usados) >= 2` explícitamente y agregándoles `motivo_no_comparable is None`. Los 2 tests de `_no_comparable` ya existentes (`eps_no_positivo`, `sin_peers_validos`) quedan intactos en su comportamiento, solo se les agrega el campo nuevo. Sin solapamiento entre los 3 motivos de `no_comparable` (son mutuamente excluyentes por construcción: `per_propio is None` vs. `len(peers_usados)==0` vs. `len(peers_usados)==1`).
+
+### Números de Adobe — verificados contra el propio transcript de esta sesión
+
+La tabla que cita este patch (Múltiplos 600.00/658.00/714.00, Graham 435.64/555.64/675.64, DCF 225.64/288.82/376.50, Total 420.43/500.82/588.71) coincide **exactamente, cifra por cifra**, con la tabla que `qa` trazó a mano en su propia revisión de Iter-3 (misma sección del documento, líneas con el detalle `Pesimista/Conservador/Optimista` y la relación 420.43 ≤ 500.82 ≤ 588.71). No hace falta re-ejecutar `valuation.py` contra el fixture: es la misma evidencia numérica, citada verbatim por `architect`, no un cálculo nuevo. Sin discrepancias.
+
+### Reapertura de lo congelado
+
+Confirmado: el patch no reabre las secciones 1-6 del Spec Patch Iter-3, `security` Iter-3, ni los puntos 1/2/4/5 de `qa` Iter-3 fuera de la regla de combinación actualizada (que sí estaba explícitamente en alcance de C1). No se detectó ningún criterio nuevo fuera de C1-C3.
+
+### Confirmación de superficie de seguridad
+
+Se confirma la afirmación de `architect`: C1-C3 son ajustes de lógica de presentación/clasificación pura sobre datos ya validados (omitir una sección de texto, extender una guarda de comparación numérica, agregar un campo de motivo a un dataclass) — ninguno introduce I/O, secreto, ni vector de input externo nuevo. No hay razón para volver a pasar por `security` ni por `frontend` (no aplica, bot de Telegram sin UI web, consistente con Iter-1/Iter-2/Iter-3).
+
+### Veredicto de `qa`
+
+**SCOPE FREEZE confirmado para el Spec Patch Iter-4.** Los 3 bloqueantes C1-C3 quedaron con comportamiento definido, estructura de retorno concreta (`motivo_no_comparable`), regla de combinación sin casos huérfanos, y criterios de aceptación con assert determinista, escribibles como test unitario sin inventar nada.
+
+**El pipeline completo (Iter-1 + Iter-2 + Iter-3 + Iter-4) queda listo para `implementer`, sin volver a `security` ni a `frontend`.**
+
+---

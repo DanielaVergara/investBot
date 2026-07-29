@@ -42,6 +42,60 @@ async def test_get_peer_pe_average_caso_simple():
     assert set(result.peers_usados) == {"MSFT", "ORCL", "CRM"}
 
 
+# ---------------------------------------------------------------------------
+# per_minimo / per_maximo (Spec Patch [Iter-3], sección 2) — derivados del
+# mismo array de PERs ya calculado, sin llamada adicional a /key-metrics.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_peer_pe_average_expone_minimo_y_maximo():
+    metrics = {
+        "MSFT": {"earningsYield": 1 / 30.0},  # PER=30.0
+        "ORCL": {"earningsYield": 1 / 34.0},  # PER=34.0
+        "CRM": {"earningsYield": 1 / 32.0},  # PER=32.0
+    }
+
+    async def fake_get_metrics(ticker: str):
+        return metrics.get(ticker)
+
+    result = await peers.get_peer_pe_average(
+        get_peer_metrics_fn=fake_get_metrics, sector="Technology", own_ticker="AAPL"
+    )
+    assert result.per_minimo == pytest.approx(30.0)
+    assert result.per_promedio == pytest.approx(32.0)
+    assert result.per_maximo == pytest.approx(34.0)
+
+
+async def test_get_peer_pe_average_un_solo_peer_valido_minimo_igual_a_maximo():
+    """Caso degenerado (sección 1 del Spec Patch Iter-3): con 1 solo peer
+    válido, per_minimo == per_promedio == per_maximo — no hay rango real."""
+    metrics = {
+        "MSFT": {"earningsYield": 1 / 30.0},
+        "ORCL": None,
+        "CRM": {"earningsYield": None},
+    }
+
+    async def fake_get_metrics(ticker: str):
+        return metrics.get(ticker)
+
+    result = await peers.get_peer_pe_average(
+        get_peer_metrics_fn=fake_get_metrics, sector="Technology", own_ticker="AAPL"
+    )
+    assert result.peers_usados == ["MSFT"]
+    assert result.per_minimo == result.per_promedio == result.per_maximo == pytest.approx(30.0)
+
+
+async def test_get_peer_pe_average_ningun_peer_disponible_minimo_y_maximo_none():
+    async def fake_get_metrics(ticker: str):
+        return None
+
+    result = await peers.get_peer_pe_average(
+        get_peer_metrics_fn=fake_get_metrics, sector="Technology", own_ticker="AAPL"
+    )
+    assert result.per_minimo is None
+    assert result.per_maximo is None
+
+
 async def test_get_peer_pe_average_excluye_propio_ticker():
     metrics = {
         "MSFT": {"earningsYield": 1 / 30.0},

@@ -32,6 +32,8 @@ PEERS_BY_SECTOR: dict[str, list[str]] = {
 @dataclass
 class PeerAverageResult:
     per_promedio: Optional[float]
+    per_minimo: Optional[float]  # Spec Patch Iter-3, sección 2 — derivado del mismo array
+    per_maximo: Optional[float]  # de PERs válidos, sin llamada adicional a /key-metrics.
     peers_usados: list[str]
 
 
@@ -76,5 +78,12 @@ async def get_peer_pe_average(
             pes.append(1.0 / float(earnings_yield))
             usados.append(peer)
     if not pes:
-        return PeerAverageResult(per_promedio=None, peers_usados=[])
-    return PeerAverageResult(per_promedio=sum(pes) / len(pes), peers_usados=usados)
+        return PeerAverageResult(
+            per_promedio=None, per_minimo=None, per_maximo=None, peers_usados=[]
+        )
+    return PeerAverageResult(
+        per_promedio=sum(pes) / len(pes),
+        per_minimo=min(pes),
+        per_maximo=max(pes),
+        peers_usados=usados,
+    )

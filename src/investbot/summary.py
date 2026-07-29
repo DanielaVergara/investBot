@@ -5,17 +5,30 @@ General), "el extracto" (Flujo de Efectivo), y referencia la analogía de
 "Tienda de Limonada" al menos una vez. Indica explícitamente si la empresa
 "encaja" o "no encaja" con el perfil de riesgo guardado.
 
-`summary.py` (no `valuation.py`/`rules.py`) es responsable de convertir la
-estructura de datos pura (`modelos_excluidos`, flags de `rules.py`) en texto
-— mantiene la separación cálculo puro vs. presentación exigida por `qa`.
+`summary.py` (no `valuation.py`/`rules.py`/`market_context.py`) es
+responsable de convertir la estructura de datos pura (`modelos_excluidos`,
+flags de `rules.py`, `MomentumResult`/`PeerComparisonResult`) en texto —
+mantiene la separación cálculo puro vs. presentación exigida por `qa`.
+
+Spec Patch [Iter-3] (escenarios Pesimista/Conservador/Optimista + Contexto de
+mercado) + [Iter-4] (C1: se omite la sección de clasificación cuando los 3
+escenarios quedan sin `valor_justo_total`).
 """
 
 from __future__ import annotations
+
+from investbot.valuation import classify_scenario
 
 MODELO_LABELS = {
     "multiplos": "el modelo de Múltiplos",
     "graham": "el modelo Graham (EPS Model)",
     "dcf": "el modelo DCF",
+}
+
+MODELO_LABELS_CORTO = {
+    "multiplos": "Múltiplos",
+    "graham": "Graham EPS Model",
+    "dcf": "DCF",
 }
 
 MOTIVO_LABELS = {
@@ -29,44 +42,107 @@ MOTIVO_LABELS = {
     "wacc_no_calculable": "no se pudo estimar el costo de capital (WACC) con los datos disponibles",
     "dcf_no_calculable": "no se pudo proyectar el flujo de caja con los datos disponibles",
     "per_peers_no_disponible": "no pude obtener el PER de los comparables del sector",
+    "graham_multiplicador_no_positivo": "en este escenario el crecimiento estimado haría el múltiplo de Graham cero o negativo",
 }
+
+MOTIVO_NO_COMPARABLE_LABELS = {
+    "eps_no_positivo": "tu PER no aplica por EPS negativo o cero — mirá el P/S como referencia.",
+    "sin_peers_validos": "no hay comparables con PER válido en tu set de peers para comparar.",
+    "un_solo_peer_valido": (
+        "Solo 1 comparable con PER válido en tu set de peers — no hay rango "
+        "suficiente para comparar."
+    ),
+}
+
+POSICION_LABELS = {
+    "mas_barata": "más barata",
+    "en_linea": "en línea",
+    "mas_cara": "más cara",
+}
+
+ETIQUETA_MOMENTUM_LABELS = {
+    "impulso_positivo": "Por encima de su promedio de 50 días y de 200 días → impulso positivo.",
+    "impulso_negativo": "Por debajo de su promedio de 50 días y de 200 días → impulso negativo.",
+    "mixto": "Por encima de uno de sus promedios móviles pero no del otro → impulso mixto.",
+}
+
+# Orden fijo de presentación (Pesimista | Conservador | Optimista), Decisión
+# (e) del Spec Patch Iter-3 — nunca la variante "peor caso/mejor caso".
+_MODELOS_ORDEN = [
+    ("multiplos", "valor_justo_multiplos"),
+    ("graham", "valor_justo_graham"),
+    ("dcf", "valor_justo_dcf"),
+]
 
 
 def _fmt_money(value: float) -> str:
     return f"${value:,.2f}"
 
 
-def _fmt_pct(value: float) -> str:
-    return f"{value:+.1f}%"
+def _fmt_ratio(value: float) -> str:
+    return f"{value:.1f}"
 
 
-def build_valuation_section(valuation: dict, precio_actual: float) -> str:
-    """Sección de "Valor Justo" — maneja exclusión total/parcial de modelos (Spec Patch Iter-2)."""
-    lines = ["*Valor Justo (motor propio, sin depender de /dcf de FMP):*"]
+def _cell(escenario: dict, campo: str) -> str:
+    value = escenario.get(campo)
+    return _fmt_money(value) if value is not None else "N/D"
 
-    if valuation.get("valor_justo_multiplos") is not None:
-        lines.append(f"- Múltiplos: {_fmt_money(valuation['valor_justo_multiplos'])}")
-    if valuation.get("valor_justo_graham") is not None:
+
+def build_valuation_scenarios_section(
+    scenarios: dict, precio_actual: float, n_peers_validos: int
+) -> str:
+    """Sección de "Valor Justo" con rango Pesimista | Conservador | Optimista
+    por modelo + total, y clasificación barata/cara por escenario (Spec Patch
+    Iter-3, secciones 1-3 + Iter-4 C1).
+
+    `scenarios` es la representación en dict de `valuation.ValuationScenarios`
+    (`.as_dict()`): claves `pesimista`/`conservador`/`optimista` (cada una un
+    dict con `valor_justo_multiplos/graham/dcf/total` + `modelos_excluidos`)
+    y `modelos_excluidos_base` (nivel 1, reportado una sola vez).
+    """
+    pesimista = scenarios["pesimista"]
+    conservador = scenarios["conservador"]
+    optimista = scenarios["optimista"]
+    excluidos_base = scenarios.get("modelos_excluidos_base") or []
+    excluidos_base_modelos = {item["modelo"] for item in excluidos_base}
+
+    lines = ["*Rango de Valor Justo (Pesimista | Conservador | Optimista):*"]
+    modelos_nivel2_nd: list[tuple[str, str]] = []
+
+    for modelo_key, campo in _MODELOS_ORDEN:
+        if modelo_key in excluidos_base_modelos:
+            continue
+        modelo_label = MODELO_LABELS_CORTO[modelo_key]
         lines.append(
-            f"- Graham EPS Model (g = CAGR histórico, Y = FRED/Treasury.gov): "
-            f"{_fmt_money(valuation['valor_justo_graham'])}"
+            f"- {modelo_label}: {_cell(pesimista, campo)} | "
+            f"{_cell(conservador, campo)} | {_cell(optimista, campo)}"
         )
-    if valuation.get("valor_justo_dcf") is not None:
-        lines.append(
-            f"- DCF (proyección propia de flujo de caja + WACC simplificado): "
-            f"{_fmt_money(valuation['valor_justo_dcf'])}"
-        )
+        for escenario_nombre, escenario in (
+            ("Pesimista", pesimista),
+            ("Conservador", conservador),
+            ("Optimista", optimista),
+        ):
+            if escenario.get(campo) is None:
+                modelos_nivel2_nd.append((modelo_label, escenario_nombre))
+        if modelo_key == "multiplos" and n_peers_validos < 2:
+            lines.append(
+                f"  _(no hay rango disponible para Múltiplos: solo {n_peers_validos} "
+                "comparable(s) válido(s))_"
+            )
 
-    excluidos = valuation.get("modelos_excluidos") or []
-    for item in excluidos:
+    for item in excluidos_base:
         modelo_label = MODELO_LABELS.get(item["modelo"], item["modelo"])
         motivo_label = MOTIVO_LABELS.get(item["motivo"], item["motivo"])
         lines.append(f"- {modelo_label} no se pudo calcular: {motivo_label}.")
 
-    total = valuation.get("valor_justo_total")
-    n_calculados = 3 - len(excluidos)
+    total_pes = pesimista.get("valor_justo_total")
+    total_cons = conservador.get("valor_justo_total")
+    total_opt = optimista.get("valor_justo_total")
 
-    if total is None:
+    if total_cons is None:
+        # Iter-2: ningún modelo pudo calcularse a nivel base -> por
+        # construcción, los 3 escenarios quedan en None (Spec Patch Iter-4,
+        # C1) -> se omite por completo la sección de clasificación abajo.
         lines.append(
             "\nNo fue posible valorar la empresa con los datos disponibles "
             "(ningún modelo pudo calcularse). Igual te muestro el resto del "
@@ -74,19 +150,114 @@ def build_valuation_section(valuation: dict, precio_actual: float) -> str:
         )
         return "\n".join(lines)
 
-    if n_calculados == 1:
-        lines.append(
-            f"\n*Valor aproximado, basado en un solo modelo*: {_fmt_money(total)}"
-        )
-    else:
-        lines.append(f"\n*Valor Justo Total (promedio): {_fmt_money(total)}*")
-
-    diff_pct = (total - precio_actual) / precio_actual * 100
-    barata = precio_actual < total
-    etiqueta = "barata" if barata else "cara"
     lines.append(
-        f"Precio actual: {_fmt_money(precio_actual)} → la empresa está "
-        f"*{etiqueta}* ({_fmt_pct(diff_pct)} vs. el valor justo)."
+        f"\n*Valor Justo Total: {_cell(pesimista, 'valor_justo_total')} | "
+        f"{_cell(conservador, 'valor_justo_total')} | "
+        f"{_cell(optimista, 'valor_justo_total')}*"
+    )
+
+    for modelo_label, escenario_nombre in modelos_nivel2_nd:
+        lines.append(
+            f"_{modelo_label} no disponible en el escenario {escenario_nombre} "
+            "con estos supuestos — se promedia sin él en ese caso._"
+        )
+
+    lines.extend(
+        _build_classification_lines(precio_actual, total_pes, total_cons, total_opt)
+    )
+
+    return "\n".join(lines)
+
+
+def _build_classification_lines(
+    precio_actual: float,
+    total_pesimista: float | None,
+    total_conservador: float,
+    total_optimista: float | None,
+) -> list[str]:
+    """Regla de combinación (Spec Patch Iter-3, sección 3): consolida si los
+    3 escenarios coinciden, desglosa si no coinciden o si alguno es `None`.
+    Se llama únicamente cuando `total_conservador` no es `None` (el llamador
+    ya maneja el caso "0 de 3 modelos", Iter-4 C1)."""
+    clasificaciones = {
+        "Pesimista": (classify_scenario(precio_actual, total_pesimista), total_pesimista),
+        "Conservador": (classify_scenario(precio_actual, total_conservador), total_conservador),
+        "Optimista": (classify_scenario(precio_actual, total_optimista), total_optimista),
+    }
+    valores = [c for c, _ in clasificaciones.values()]
+
+    if None not in valores and len(set(valores)) == 1:
+        etiqueta = "Barata" if valores[0] else "Cara"
+        return [
+            f"\n{etiqueta} en los 3 escenarios (Pesimista, Conservador y Optimista) "
+            "— señal de confianza adicional."
+        ]
+
+    lines = [f"\nPrecio actual: {_fmt_money(precio_actual)}"]
+    for nombre, (clas, total) in clasificaciones.items():
+        if clas is None:
+            lines.append(f"- {nombre}: no se pudo determinar en este escenario")
+        else:
+            etiqueta = "Barata" if clas else "Cara"
+            lines.append(f"- {nombre}: {etiqueta} (valor justo {_fmt_money(total)})")
+    return lines
+
+
+def build_market_context_section(
+    *, precio_actual: float, momentum: dict, peer_comparison: dict
+) -> str:
+    """Sección "Contexto de mercado" (Spec Patch Iter-3, sección 6): momentum
+    de precio + comparación explícita con peers. Se ubica entre "Pilares de
+    buena empresa" y "Encaje con tu perfil de riesgo"."""
+    lines = ["*Contexto de mercado:*"]
+
+    pct_high = momentum.get("pct_vs_year_high")
+    pct_low = momentum.get("pct_vs_year_low")
+    if pct_high is not None and pct_low is not None:
+        lines.append(
+            f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_high):.1f}% por "
+            f"debajo de su máximo de 52 semanas y un {abs(pct_low):.1f}% por "
+            "encima de su mínimo de 52 semanas."
+        )
+    elif pct_high is not None:
+        lines.append(
+            f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_high):.1f}% por "
+            "debajo de su máximo de 52 semanas."
+        )
+    elif pct_low is not None:
+        lines.append(
+            f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_low):.1f}% por "
+            "encima de su mínimo de 52 semanas."
+        )
+
+    etiqueta = momentum.get("etiqueta")
+    if etiqueta in ETIQUETA_MOMENTUM_LABELS:
+        lines.append(f"- {ETIQUETA_MOMENTUM_LABELS[etiqueta]}")
+    # etiqueta == "no_disponible" -> se omite (criterio explícito Iter-3/6.3),
+    # no se muestra como ruido "impulso: no disponible".
+
+    posicion = peer_comparison.get("posicion")
+    if posicion == "no_comparable":
+        motivo = peer_comparison.get("motivo_no_comparable")
+        texto = MOTIVO_NO_COMPARABLE_LABELS.get(motivo, "no se pudo comparar con tus peers.")
+        lines.append(f"- Comparada con sus comparables del sector: {texto}")
+    else:
+        peers_str = ", ".join(peer_comparison.get("peers_usados") or [])
+        posicion_txt = POSICION_LABELS.get(posicion, posicion)
+        per_propio = peer_comparison.get("per_propio")
+        per_min = peer_comparison.get("per_minimo_peers")
+        per_prom = peer_comparison.get("per_promedio_peers")
+        per_max = peer_comparison.get("per_maximo_peers")
+        lines.append(
+            f"- Comparada con sus comparables del sector ({peers_str}): tu PER "
+            f"({_fmt_ratio(per_propio)}) está {posicion_txt} con el rango de tus "
+            f"peers (mínimo {_fmt_ratio(per_min)}, promedio {_fmt_ratio(per_prom)}, "
+            f"máximo {_fmt_ratio(per_max)})."
+        )
+
+    lines.append(
+        "\n_Nota: el momentum es un proxy simple de precio, no un índice de "
+        "sentimiento de mercado (VIX/Fear & Greed)._"
     )
     return "\n".join(lines)
 
@@ -125,7 +296,10 @@ def build_summary(
     precio_actual: float,
     ratios: dict,
     pillars: dict,
-    valuation: dict,
+    scenarios: dict,
+    n_peers_validos: int,
+    momentum: dict,
+    peer_comparison: dict,
     risk_fit: dict,
     treasury_source: str | None = None,
     peers_note: str = "PER promedio de un set fijo de comparables, no del sector completo.",
@@ -133,6 +307,9 @@ def build_summary(
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto".
 
     Usa el boletín/la foto/el extracto y la analogía de Tienda de Limonada.
+
+    Orden de lectura (Spec Patch Iter-3, sección 6.3): valor justo → pilares
+    → contexto de mercado → encaje de riesgo → notas de transparencia.
     """
     intro = (
         f"*{company_name} ({ticker})*\n\n"
@@ -159,8 +336,13 @@ def build_summary(
     if ratios.get("ps") is not None:
         ratios_lines.append(f"- P/S (Precio-Ventas): {ratios['ps']:.2f}")
 
-    valuation_section = build_valuation_section(valuation, precio_actual)
+    valuation_section = build_valuation_scenarios_section(
+        scenarios, precio_actual, n_peers_validos
+    )
     pillars_section = build_pillars_section(pillars)
+    market_context_section = build_market_context_section(
+        precio_actual=precio_actual, momentum=momentum, peer_comparison=peer_comparison
+    )
     risk_section = build_risk_fit_section(risk_fit)
 
     transparency_lines = [
@@ -179,6 +361,7 @@ def build_summary(
         "\n".join(ratios_lines),
         valuation_section,
         pillars_section,
+        market_context_section,
         risk_section,
         "\n".join(transparency_lines),
     ]
