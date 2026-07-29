@@ -17,6 +17,8 @@ escenarios quedan sin `valor_justo_total`).
 
 from __future__ import annotations
 
+from typing import Optional
+
 from investbot.valuation import classify_scenario
 
 MODELO_LABELS = {
@@ -112,7 +114,7 @@ def build_valuation_scenarios_section(
     excluidos_base = scenarios.get("modelos_excluidos_base") or []
     excluidos_base_modelos = {item["modelo"] for item in excluidos_base}
 
-    lines = ["*Rango de Valor Justo (Pesimista | Conservador | Optimista):*"]
+    lines = ["*Rango de Valor Justo estimado (Pesimista | Conservador | Optimista):*"]
     modelos_nivel2_nd: list[tuple[str, str]] = []
 
     for modelo_key, campo in _MODELOS_ORDEN:
@@ -160,7 +162,7 @@ def build_valuation_scenarios_section(
         return "\n".join(lines)
 
     lines.append(
-        f"\n*Valor Justo Total: {_cell(pesimista, 'valor_justo_total')} | "
+        f"\n*Valor Justo Total (estimado): {_cell(pesimista, 'valor_justo_total')} | "
         f"{_cell(conservador, 'valor_justo_total')} | "
         f"{_cell(optimista, 'valor_justo_total')}*"
     )
@@ -213,7 +215,11 @@ def _build_classification_lines(
 
 
 def build_market_context_section(
-    *, precio_actual: float, momentum: dict, peer_comparison: dict
+    *,
+    precio_actual: float,
+    momentum: dict,
+    peer_comparison: dict,
+    vix: Optional[dict] = None,
 ) -> str:
     """Sección "Contexto de mercado" (Spec Patch Iter-3, sección 6): momentum
     de precio + comparación explícita con peers. Se ubica entre "Pilares de
@@ -264,9 +270,23 @@ def build_market_context_section(
             f"máximo {_fmt_ratio(per_max)})."
         )
 
+    if vix and vix.get("disponible"):
+        lines.append(f"- VIX (CBOE Volatility Index): {vix['valor']:.2f}")
+        lines.append(
+            "  _Estimado/aproximado — mide la volatilidad implícita "
+            "esperada de opciones sobre el S&P 500 (el mercado en "
+            "general), no del ticker que consultaste. NO es lo mismo "
+            "que un índice compuesto de sentimiento tipo \"Fear & "
+            "Greed\" (ese combina varias señales distintas; el VIX "
+            "solo mide volatilidad). Dato de FMP (símbolo ^VIX)._"
+        )
+
     lines.append(
-        "\n_Nota: el momentum es un proxy simple de precio, no un índice de "
-        "sentimiento de mercado (VIX/Fear & Greed)._"
+        "\n_Nota: el momentum de arriba es un proxy simple de precio "
+        "del ticker consultado, no del mercado en general. El VIX (si "
+        "aparece más arriba) es una aproximación de la volatilidad "
+        "esperada del mercado en general, no del ticker — tampoco es "
+        "un índice de sentimiento compuesto._"
     )
     return "\n".join(lines)
 
@@ -294,11 +314,131 @@ def build_risk_fit_section(risk_fit: dict) -> str:
     encaje_txt = "SÍ encaja" if risk_fit["encaja"] else "NO encaja"
     return (
         f"*Encaje con tu perfil de riesgo ({risk_fit['perfil']}):* {encaje_txt} — "
-        f"es {risk_fit['etiqueta_activo']} con beta de {risk_fit['beta']:.2f}."
+        f"es {risk_fit['etiqueta_activo']} con beta de {risk_fit['beta']:.2f}.\n"
+        "_Renta variable = sos dueño de una parte de la empresa (una "
+        "acción). A diferencia de la renta fija (bonos, plazo fijo), acá "
+        "no hay un pago garantizado: ganás o perdés según cómo le va al "
+        "negocio._\n"
+        "_Beta mide qué tan volátil es esta acción comparada con el "
+        "mercado en general: 1.0 = se mueve igual que el mercado; más de "
+        "1.0 = se mueve más fuerte (para arriba y para abajo); menos de "
+        "1.0 = se mueve menos. Dato de FMP._"
     )
 
 
-def build_summary(
+_EXTRAS_CAMPOS = ["roe", "debt_to_equity", "net_debt_to_ebitda", "dividend_yield", "payout_ratio"]
+
+
+def build_extras_section(extras: Optional[dict]) -> Optional[str]:
+    """Sección "Rentabilidad, deuda de largo plazo y dividendos" (Decisión
+    #3). Se omite por completo (retorna `None`) si los 5 campos vienen
+    `None` — mismo criterio de "degradar con gracia sin ruido" que el resto
+    del proyecto. Si al menos un campo está disponible, se muestran solo
+    las líneas de los campos presentes, sin placeholder "N/D" para los
+    ausentes.
+    """
+    if not extras or all(extras.get(campo) is None for campo in _EXTRAS_CAMPOS):
+        return None
+
+    lines = ["*Rentabilidad, deuda de largo plazo y dividendos:*"]
+
+    roe = extras.get("roe")
+    if roe is not None:
+        lines.append(
+            f"- ROE (Rentabilidad sobre el Patrimonio): {roe * 100:.1f}% "
+            "_(fórmula: Ganancia Neta / Patrimonio de los Accionistas — "
+            "dato ya calculado por FMP, el bot no lo recalcula)_"
+        )
+        lines.append(
+            f"  _Por cada $100 que pusieron los dueños, la empresa ganó "
+            f"${roe * 100:.0f} este año._"
+        )
+
+    debt_to_equity = extras.get("debt_to_equity")
+    if debt_to_equity is not None:
+        lines.append(
+            f"- Deuda/Patrimonio (Debt-to-Equity): {debt_to_equity:.2f} "
+            "_(fórmula: Deuda Total / Patrimonio de los Accionistas — dato de FMP)_"
+        )
+        lines.append(
+            "  _Cuánta deuda tiene la empresa comparada con lo que es de los dueños._"
+        )
+
+    net_debt_to_ebitda = extras.get("net_debt_to_ebitda")
+    if net_debt_to_ebitda is not None:
+        lines.append(
+            f"- Deuda Neta / EBITDA: {net_debt_to_ebitda:.2f}x _(dato de FMP)_"
+        )
+        lines.append(
+            "  _Cuántos años de ganancia operativa le tomaría pagar toda su deuda._"
+        )
+
+    dividend_yield = extras.get("dividend_yield")
+    if dividend_yield is not None:
+        lines.append(f"- Dividend Yield: {dividend_yield * 100:.2f}% _(dato de FMP)_")
+        if dividend_yield == 0:
+            lines.append(
+                "  _Esta empresa no reparte dividendos actualmente — reinvierte todo._"
+            )
+        else:
+            lines.append(
+                f"  _Por cada $100 invertidos, la empresa te devuelve "
+                f"aproximadamente ${dividend_yield * 100:.2f} al año en "
+                "dividendos, antes de impuestos._"
+            )
+
+    payout_ratio = extras.get("payout_ratio")
+    if payout_ratio is not None:
+        lines.append(f"- Payout Ratio: {payout_ratio * 100:.1f}% _(dato de FMP)_")
+        lines.append(
+            "  _% de la ganancia que reparte como dividendo — el resto lo "
+            "reinvierte en el negocio._"
+        )
+
+    return "\n".join(lines)
+
+
+def build_veredicto_section(*, pillars: dict, risk_fit: dict) -> str:
+    """Resumen ejecutivo de una frase. Se arma puramente a partir de
+    `pillars` (ya calculado por rules.evaluate_pillars) y `risk_fit` (ya
+    calculado por risk_fit.evaluate_risk_fit) — los mismos dicts que
+    build_summary ya recibe hoy. No lee ratios, no lee ROE/deuda/
+    dividendos, no aplica ningún umbral nuevo sobre datos financieros:
+    "qué mirar con cuidado" es una enumeración de qué pilares booleanos
+    ya vienen en False, no una interpretación numérica nueva.
+    """
+    precio_razonable = pillars.get("precio_razonable")
+    if precio_razonable is True:
+        precio_txt = "parece *barata* según el valor justo estimado (escenario conservador)"
+    elif precio_razonable is False:
+        precio_txt = "parece *cara* según el valor justo estimado (escenario conservador)"
+    else:
+        precio_txt = "no pude determinar si está cara o barata con los datos disponibles"
+
+    claves = ["ingresos_crecientes", "utilidades_crecientes", "deuda_controlada", "precio_razonable"]
+    solidos = sum(1 for k in claves if pillars.get(k) is True)
+    debiles = [k for k in claves if pillars.get(k) is False]
+
+    encaje_txt = "SÍ encaja" if risk_fit.get("encaja") else "NO encaja"
+
+    cuidado_txt = ""
+    if debiles:
+        etiquetas = {
+            "ingresos_crecientes": "ingresos",
+            "utilidades_crecientes": "utilidades",
+            "deuda_controlada": "deuda",
+            "precio_razonable": "precio",
+        }
+        cuidado_txt = f" Mirá con cuidado: {', '.join(etiquetas[k] for k in debiles)}."
+
+    return (
+        f"*En una frase:* {precio_txt}, con {solidos}/4 pilares sólidos, "
+        f"y {encaje_txt} con tu perfil de riesgo ({risk_fit.get('perfil')})."
+        f"{cuidado_txt}"
+    )
+
+
+def build_summary_parts(
     *,
     ticker: str,
     company_name: str,
@@ -312,16 +452,28 @@ def build_summary(
     risk_fit: dict,
     treasury_source: str | None = None,
     peers_note: str = "PER promedio de un set fijo de comparables, no del sector completo.",
-) -> str:
-    """Arma la respuesta completa, estilo "explícamelo como si fuera tonto".
+    extras: Optional[dict] = None,
+    vix: Optional[dict] = None,
+) -> list[str]:
+    """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
+    y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
+    la partición segura que reutiliza `query_handler.chunk_for_telegram`
+    para respetar el límite de 4096 caracteres de Telegram (Decisión 16.1):
+    cada elemento es, por construcción, una sección completa.
 
     Usa el boletín/la foto/el extracto y la analogía de Tienda de Limonada.
 
-    Orden de lectura (Spec Patch Iter-3, sección 6.3): valor justo → pilares
-    → contexto de mercado → encaje de riesgo → notas de transparencia.
+    Orden de lectura (Decisión #5): Título → Veredicto → Intro Tienda de
+    Limonada → Ratios clave → Rentabilidad/deuda/dividendos (se omite si no
+    hay datos) → Valor Justo (3 escenarios) → Pilares de buena empresa →
+    Contexto de mercado (incluye VIX) → Encaje de riesgo (incluye
+    explicaciones dummy) → Notas de transparencia (incluye WACC expandido +
+    disclaimer general).
     """
+    titulo = f"*{company_name} ({ticker})*"
+    veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
+
     intro = (
-        f"*{company_name} ({ticker})*\n\n"
         "Pensá en una empresa como una Tienda de Limonada: el *boletín* "
         "(Estado de Resultados) te dice cuánto vendió y ganó, *la foto* "
         "(Balance General) te dice qué tiene y qué debe en un momento dado, "
@@ -357,12 +509,17 @@ def build_summary(
             " _(fórmula: Capitalización de Mercado / Ventas Totales)_"
         )
 
+    extras_section = build_extras_section(extras)
+
     valuation_section = build_valuation_scenarios_section(
         scenarios, precio_actual, n_peers_validos
     )
     pillars_section = build_pillars_section(pillars)
     market_context_section = build_market_context_section(
-        precio_actual=precio_actual, momentum=momentum, peer_comparison=peer_comparison
+        precio_actual=precio_actual,
+        momentum=momentum,
+        peer_comparison=peer_comparison,
+        vix=vix,
     )
     risk_section = build_risk_fit_section(risk_fit)
 
@@ -376,16 +533,72 @@ def build_summary(
             f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
         )
     transparency_lines.append(
-        "_El DCF es una aproximación con supuestos simplificados de WACC._"
+        "_El DCF es una aproximación con supuestos simplificados de WACC "
+        "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
+        "la empresa financiarse con capital propio (accionistas) y con "
+        "deuda (bancos/bonistas), ponderado por cuánto usa de cada uno. Es "
+        "un cálculo propio del bot (no viene de FMP), simplificado — no "
+        "reemplaza el WACC que armaría un analista con datos de mercado "
+        "más completos._"
+    )
+    transparency_lines.append(
+        "_Esto es una síntesis de datos financieros históricos, no "
+        "asesoramiento financiero profesional ni una recomendación de "
+        "inversión. No tiene en cuenta noticias, eventos recientes, "
+        "cambios de gestión ni el contexto cualitativo del negocio — "
+        "revisá eso vos antes de decidir._"
     )
 
     parts = [
+        titulo,
+        veredicto_section,
         intro,
         "\n".join(ratios_lines),
+        extras_section,
         valuation_section,
         pillars_section,
         market_context_section,
         risk_section,
         "\n".join(transparency_lines),
     ]
-    return "\n\n".join(parts)
+    return [part for part in parts if part is not None]
+
+
+def build_summary(
+    *,
+    ticker: str,
+    company_name: str,
+    precio_actual: float,
+    ratios: dict,
+    pillars: dict,
+    scenarios: dict,
+    n_peers_validos: int,
+    momentum: dict,
+    peer_comparison: dict,
+    risk_fit: dict,
+    treasury_source: str | None = None,
+    peers_note: str = "PER promedio de un set fijo de comparables, no del sector completo.",
+    extras: Optional[dict] = None,
+    vix: Optional[dict] = None,
+) -> str:
+    """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
+    puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
+    recibiendo el mismo `str`."""
+    return "\n\n".join(
+        build_summary_parts(
+            ticker=ticker,
+            company_name=company_name,
+            precio_actual=precio_actual,
+            ratios=ratios,
+            pillars=pillars,
+            scenarios=scenarios,
+            n_peers_validos=n_peers_validos,
+            momentum=momentum,
+            peer_comparison=peer_comparison,
+            risk_fit=risk_fit,
+            treasury_source=treasury_source,
+            peers_note=peers_note,
+            extras=extras,
+            vix=vix,
+        )
+    )

@@ -6,6 +6,8 @@ ausente) y C3 (comparación con 1 solo peer válido).
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from investbot import market_context
@@ -155,3 +157,43 @@ def test_compare_to_peers_no_comparable_un_solo_peer_valido(per_propio):
     )
     assert result.posicion == "no_comparable"
     assert result.motivo_no_comparable == "un_solo_peer_valido"
+
+
+# ---------------------------------------------------------------------------
+# extract_vix_context (SDD_contenido_financiero_explicado.md, Decisión #8)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_vix_context_disponible():
+    result = market_context.extract_vix_context({"price": 18.42})
+    assert result == market_context.VixResult(valor=18.42, disponible=True)
+
+
+def test_extract_vix_context_quote_none():
+    result = market_context.extract_vix_context(None)
+    assert result == market_context.VixResult(valor=None, disponible=False)
+
+
+def test_extract_vix_context_quote_vacio():
+    result = market_context.extract_vix_context({})
+    assert result == market_context.VixResult(valor=None, disponible=False)
+
+
+def test_extract_vix_context_price_no_numerico():
+    result = market_context.extract_vix_context({"price": "N/A"})
+    assert result == market_context.VixResult(valor=None, disponible=False)
+
+
+def test_extract_vix_context_price_cero_es_valido():
+    """Guarda de tipo, no de rango — `0` es un dato válido (aunque sería
+    anómalo financieramente, no es responsabilidad de esta función juzgarlo)."""
+    result = market_context.extract_vix_context({"price": 0})
+    assert result.valor == 0
+    assert result.disponible is True
+
+
+def test_vix_result_no_expone_clasificacion_cualitativa():
+    """`VixResult` solo tiene `valor`/`disponible` — nunca una etiqueta de
+    "alta"/"baja"/"moderada" volatilidad (Decisión #8, sin umbral nuevo)."""
+    campos = {f.name for f in dataclasses.fields(market_context.VixResult)}
+    assert campos == {"valor", "disponible"}

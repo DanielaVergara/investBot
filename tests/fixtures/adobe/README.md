@@ -59,3 +59,22 @@ cuentas nuevas — el bot migró a la API "stable" (`/stable/...`, ticker vía
 `/cash-flow-statement` y `/key-metrics-ttm` para AAPL — siguen siendo
 sintéticos en sus **valores** (siguen reproduciendo el caso Adobe de la spec),
 pero la **forma** del JSON ya no es hipotética.
+
+## Fixtures agregados por `SDD_contenido_financiero_explicado.md` (2026-07-29)
+
+**Origen: sintético**, no capturas reales — mismo criterio que el resto de este archivo.
+
+- `key_metrics_own.json` — respuesta de `/key-metrics` (anual, `limit=1`)
+  para el **ticker propio** (`ADBE`), a diferencia de `peers_metrics.json`
+  (que solo cubre los peers `MSFT`/`ORCL`/`CRM`). Usado para probar
+  `rules.extract_key_metrics_extras` end-to-end. Los valores de
+  `roe`/`debtToEquity`/`netDebtToEBITDA`/`dividendYield`/`payoutRatio` son
+  inventados para poblar los 5 campos (Adobe real no reparte dividendos;
+  acá se usa un `dividendYield` positivo a propósito para cubrir la rama
+  "> 0" del bullet, la rama "== 0" se cubre con un test unitario aparte en
+  `test_rules.py`/`test_summary.py`).
+- `quote_vix.json` — respuesta de `/quote?symbol=^VIX`, con un `price`
+  (`18.42`) deliberadamente distinto del precio de ADBE (`333.00`) para que
+  el test end-to-end pueda verificar que el VIX mostrado no es, por error
+  de ruteo del fixture, el precio de Adobe (Gap #2 de la sección QA de la
+  spec).

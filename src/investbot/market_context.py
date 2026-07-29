@@ -9,16 +9,54 @@ Bucket de cobertura: 70% ("resto", mismo nivel que `rules.py` — información
 complementaria/contextual, no el motor de Valor Justo en sí, confirmado por
 `qa`/`architect` en Iter-3/Iter-4).
 
-Presupuesto de requests FMP: cero llamadas HTTP nuevas — el momentum usa
-campos ya presentes en `/quote` (`yearHigh`, `yearLow`, `priceAvg50`,
-`priceAvg200`), ya solicitado hoy; la comparación con peers reutiliza el
-mismo array de PERs que `peers.py` ya calcula para el modelo de Múltiplos.
+Presupuesto de requests FMP: `calculate_momentum`/`compare_to_peers` siguen
+sin llamadas HTTP nuevas — el momentum usa campos ya presentes en `/quote`
+(`yearHigh`, `yearLow`, `priceAvg50`, `priceAvg200`), ya solicitado hoy; la
+comparación con peers reutiliza el mismo array de PERs que `peers.py` ya
+calcula para el modelo de Múltiplos. **Excepción (Ampliación de alcance,
+VIX):** `extract_vix_context` en sí sigue siendo una función pura sin I/O,
+pero el `quote` que recibe como parámetro (resuelto para `VIX_SYMBOL`,
+"^VIX") sí requiere un fetch nuevo (`fmp_client.get_quote` en
+`query_handler.py`, best-effort) — la afirmación de "cero llamadas HTTP
+nuevas" ya no aplica al módulo en conjunto, solo a las funciones de
+momentum/peers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+
+
+VIX_SYMBOL = "^VIX"
+
+
+@dataclass
+class VixResult:
+    valor: Optional[float]
+    disponible: bool
+
+
+def extract_vix_context(quote: Optional[dict]) -> VixResult:
+    """Lee el nivel del VIX (CBOE Volatility Index) desde un /quote ya
+    resuelto para VIX_SYMBOL ("^VIX"). Función pura, sin I/O — el fetch
+    ocurre en query_handler.py, best-effort (Decisión #7), mismo patrón
+    que rules.extract_key_metrics_extras (guarda de tipo, nunca crashea).
+
+    Deliberadamente NO clasifica el valor en "alta"/"baja"/"moderada"
+    volatilidad — eso requeriría un umbral numérico nuevo no acordado
+    con Daniela (mismo criterio que la Restricción de "no agregar
+    interpretación numérica nueva" ya vigente para ROE/deuda/dividendos,
+    Decisión #2/#6). El VIX se muestra como dato crudo con su
+    explicación textual en summary.py, nunca como semáforo. Si Daniela
+    quiere umbrales de "alta/baja volatilidad" más adelante, es una spec
+    patch separada con el umbral acordado explícitamente.
+    """
+    if not quote:
+        return VixResult(valor=None, disponible=False)
+    valor = quote.get("price")
+    valor = valor if isinstance(valor, (int, float)) else None
+    return VixResult(valor=valor, disponible=valor is not None)
 
 
 @dataclass

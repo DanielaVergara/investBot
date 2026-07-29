@@ -150,3 +150,82 @@ def test_pilar_ventaja_competitiva_siempre_revisar_manualmente():
     )
     assert pillars.ventaja_competitiva == "revisar_manualmente"
     assert pillars.precio_razonable is None
+
+
+# ---------------------------------------------------------------------------
+# extract_key_metrics_extras (SDD_contenido_financiero_explicado.md, Decisión #2)
+# ---------------------------------------------------------------------------
+
+
+def _full_metrics(**overrides):
+    metrics = {
+        "roe": 0.35,
+        "debtToEquity": 0.42,
+        "netDebtToEBITDA": 0.15,
+        "dividendYield": 0.006,
+        "payoutRatio": 0.25,
+    }
+    metrics.update(overrides)
+    return metrics
+
+
+def test_extract_key_metrics_extras_happy_path_5_campos_presentes():
+    result = rules.extract_key_metrics_extras(_full_metrics())
+    assert result.roe == pytest.approx(0.35)
+    assert result.debt_to_equity == pytest.approx(0.42)
+    assert result.net_debt_to_ebitda == pytest.approx(0.15)
+    assert result.dividend_yield == pytest.approx(0.006)
+    assert result.payout_ratio == pytest.approx(0.25)
+
+
+def test_extract_key_metrics_extras_metrics_none():
+    result = rules.extract_key_metrics_extras(None)
+    assert result == rules.KeyMetricsExtras(
+        roe=None, debt_to_equity=None, net_debt_to_ebitda=None,
+        dividend_yield=None, payout_ratio=None,
+    )
+
+
+def test_extract_key_metrics_extras_metrics_dict_vacio():
+    result = rules.extract_key_metrics_extras({})
+    assert result == rules.KeyMetricsExtras(
+        roe=None, debt_to_equity=None, net_debt_to_ebitda=None,
+        dividend_yield=None, payout_ratio=None,
+    )
+
+
+def test_extract_key_metrics_extras_campo_ausente_del_dict():
+    metrics = _full_metrics()
+    del metrics["dividendYield"]
+    result = rules.extract_key_metrics_extras(metrics)
+    assert result.dividend_yield is None
+    # el resto se lee normal
+    assert result.roe == pytest.approx(0.35)
+    assert result.debt_to_equity == pytest.approx(0.42)
+    assert result.net_debt_to_ebitda == pytest.approx(0.15)
+    assert result.payout_ratio == pytest.approx(0.25)
+
+
+def test_extract_key_metrics_extras_campo_no_numerico():
+    metrics = _full_metrics(roe="N/A")
+    result = rules.extract_key_metrics_extras(metrics)
+    assert result.roe is None
+
+
+def test_extract_key_metrics_extras_dividend_yield_cero_no_es_none():
+    metrics = _full_metrics(dividendYield=0)
+    result = rules.extract_key_metrics_extras(metrics)
+    assert result.dividend_yield == 0
+    assert result.dividend_yield is not None
+
+
+def test_extract_key_metrics_extras_payout_ratio_mayor_a_1_se_propaga():
+    metrics = _full_metrics(payoutRatio=1.5)
+    result = rules.extract_key_metrics_extras(metrics)
+    assert result.payout_ratio == pytest.approx(1.5)
+
+
+def test_extract_key_metrics_extras_debt_to_equity_negativo_se_propaga():
+    metrics = _full_metrics(debtToEquity=-0.8)
+    result = rules.extract_key_metrics_extras(metrics)
+    assert result.debt_to_equity == pytest.approx(-0.8)

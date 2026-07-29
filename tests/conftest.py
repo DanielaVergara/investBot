@@ -32,6 +32,8 @@ def adobe_fixtures():
         "cash_flow": load_fixture("adobe", "cash_flow.json"),
         "peers_metrics": load_fixture("adobe", "peers_metrics.json"),
         "fred_dgs20": load_fixture("adobe", "fred_dgs20.json"),
+        "key_metrics_own": load_fixture("adobe", "key_metrics_own.json"),
+        "quote_vix": load_fixture("adobe", "quote_vix.json"),
     }
 
 

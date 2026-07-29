@@ -25,8 +25,17 @@ def _adobe_router(adobe_fixtures):
         path = request.url.path
         symbol = request.url.params.get("symbol")
         if path == "/stable/quote":
+            # Gap #2 (sección QA de SDD_contenido_financiero_explicado.md):
+            # distinguir el ticker propio del VIX por `symbol` — sin esto,
+            # cualquier test de VIX pasaría en falso con el precio de ADBE.
+            if symbol == query_handler.market_context.VIX_SYMBOL:
+                return httpx.Response(200, json=adobe_fixtures["quote_vix"])
             return httpx.Response(200, json=adobe_fixtures["quote"])
         if path == "/stable/key-metrics":
+            # Distinguir el ticker propio (ADBE) de cada peer — hoy ambos
+            # comparten el mismo path, diferenciables solo por `symbol`.
+            if symbol == "ADBE":
+                return httpx.Response(200, json=adobe_fixtures["key_metrics_own"])
             peer_data = adobe_fixtures["peers_metrics"].get(symbol)
             if peer_data:
                 return httpx.Response(200, json=peer_data)
@@ -134,11 +143,21 @@ class FakeRateLimiter:
         return self.allow_value
 
 
+def _fake_message(**overrides):
+    """Mock de `telegram.Message` con `.edit_text` y `.chat.send_message` —
+    ambos necesarios para el flujo multi-chunk (Ampliación #2, Decisión 17):
+    el primer chunk se entrega vía `.edit_text`, los siguientes vía
+    `.chat.send_message` sobre este mismo objeto."""
+    base = dict(edit_text=AsyncMock(), chat=SimpleNamespace(send_message=AsyncMock()))
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 def _fake_text_update(text, chat_id=ALLOWED_CHAT_ID):
     update = SimpleNamespace()
     update.message = SimpleNamespace(
         text=text,
-        reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+        reply_text=AsyncMock(return_value=_fake_message()),
     )
     update.effective_chat = SimpleNamespace(id=chat_id, type="private")
     update.callback_query = None
@@ -295,7 +314,7 @@ async def test_handle_disambiguation_resuelve_y_responde(adobe_fixtures, conn_fa
     query = SimpleNamespace(
         data="tk:ADBE",
         answer=AsyncMock(),
-        edit_message_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+        edit_message_text=AsyncMock(return_value=_fake_message()),
     )
     update.callback_query = query
     update.effective_chat = SimpleNamespace(id=ALLOWED_CHAT_ID, type="private")
@@ -320,7 +339,10 @@ async def test_run_analysis_error_generico_no_crashea(conn_factory, monkeypatch)
     async def fake_search(client, key, q):
         return [{"symbol": "ADBE", "name": "Adobe Inc."}]
 
-    monkeypatch.setattr(query_handler, "fetch_and_analyze", raise_unexpected)
+    # `_run_analysis` llama a `fetch_and_analyze_parts` (no `fetch_and_analyze`,
+    # que ahora es solo un wrapper de compatibilidad) — Decisión 17 de
+    # SDD_contenido_financiero_explicado.md.
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", raise_unexpected)
     monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
 
     empty_transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
@@ -359,7 +381,10 @@ async def test_run_analysis_fmp_error_dentro_de_fetch_and_analyze(conn_factory, 
     async def fake_search(client, key, q):
         return [{"symbol": "ADBE", "name": "Adobe Inc."}]
 
-    monkeypatch.setattr(query_handler, "fetch_and_analyze", raise_fmp_error)
+    # `_run_analysis` llama a `fetch_and_analyze_parts` (no `fetch_and_analyze`,
+    # que ahora es solo un wrapper de compatibilidad) — Decisión 17 de
+    # SDD_contenido_financiero_explicado.md.
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", raise_fmp_error)
     monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
 
     empty_transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
@@ -403,7 +428,7 @@ async def test_handle_text_falla_envio_mensaje_carga_no_bloquea_analisis(
 
     update = _fake_text_update("ADBE")
     update.message.reply_text = AsyncMock(
-        side_effect=[TelegramError("boom"), SimpleNamespace(edit_text=AsyncMock())]
+        side_effect=[TelegramError("boom"), _fake_message()]
     )
 
     await handle_text(update, context=SimpleNamespace())
@@ -428,7 +453,7 @@ async def test_handle_text_falla_edit_final_hace_fallback_a_reply_fn(
     handle_text = handlers[0].callback
 
     update = _fake_text_update("ADBE")
-    loading_msg = SimpleNamespace(edit_text=AsyncMock(side_effect=TelegramError("boom")))
+    loading_msg = _fake_message(edit_text=AsyncMock(side_effect=TelegramError("boom")))
     update.message.reply_text = AsyncMock(return_value=loading_msg)
 
     await handle_text(update, context=SimpleNamespace())

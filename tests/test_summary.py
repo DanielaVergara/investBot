@@ -386,3 +386,479 @@ def test_market_context_section_peer_comparison_un_solo_peer_valido():
 def test_summary_incluye_seccion_contexto_de_mercado():
     text = _build_summary()
     assert "Contexto de mercado" in text
+
+
+# ---------------------------------------------------------------------------
+# build_extras_section (Pieza 1 — KeyMetricsExtras)
+# ---------------------------------------------------------------------------
+
+
+def _full_extras(**overrides):
+    extras = {
+        "roe": 0.18,
+        "debt_to_equity": 0.65,
+        "net_debt_to_ebitda": 1.2,
+        "dividend_yield": 0.02,
+        "payout_ratio": 0.35,
+    }
+    extras.update(overrides)
+    return extras
+
+
+def test_build_extras_section_happy_path_5_campos():
+    text = summary.build_extras_section(_full_extras())
+    assert text is not None
+    assert "Rentabilidad, deuda de largo plazo y dividendos" in text
+    # roe=0.18 -> supuesto *100 (Resolución (a) / Gap #4: convención no
+    # verificada contra FMP real, ver tests/fixtures/adobe/README.md).
+    assert "ROE (Rentabilidad sobre el Patrimonio): 18.0%" in text
+    assert "Por cada $100 que pusieron los dueños, la empresa ganó $18" in text
+    assert "Deuda/Patrimonio (Debt-to-Equity): 0.65" in text
+    assert "Deuda Neta / EBITDA: 1.20x" in text
+    assert "Dividend Yield: 2.00%" in text
+    assert "Payout Ratio: 35.0%" in text
+    assert "dato de FMP" in text
+
+
+def test_build_extras_section_none_retorna_none():
+    assert summary.build_extras_section(None) is None
+
+
+def test_build_extras_section_5_campos_none_retorna_none():
+    extras = {
+        "roe": None, "debt_to_equity": None, "net_debt_to_ebitda": None,
+        "dividend_yield": None, "payout_ratio": None,
+    }
+    assert summary.build_extras_section(extras) is None
+
+
+def test_build_extras_section_2_de_5_campos_disponibles():
+    extras = {
+        "roe": 0.18, "debt_to_equity": None, "net_debt_to_ebitda": None,
+        "dividend_yield": 0.02, "payout_ratio": None,
+    }
+    text = summary.build_extras_section(extras)
+    assert "ROE" in text
+    assert "Dividend Yield" in text
+    assert "Debt-to-Equity" not in text
+    assert "Deuda Neta / EBITDA" not in text
+    assert "Payout Ratio" not in text
+
+
+def test_build_extras_section_otros_2_de_5_campos_disponibles():
+    """Complementa `test_build_extras_section_2_de_5_campos_disponibles`
+    cubriendo la rama contraria de `roe`/`dividend_yield` (ausentes acá,
+    presentes allá) para 100% de ramas en `build_extras_section`."""
+    extras = {
+        "roe": None, "debt_to_equity": 0.65, "net_debt_to_ebitda": None,
+        "dividend_yield": None, "payout_ratio": 0.35,
+    }
+    text = summary.build_extras_section(extras)
+    assert "Debt-to-Equity" in text
+    assert "Payout Ratio" in text
+    assert "ROE" not in text
+    assert "Dividend Yield" not in text
+
+
+def test_build_extras_section_dividend_yield_cero_muestra_no_reparte():
+    extras = _full_extras(dividend_yield=0)
+    text = summary.build_extras_section(extras)
+    assert "no reparte dividendos actualmente" in text
+
+
+def test_build_extras_section_omitido_en_build_summary_si_extras_none():
+    text = _build_summary(extras=None)
+    assert "Rentabilidad, deuda de largo plazo y dividendos" not in text
+
+
+def test_build_extras_section_orden_entre_ratios_y_valor_justo():
+    text = _build_summary(extras=_full_extras())
+    idx_ratios = text.index("Ratios clave")
+    idx_extras = text.index("Rentabilidad, deuda de largo plazo y dividendos")
+    idx_valor_justo = text.index("Rango de Valor Justo")
+    assert idx_ratios < idx_extras < idx_valor_justo
+
+
+# ---------------------------------------------------------------------------
+# build_veredicto_section (Pieza 3 — Veredicto)
+# ---------------------------------------------------------------------------
+
+
+def test_veredicto_4_de_4_pilares_y_encaja():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": True,
+            "utilidades_crecientes": True,
+            "deuda_controlada": True,
+            "precio_razonable": True,
+        },
+        risk_fit={"encaja": True, "perfil": "moderado"},
+    )
+    assert "barata" in text
+    assert "4/4 pilares sólidos" in text
+    assert "SÍ encaja" in text
+    assert "Mirá con cuidado" not in text
+
+
+def test_veredicto_precio_razonable_false_dice_cara():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": True,
+            "utilidades_crecientes": True,
+            "deuda_controlada": True,
+            "precio_razonable": False,
+        },
+        risk_fit={"encaja": True, "perfil": "moderado"},
+    )
+    assert "parece *cara*" in text
+    assert "3/4 pilares sólidos" in text
+    assert "Mirá con cuidado: precio." in text
+
+
+def test_veredicto_precio_razonable_none():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": False,
+            "utilidades_crecientes": False,
+            "deuda_controlada": False,
+            "precio_razonable": None,
+        },
+        risk_fit={"encaja": False, "perfil": "moderado"},
+    )
+    assert "no pude determinar si está cara o barata" in text
+    assert "None" not in text
+
+
+def test_veredicto_al_menos_un_pilar_false_muestra_mira_con_cuidado():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": False,
+            "utilidades_crecientes": True,
+            "deuda_controlada": False,
+            "precio_razonable": True,
+        },
+        risk_fit={"encaja": True, "perfil": "moderado"},
+    )
+    assert "Mirá con cuidado: ingresos, deuda." in text
+    assert "ingresos_crecientes" not in text
+    assert "deuda_controlada" not in text
+
+
+def test_veredicto_no_encaja():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": True,
+            "utilidades_crecientes": True,
+            "deuda_controlada": True,
+            "precio_razonable": True,
+        },
+        risk_fit={"encaja": False, "perfil": "agresivo"},
+    )
+    assert "NO encaja" in text
+
+
+def test_veredicto_es_el_segundo_bloque_de_la_respuesta():
+    text = _build_summary()
+    idx_titulo = text.index("*Adobe Inc. (ADBE)*")
+    idx_veredicto = text.index("*En una frase:*")
+    idx_limonada = text.index("Tienda de Limonada")
+    assert idx_titulo < idx_veredicto < idx_limonada
+
+
+def test_veredicto_firma_solo_pillars_y_risk_fit():
+    import inspect
+
+    sig = inspect.signature(summary.build_veredicto_section)
+    assert set(sig.parameters) == {"pillars", "risk_fit"}
+
+
+def test_veredicto_peor_escenario_no_crashea():
+    text = summary.build_veredicto_section(
+        pillars={
+            "ingresos_crecientes": False,
+            "utilidades_crecientes": False,
+            "deuda_controlada": False,
+            "precio_razonable": None,
+        },
+        risk_fit={"encaja": False, "perfil": "muy_conservador"},
+    )
+    assert "no pude determinar si está cara o barata" in text
+    assert "NO encaja" in text
+    assert "Mirá con cuidado: ingresos, utilidades, deuda." in text
+
+
+# ---------------------------------------------------------------------------
+# build_market_context_section — bullet de VIX (Pieza 2)
+# ---------------------------------------------------------------------------
+
+
+def test_market_context_section_vix_disponible_muestra_bullet():
+    text = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        vix={"valor": 18.42, "disponible": True},
+    )
+    assert "18.42" in text
+    assert "estimado" in text.lower() or "aproximado" in text.lower()
+    assert "Fear" in text
+    assert "no es lo mismo que un índice compuesto" in text.lower() or "no es un índice de sentimiento compuesto" in text.lower()
+
+
+def test_market_context_section_vix_no_disponible_omite_bullet():
+    text = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        vix={"valor": None, "disponible": False},
+    )
+    assert "CBOE Volatility Index" not in text
+
+
+def test_market_context_section_vix_none_omite_bullet():
+    text = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        vix=None,
+    )
+    assert "CBOE Volatility Index" not in text
+
+
+def test_market_context_section_nota_final_exacta_con_vix_disponible():
+    text = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        vix={"valor": 18.42, "disponible": True},
+    )
+    assert (
+        "el momentum de arriba es un proxy simple de precio del ticker "
+        "consultado, no del mercado en general" in text
+    )
+    assert "tampoco es un índice de sentimiento compuesto" in text
+
+
+def test_market_context_section_nota_final_exacta_sin_vix():
+    text = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        vix=None,
+    )
+    assert (
+        "el momentum de arriba es un proxy simple de precio del ticker "
+        "consultado, no del mercado en general" in text
+    )
+    assert "tampoco es un índice de sentimiento compuesto" in text
+
+
+def test_build_summary_acepta_llamadas_sin_vix():
+    text = _build_summary()
+    assert "Contexto de mercado" in text
+
+
+# ---------------------------------------------------------------------------
+# Etiquetas "estimado"/"aproximado" (Decisión #10)
+# ---------------------------------------------------------------------------
+
+
+def test_valuation_scenarios_header_dice_rango_de_valor_justo_estimado():
+    text = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3
+    )
+    assert "Rango de Valor Justo estimado" in text
+
+
+def test_valuation_scenarios_total_dice_valor_justo_total_estimado():
+    text = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3
+    )
+    assert "Valor Justo Total (estimado)" in text
+
+
+def test_ratios_lines_no_contienen_estimado_ni_aproximado():
+    ratios = _base_ratios()
+    ratios_lines = ["*Ratios clave:*"]
+    if ratios.get("ratio_liquidez") is not None:
+        ratios_lines.append(f"- Liquidez: {ratios['ratio_liquidez']:.2f}")
+    # Verificación aislada (Gap #3): las líneas de Ratios clave en sí mismas
+    # no llevan "estimado"/"aproximado" — se prueba sobre el fragmento
+    # aislado, no sobre build_summary() completo (que sí lo contendría por
+    # el VIX/Valor Justo).
+    text = "\n".join(ratios_lines)
+    assert "estimado" not in text.lower()
+    assert "aproximado" not in text.lower()
+
+
+def test_build_extras_section_no_contiene_estimado_ni_aproximado():
+    text = summary.build_extras_section(_full_extras())
+    assert "estimado" not in text.lower()
+    assert "aproximado" not in text.lower()
+
+
+def test_momentum_y_peer_comparison_bullets_no_contienen_estimado():
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=_base_peer_comparison()
+    )
+    # Sin VIX: nada en el bloque de momentum/peers debería decir "estimado"/
+    # "aproximado" (la nota final menciona "aproximación" solo en relación
+    # al VIX, que acá está ausente).
+    momentum_and_peers_lines = "\n".join(
+        line for line in text.split("\n") if line.startswith("- ")
+    )
+    assert "estimado" not in momentum_and_peers_lines.lower()
+    assert "aproximado" not in momentum_and_peers_lines.lower()
+
+
+# ---------------------------------------------------------------------------
+# Explicaciones dummy + WACC + disclaimer 12b (Pieza 4)
+# ---------------------------------------------------------------------------
+
+
+def test_risk_fit_section_incluye_explicacion_renta_variable_y_beta():
+    text = summary.build_risk_fit_section(_base_risk_fit())
+    assert (
+        "Renta variable = sos dueño de una parte de la empresa" in text
+    )
+    assert "Beta mide qué tan volátil es esta acción" in text
+    assert "Dato de FMP" in text
+
+
+def test_renta_variable_explicacion_aparece_una_sola_vez_en_toda_la_respuesta():
+    text = _build_summary()
+    assert text.count("Renta variable = sos dueño de una parte de la empresa") == 1
+
+
+def test_wacc_nota_contiene_costo_promedio_ponderado_y_calculo_propio():
+    text = _build_summary()
+    assert "Costo Promedio Ponderado de Capital" in text
+    assert "cálculo propio del bot" in text
+
+
+def test_disclaimer_12b_siempre_presente_con_treasury_source():
+    text = _build_summary(treasury_source="FRED (serie DGS20)")
+    assert (
+        "no asesoramiento financiero profesional ni una recomendación de "
+        "inversión" in text
+    )
+
+
+def test_disclaimer_12b_siempre_presente_sin_treasury_source():
+    text = _build_summary(treasury_source=None)
+    assert (
+        "no asesoramiento financiero profesional ni una recomendación de "
+        "inversión" in text
+    )
+
+
+def test_orden_wacc_antes_que_disclaimer_12b():
+    text = _build_summary()
+    idx_wacc = text.index("Costo Promedio Ponderado de Capital")
+    idx_disclaimer = text.index("no asesoramiento financiero profesional")
+    assert idx_wacc < idx_disclaimer
+
+
+def test_build_summary_con_extras_y_vix_none_no_crashea():
+    text = _build_summary(extras=None, vix=None)
+    assert "el boletín" in text
+
+
+# ---------------------------------------------------------------------------
+# build_summary_parts (Pieza 5 — límite 4096 de Telegram)
+# ---------------------------------------------------------------------------
+
+
+def test_build_summary_equivale_a_join_de_build_summary_parts():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    assert summary.build_summary(**kwargs) == "\n\n".join(
+        summary.build_summary_parts(**kwargs)
+    )
+
+
+def test_build_summary_equivale_a_join_de_build_summary_parts_con_extras_y_vix():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+        treasury_source="FRED (serie DGS20)",
+        extras=_full_extras(),
+        vix={"valor": 18.42, "disponible": True},
+    )
+    assert summary.build_summary(**kwargs) == "\n\n".join(
+        summary.build_summary_parts(**kwargs)
+    )
+
+
+def test_build_summary_parts_no_incluye_none():
+    parts = summary.build_summary_parts(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+        extras=None,
+    )
+    assert all(part is not None for part in parts)
+
+
+# ---------------------------------------------------------------------------
+# Pieza 6 — Reordenamiento completo de build_summary
+# ---------------------------------------------------------------------------
+
+
+def test_orden_completo_de_build_summary_con_extras():
+    text = _build_summary(extras=_full_extras(), vix={"valor": 18.42, "disponible": True})
+    indices = [
+        text.index("*Adobe Inc. (ADBE)*"),
+        text.index("*En una frase:*"),
+        text.index("Tienda de Limonada"),
+        text.index("Ratios clave"),
+        text.index("Rentabilidad, deuda de largo plazo y dividendos"),
+        text.index("Rango de Valor Justo"),
+        text.index("Pilares de buena empresa"),
+        text.index("Contexto de mercado"),
+        text.index("Encaje con tu perfil de riesgo"),
+        text.index("Datos financieros"),
+    ]
+    assert indices == sorted(indices)
+
+
+def test_orden_completo_de_build_summary_sin_extras():
+    text = _build_summary(extras=None)
+    assert "Rentabilidad, deuda de largo plazo y dividendos" not in text
+    indices = [
+        text.index("*Adobe Inc. (ADBE)*"),
+        text.index("*En una frase:*"),
+        text.index("Tienda de Limonada"),
+        text.index("Ratios clave"),
+        text.index("Rango de Valor Justo"),
+        text.index("Pilares de buena empresa"),
+        text.index("Contexto de mercado"),
+        text.index("Encaje con tu perfil de riesgo"),
+        text.index("Datos financieros"),
+    ]
+    assert indices == sorted(indices)

@@ -45,6 +45,12 @@ RATE_LIMITED_MSG = "Estás consultando muy rápido — esperá un minuto antes d
 GENERIC_ERROR_MSG = "No pude completar el análisis ahora mismo. Intenta más tarde."
 LOADING_MSG = "🔍 Analizando {ticker}, dame un toque..."
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+# Margen reservado en cada chunk para el prefijo de continuación
+# "_(cont. parte N/M)_\n\n" (Decisión 17.1) — conservador a propósito.
+_CONTINUATION_PREFIX_RESERVE = 40
+_CONTINUATION_PREFIX = "_(cont. parte {i}/{n})_\n\n"
+
 _CONTROL_CHARS_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f]")
 
 
@@ -80,8 +86,11 @@ def _annual_series(statements: list[dict], field: str) -> list[float]:
     return list(reversed(values))
 
 
-async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
-    """Trae los datos de un ticker resuelto y arma la respuesta completa."""
+async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) -> list[str]:
+    """Trae los datos de un ticker resuelto y arma la respuesta completa,
+    devuelta como lista de secciones sin unir (`summary.build_summary_parts`)
+    — permite a `_run_analysis` particionar en varios mensajes de Telegram
+    sin cortar a mitad de sección (Decisión 16)."""
     quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
     profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
     income_statements = await fmp_client.get_income_statement(
@@ -95,7 +104,25 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
     )
 
     if not quote or not profile or not income_statements or not balance_sheets or not cash_flows:
-        return f"No pude obtener suficientes datos de {ticker} para analizarlo ahora mismo."
+        return [f"No pude obtener suficientes datos de {ticker} para analizarlo ahora mismo."]
+
+    # Rentabilidad/deuda/dividendos del ticker propio (Decisión #1) —
+    # best-effort, nunca bloquea el resto del análisis.
+    try:
+        own_metrics_list = await fmp_client.get_key_metrics(
+            clients.fmp_http, clients.fmp_api_key, ticker, limit=1
+        )
+        own_metrics = own_metrics_list[0] if own_metrics_list else None
+    except fmp_client.FMPError:
+        own_metrics = None
+
+    # VIX (Decisión #7) — best-effort, nunca bloquea el resto del análisis.
+    try:
+        vix_quote = await fmp_client.get_quote(
+            clients.fmp_http, clients.fmp_api_key, market_context.VIX_SYMBOL
+        )
+    except fmp_client.FMPError:
+        vix_quote = None
 
     company_name = profile.get("companyName", ticker)
     sector = profile.get("sector", "")
@@ -256,7 +283,18 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
         "motivo_no_comparable": peer_comparison_result.motivo_no_comparable,
     }
 
-    return summary.build_summary(
+    extras_result = rules.extract_key_metrics_extras(own_metrics)
+    extras_dict = {
+        "roe": extras_result.roe,
+        "debt_to_equity": extras_result.debt_to_equity,
+        "net_debt_to_ebitda": extras_result.net_debt_to_ebitda,
+        "dividend_yield": extras_result.dividend_yield,
+        "payout_ratio": extras_result.payout_ratio,
+    }
+    vix_result = market_context.extract_vix_context(vix_quote)
+    vix_dict = {"valor": vix_result.valor, "disponible": vix_result.disponible}
+
+    return summary.build_summary_parts(
         ticker=ticker,
         company_name=company_name,
         precio_actual=precio_actual or 0.0,
@@ -268,7 +306,129 @@ async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
         peer_comparison=peer_comparison_dict,
         risk_fit=risk_fit_dict,
         treasury_source=treasury_source,
+        extras=extras_dict,
+        vix=vix_dict,
     )
+
+
+async def fetch_and_analyze(ticker: str, clients: Clients, perfil: str) -> str:
+    """Wrapper de compatibilidad — todo lo que hoy llama `fetch_and_analyze`
+    sigue recibiendo el mismo `str` (mismo patrón que
+    `summary.build_summary`/`summary.build_summary_parts`, Decisión 16.1)."""
+    return "\n\n".join(await fetch_and_analyze_parts(ticker, clients, perfil))
+
+
+def _split_oversized_part(part: str, limit: int) -> list[str]:
+    """Parte una sección que por sí sola supera `limit`, probando cortes
+    cada vez más finos: párrafo ("\\n\\n") -> línea ("\\n") -> oración
+    (". ") -> corte duro con marcador visible + log. Nunca corta a mitad de
+    palabra salvo el último recurso absoluto (Decisión 18)."""
+    for separator in ("\n\n", "\n", ". "):
+        pieces = part.split(separator)
+        if len(pieces) > 1:
+            chunks, current = [], ""
+            for piece in pieces:
+                candidate = current + (separator if current else "") + piece
+                if len(candidate) > limit and current:
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = candidate
+            if current:
+                chunks.append(current)
+            if all(len(c) <= limit for c in chunks):
+                return chunks
+    # Último recurso: no debería llegar acá con el contenido actual del
+    # proyecto. Corte duro + marcador visible + log explícito (Decisión 19:
+    # nunca perder contenido en silencio).
+    logger.error(
+        "Sección individual de %d caracteres no se pudo partir por párrafo/"
+        "línea/oración dentro del límite de Telegram — corte duro aplicado. "
+        "Texto completo:\n%s", len(part), part,
+    )
+    marker = "\n\n⚠️ _[recortado por límite de Telegram — ver logs]_"
+    return [part[: limit - len(marker)] + marker]
+
+
+def chunk_for_telegram(
+    parts: list[str], limit: int = TELEGRAM_MESSAGE_LIMIT
+) -> list[str]:
+    """Empaqueta `parts` (las secciones de summary.build_summary_parts) en
+    la menor cantidad de mensajes de Telegram posible, sin superar `limit`
+    caracteres por mensaje. Nunca corta el contenido de una sección salvo
+    que una sección sola ya supere `limit` (Decisión 18). Determinístico,
+    sin I/O, sin conocimiento de python-telegram-bot."""
+    budget = limit - _CONTINUATION_PREFIX_RESERVE
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        if current:
+            chunks.append("\n\n".join(current))
+
+    for part in parts:
+        if len(part) > budget:
+            flush()
+            current, current_len = [], 0
+            chunks.extend(_split_oversized_part(part, budget))
+            continue
+        added_len = len(part) + (2 if current else 0)  # "\n\n" entre partes
+        if current_len + added_len > budget:
+            flush()
+            current, current_len = [part], len(part)
+        else:
+            current.append(part)
+            current_len += added_len
+    flush()
+    return chunks or [""]
+
+
+def _with_continuation_prefixes(chunks: list[str]) -> list[str]:
+    """Antepone el prefijo de continuación (Decisión 17.1) a los chunks 2..N.
+    No-op si hay 1 solo chunk (caso de hoy)."""
+    if len(chunks) <= 1:
+        return chunks
+    n = len(chunks)
+    return [
+        chunk if i == 1 else _CONTINUATION_PREFIX.format(i=i, n=n) + chunk
+        for i, chunk in enumerate(chunks, start=1)
+    ]
+
+
+def _hard_truncate_with_marker(parts: list[str]) -> str:
+    """Red de seguridad de último recurso (Decisión 19): un fallo inesperado
+    de `chunk_for_telegram` en sí (bug propio, no un fallo de Telegram) nunca
+    debe tumbar `_run_analysis` — se entrega un único mensaje truncado, con
+    el contenido completo logueado antes de truncar."""
+    full = "\n\n".join(parts)
+    logger.error(
+        "chunk_for_telegram falló de forma inesperada (%d caracteres, %d "
+        "secciones) — se entrega un único mensaje truncado como último "
+        "recurso. Texto completo:\n%s", len(full), len(parts), full,
+    )
+    marker = "\n\n⚠️ _[mensaje recortado por un error interno — el análisis completo quedó en los logs]_"
+    return full[: TELEGRAM_MESSAGE_LIMIT - len(marker)] + marker
+
+
+async def _deliver_all(reply_fn, first_msg, remaining_or_all, ticker, **kwargs) -> None:
+    """Entrega los chunks restantes. Si `first_msg` es `None`,
+    `remaining_or_all` incluye el chunk 0 y se manda por `reply_fn` (mismo
+    comportamiento que hoy cuando no hay `loading_msg`); el resto se manda
+    con `.chat.send_message` sobre el `Message` que devuelve esa primera
+    llamada."""
+    chunks = remaining_or_all
+    if first_msg is None:
+        first_msg = await reply_fn(chunks[0], **kwargs)
+        chunks = chunks[1:]
+    for i, chunk in enumerate(chunks, start=2):
+        try:
+            await first_msg.chat.send_message(chunk, **kwargs)
+        except TelegramError as exc:
+            logger.error(
+                "No se pudo enviar la parte %d del análisis de %s — esa parte no "
+                "llegó a Telegram: %s", i, ticker, exc,
+            )
 
 
 def build_query_handlers(
@@ -363,26 +523,37 @@ def build_query_handlers(
             )
 
         try:
-            text = await fetch_and_analyze(ticker, clients, perfil)
+            parts = await fetch_and_analyze_parts(ticker, clients, perfil)
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
-            final_text, kwargs = str(exc), {}
+            final_parts, kwargs = [str(exc)], {}
         except Exception:
             logger.exception("Error inesperado analizando %s", ticker)
-            final_text, kwargs = GENERIC_ERROR_MSG, {}
+            final_parts, kwargs = [GENERIC_ERROR_MSG], {}
         else:
-            final_text, kwargs = text, {"parse_mode": "Markdown"}
+            final_parts, kwargs = parts, {"parse_mode": "Markdown"}
+
+        try:
+            chunks = chunk_for_telegram(final_parts)
+        except Exception:
+            logger.exception("Fallo inesperado partiendo el mensaje para %s", ticker)
+            chunks = [_hard_truncate_with_marker(final_parts)]
+
+        chunks = _with_continuation_prefixes(chunks)
 
         if loading_msg is None:
-            await reply_fn(final_text, **kwargs)
+            await _deliver_all(reply_fn, None, chunks, ticker, **kwargs)
             return
 
         try:
-            await loading_msg.edit_text(final_text, **kwargs)
+            await loading_msg.edit_text(chunks[0], **kwargs)
         except TelegramError as exc:
             logger.warning(
                 "No se pudo editar el mensaje final para %s — %s", ticker, exc
             )
-            await reply_fn(final_text, **kwargs)
+            await _deliver_all(reply_fn, None, chunks, ticker, **kwargs)
+            return
+
+        await _deliver_all(reply_fn, loading_msg, chunks[1:], ticker, **kwargs)
 
     return [
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),

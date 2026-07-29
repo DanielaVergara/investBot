@@ -79,6 +79,44 @@ def calculate_ps(market_cap: float, revenue: float) -> Optional[float]:
 
 
 @dataclass
+class KeyMetricsExtras:
+    roe: Optional[float]
+    debt_to_equity: Optional[float]
+    net_debt_to_ebitda: Optional[float]
+    dividend_yield: Optional[float]
+    payout_ratio: Optional[float]
+
+
+def extract_key_metrics_extras(metrics: Optional[dict]) -> KeyMetricsExtras:
+    """Lee ROE, Debt-to-Equity, Net Debt/EBITDA, Dividend Yield y Payout
+    Ratio del dict más reciente de /key-metrics (anual) del ticker propio.
+    No calcula nada — FMP ya precalcula estos campos. Guarda de tipo: si
+    el campo está ausente, es None, o no es int/float, se descarta como
+    None (nunca crashea, nunca inventa un valor, nunca intenta parsear
+    strings). No filtra por signo ni rango — un ROE negativo, un
+    Debt-to-Equity fuera de rango típico, o un Payout Ratio > 100% son
+    señales financieras reales (patrimonio negativo, sobre-endeudamiento,
+    reparto de dividendos pese a pérdidas) y se muestran tal cual, sin
+    interpretación numérica adicional (eso sería agregar complejidad
+    matemática nueva, fuera de alcance de esta spec).
+    """
+
+    def _num(key: str) -> Optional[float]:
+        if not metrics:
+            return None
+        value = metrics.get(key)
+        return value if isinstance(value, (int, float)) else None
+
+    return KeyMetricsExtras(
+        roe=_num("roe"),
+        debt_to_equity=_num("debtToEquity"),
+        net_debt_to_ebitda=_num("netDebtToEBITDA"),
+        dividend_yield=_num("dividendYield"),
+        payout_ratio=_num("payoutRatio"),
+    )
+
+
+@dataclass
 class PillarsResult:
     ingresos_crecientes: bool
     utilidades_crecientes: bool
