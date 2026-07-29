@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from telegram.error import TelegramError
 
 from investbot import db, query_handler
 from investbot.fmp_client import FMPError
@@ -135,7 +136,10 @@ class FakeRateLimiter:
 
 def _fake_text_update(text, chat_id=ALLOWED_CHAT_ID):
     update = SimpleNamespace()
-    update.message = SimpleNamespace(text=text, reply_text=AsyncMock())
+    update.message = SimpleNamespace(
+        text=text,
+        reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+    )
     update.effective_chat = SimpleNamespace(id=chat_id, type="private")
     update.callback_query = None
     return update
@@ -200,9 +204,14 @@ async def test_handle_text_resuelve_ticker_exacto_y_responde(adobe_fixtures, con
 
     update = _fake_text_update("ADBE")
     await handle_text(update, context=SimpleNamespace())
-    update.message.reply_text.assert_awaited_once()
-    args, kwargs = update.message.reply_text.call_args
+    update.message.reply_text.assert_awaited_once_with(
+        query_handler.LOADING_MSG.format(ticker="ADBE")
+    )
+    loading_msg = update.message.reply_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    args, kwargs = loading_msg.edit_text.call_args
     assert "Adobe" in args[0]
+    assert kwargs.get("parse_mode") == "Markdown"
 
 
 async def test_handle_text_sin_coincidencias(adobe_fixtures, conn_factory):
@@ -284,14 +293,18 @@ async def test_handle_disambiguation_resuelve_y_responde(adobe_fixtures, conn_fa
 
     update = SimpleNamespace()
     query = SimpleNamespace(
-        data="tk:ADBE", answer=AsyncMock(), edit_message_text=AsyncMock()
+        data="tk:ADBE",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
     )
     update.callback_query = query
     update.effective_chat = SimpleNamespace(id=ALLOWED_CHAT_ID, type="private")
 
     await handle_disambiguation(update, context=SimpleNamespace())
     query.edit_message_text.assert_awaited_once()
-    args, kwargs = query.edit_message_text.call_args
+    loading_msg = query.edit_message_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    args, kwargs = loading_msg.edit_text.call_args
     assert "Adobe" in args[0]
 
 
@@ -324,5 +337,122 @@ async def test_run_analysis_error_generico_no_crashea(conn_factory, monkeypatch)
 
     update = _fake_text_update("ADBE")
     await handle_text_fn(update, context=SimpleNamespace())
-    args, kwargs = update.message.reply_text.call_args
+    update.message.reply_text.assert_awaited_once_with(
+        query_handler.LOADING_MSG.format(ticker="ADBE")
+    )
+    loading_msg = update.message.reply_text.return_value
+    args, kwargs = loading_msg.edit_text.call_args
     assert args[0] == query_handler.GENERIC_ERROR_MSG
+    assert "parse_mode" not in kwargs
+
+
+async def test_run_analysis_fmp_error_dentro_de_fetch_and_analyze(conn_factory, monkeypatch):
+    """FMPError/TreasuryError lanzado dentro de `fetch_and_analyze` (no en
+    `search_company`, que ya tiene su propio test) también debe llegar vía
+    `.edit_text` sobre el mensaje de carga, no vía una segunda llamada
+    directa a `reply_fn`."""
+    _complete_onboarding(conn_factory)
+
+    async def raise_fmp_error(ticker, clients_arg, perfil):
+        raise FMPError("429 rate limited")
+
+    async def fake_search(client, key, q):
+        return [{"symbol": "ADBE", "name": "Adobe Inc."}]
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze", raise_fmp_error)
+    monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
+
+    empty_transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    clients = query_handler.Clients(
+        fmp_http=httpx.AsyncClient(transport=empty_transport),
+        fred_http=httpx.AsyncClient(transport=empty_transport),
+        treasury_gov_http=httpx.AsyncClient(transport=empty_transport),
+        fmp_api_key="test-key",
+        fred_api_key="test-key",
+    )
+
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    handle_text_fn = handlers[0].callback
+
+    update = _fake_text_update("ADBE")
+    await handle_text_fn(update, context=SimpleNamespace())
+    update.message.reply_text.assert_awaited_once_with(
+        query_handler.LOADING_MSG.format(ticker="ADBE")
+    )
+    loading_msg = update.message.reply_text.return_value
+    args, kwargs = loading_msg.edit_text.call_args
+    assert args[0] == "429 rate limited"
+    assert "parse_mode" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# Mensaje de carga — matriz envío/edit OK-falla (spec SDD_mensaje_cargando.md)
+# ---------------------------------------------------------------------------
+
+
+async def test_handle_text_falla_envio_mensaje_carga_no_bloquea_analisis(
+    adobe_fixtures, conn_factory
+):
+    """Si el envío del mensaje de carga falla (TelegramError), el análisis
+    real sigue igual y el resultado final llega por una llamada directa a
+    `reply_fn` (sin `.edit_text`, porque no hay `Message` que editar)."""
+    _complete_onboarding(conn_factory)
+    clients = _make_clients(adobe_fixtures)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    handle_text = handlers[0].callback
+
+    update = _fake_text_update("ADBE")
+    update.message.reply_text = AsyncMock(
+        side_effect=[TelegramError("boom"), SimpleNamespace(edit_text=AsyncMock())]
+    )
+
+    await handle_text(update, context=SimpleNamespace())
+
+    assert update.message.reply_text.await_count == 2
+    first_args, _ = update.message.reply_text.call_args_list[0]
+    assert first_args[0] == query_handler.LOADING_MSG.format(ticker="ADBE")
+    final_args, final_kwargs = update.message.reply_text.call_args_list[1]
+    assert "Adobe" in final_args[0]
+    assert final_kwargs.get("parse_mode") == "Markdown"
+
+
+async def test_handle_text_falla_edit_final_hace_fallback_a_reply_fn(
+    adobe_fixtures, conn_factory
+):
+    """Si el edit final sobre el mensaje de carga falla (TelegramError), se
+    hace un único intento de fallback llamando a `reply_fn` directamente con
+    el contenido final — nunca se pierde la respuesta."""
+    _complete_onboarding(conn_factory)
+    clients = _make_clients(adobe_fixtures)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    handle_text = handlers[0].callback
+
+    update = _fake_text_update("ADBE")
+    loading_msg = SimpleNamespace(edit_text=AsyncMock(side_effect=TelegramError("boom")))
+    update.message.reply_text = AsyncMock(return_value=loading_msg)
+
+    await handle_text(update, context=SimpleNamespace())
+
+    assert update.message.reply_text.await_count == 2
+    loading_msg.edit_text.assert_awaited_once()
+    final_args, final_kwargs = update.message.reply_text.call_args_list[1]
+    assert "Adobe" in final_args[0]
+    assert final_kwargs.get("parse_mode") == "Markdown"
+
+
+async def test_handle_text_excepcion_no_telegram_en_envio_carga_se_propaga(
+    adobe_fixtures, conn_factory
+):
+    """El `except TelegramError` acotado no debe convertirse en un catch-all:
+    una excepción que no sea de Telegram (p.ej. `ValueError`) debe propagarse
+    sin ser tragada como si fuera un fallo best-effort de la API de Telegram."""
+    _complete_onboarding(conn_factory)
+    clients = _make_clients(adobe_fixtures)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    handle_text = handlers[0].callback
+
+    update = _fake_text_update("ADBE")
+    update.message.reply_text = AsyncMock(side_effect=ValueError("no es un TelegramError"))
+
+    with pytest.raises(ValueError):
+        await handle_text(update, context=SimpleNamespace())

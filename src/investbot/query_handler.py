@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from investbot import (
@@ -42,6 +43,7 @@ NO_MATCHES_MSG = "No encontré ninguna empresa que coincida con \"{query}\". Pro
 INPUT_TOO_LONG_MSG = f"Ese texto es demasiado largo (máximo {MAX_INPUT_LENGTH} caracteres). Probá con un ticker o nombre corto."
 RATE_LIMITED_MSG = "Estás consultando muy rápido — esperá un minuto antes de volver a intentar."
 GENERIC_ERROR_MSG = "No pude completar el análisis ahora mismo. Intenta más tarde."
+LOADING_MSG = "🔍 Analizando {ticker}, dame un toque..."
 
 _CONTROL_CHARS_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f]")
 
@@ -352,16 +354,35 @@ def build_query_handlers(
         await _run_analysis(query.edit_message_text, ticker, perfil)
 
     async def _run_analysis(reply_fn, ticker: str, perfil: str) -> None:
+        loading_msg = None
+        try:
+            loading_msg = await reply_fn(LOADING_MSG.format(ticker=ticker))
+        except TelegramError as exc:
+            logger.warning(
+                "No se pudo enviar el mensaje de carga para %s — %s", ticker, exc
+            )
+
         try:
             text = await fetch_and_analyze(ticker, clients, perfil)
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
-            await reply_fn(str(exc))
-            return
+            final_text, kwargs = str(exc), {}
         except Exception:
             logger.exception("Error inesperado analizando %s", ticker)
-            await reply_fn(GENERIC_ERROR_MSG)
+            final_text, kwargs = GENERIC_ERROR_MSG, {}
+        else:
+            final_text, kwargs = text, {"parse_mode": "Markdown"}
+
+        if loading_msg is None:
+            await reply_fn(final_text, **kwargs)
             return
-        await reply_fn(text, parse_mode="Markdown")
+
+        try:
+            await loading_msg.edit_text(final_text, **kwargs)
+        except TelegramError as exc:
+            logger.warning(
+                "No se pudo editar el mensaje final para %s — %s", ticker, exc
+            )
+            await reply_fn(final_text, **kwargs)
 
     return [
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
