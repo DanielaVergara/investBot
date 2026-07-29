@@ -15,3 +15,11 @@ real (sin acceso a red/API key real en este entorno de implementación).
 Antes de producción real, reemplazar por una captura real con API key válida
 si se quiere verificar la forma exacta de la respuesta de FMP (pendiente
 documentado en el reporte de cierre de `implementer`).
+
+- `402_symbol_premium_real.txt` — **Origen: real**, capturado con `curl`
+  contra `/quote` para los tickers MELI y DRAM (respuesta 402 idéntica en
+  ambos). Body en texto plano (no JSON) — usado para el sub-caso "símbolo
+  premium" de la spec `SDD_fmp_402_simbolo_premium.md`.
+- `402_generic_payment_required.json` — **Origen: sintético**, `{"error":
+  "Payment Required"}` — representa un 402 genérico no reconocido (regresión
+  explícita: no debe activar el mensaje de "símbolo premium").

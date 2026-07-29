@@ -6,12 +6,21 @@ Usa `httpx.MockTransport` para simular respuestas de FMP. Ningún test toca
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import httpx
 import pytest
 
 from investbot import fmp_client
 
 SECRET_KEY = "SECRETO123"
+
+FMP_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "fmp"
+
+
+def _read_fmp_fixture_text(name: str) -> str:
+    return (FMP_FIXTURES_DIR / name).read_text(encoding="utf-8")
 
 
 def _client_with_handler(handler) -> httpx.AsyncClient:
@@ -205,3 +214,242 @@ async def test_get_profile_y_key_metrics():
     client2 = _client_with_handler(handler2)
     metrics = await fmp_client.get_key_metrics(client2, "test-key", "ADBE")
     assert metrics[0]["roe"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 402 "símbolo premium" — SDD_fmp_402_simbolo_premium.md
+# ---------------------------------------------------------------------------
+
+SYMBOL_PREMIUM_BODY_REAL = _read_fmp_fixture_text("402_symbol_premium_real.txt")
+GENERIC_402_MESSAGE = "FMP respondió con un error (402). Intenta más tarde."
+
+
+# --- Unidad: _is_symbol_premium_402 (función pura, sin red) -----------------
+
+
+@pytest.mark.parametrize(
+    "body_text, expected",
+    [
+        (SYMBOL_PREMIUM_BODY_REAL, True),
+        ('{"error": "Payment Required"}', False),
+        ("", False),
+        (None, False),
+        # Mayúsculas/minúsculas mixtas E INDEPENDIENTES entre los dos
+        # substrings (no solo "todo mayúsculas" u "todo minúsculas") — evita
+        # que el test pase por casualidad con un solo .upper()/.lower()
+        # aplicado a todo el body de una vez.
+        ("Ocurrió: Special ENDPOINT y también SymBol no disponible", True),
+        # Match parcial: un solo substring presente no debe disparar el caso.
+        ("Special Endpoint sin la otra palabra clave", False),
+        ("symbol sin la otra frase clave", False),
+    ],
+)
+def test_is_symbol_premium_402_casos(body_text, expected):
+    assert fmp_client._is_symbol_premium_402(body_text) is expected
+
+
+def test_is_symbol_premium_402_trunca_y_no_matchea_si_esta_despues_de_2000():
+    """Boundary del truncado (criterio de `security`): si ambos substrings
+    aparecen después de la posición ~2000, el truncado los descarta."""
+    body = ("a" * 2000) + " special endpoint symbol"
+    assert len(body) > 2000
+    assert fmp_client._is_symbol_premium_402(body) is False
+
+
+def test_is_symbol_premium_402_matchea_si_esta_antes_de_2000():
+    """Contraparte del test anterior: substrings antes de la posición ~2000
+    en un body de >2000 caracteres siguen evaluando True."""
+    body = "special endpoint symbol " + ("a" * 2500)
+    assert len(body) > 2000
+    assert fmp_client._is_symbol_premium_402(body) is True
+
+
+# --- Integración: _get / FMPError vía MockTransport -------------------------
+
+
+async def test_error_402_simbolo_premium_mensaje_especifico():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "MELI")
+
+    message = str(exc_info.value)
+    assert "MELI" in message  # (a) menciona el ticker puntual
+    assert "plan gratuito" in message  # (a) plan gratuito explícito
+    assert message != GENERIC_402_MESSAGE  # (b) no es el string genérico
+    assert "cupo" not in message.lower()  # (c) no confunde con 429
+    assert "límite" not in message.lower()  # (c) no confunde con cupo diario
+    assert "api key" not in message.lower()  # (c) no confunde con 401/403
+    assert "otro ticker" in message.lower()  # (d) sugiere otro ticker
+
+
+async def test_error_402_generico_body_json_no_reconocido_mensaje_sin_cambios():
+    """Regresión explícita: un 402 con body distinto sigue cayendo en el
+    mensaje genérico actual, sin modificación."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, json={"error": "Payment Required"})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert str(exc_info.value) == GENERIC_402_MESSAGE
+
+
+async def test_error_402_generico_body_vacio_mensaje_sin_cambios():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "ADBE")
+    assert str(exc_info.value) == GENERIC_402_MESSAGE
+
+
+async def test_error_402_simbolo_premium_no_filtra_body_ni_api_key_en_logs(caplog):
+    """Mismo patrón que `test_error_401_no_filtra_api_key_en_logs`, para el
+    sub-caso símbolo premium: ni el body crudo ni la API key llegan a logs."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(fmp_client.FMPError):
+            await fmp_client.get_quote(client, SECRET_KEY, "MELI")
+
+    assert SECRET_KEY not in caplog.text
+    assert "Special Endpoint" not in caplog.text
+    assert "subscription page" not in caplog.text
+    assert "subcaso=simbolo_premium" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response_kwargs",
+    [
+        {"json": {"error": "Payment Required"}},
+        {},  # body vacío
+    ],
+    ids=["body_json_generico", "body_vacio"],
+)
+async def test_error_402_generico_no_filtra_body_ni_api_key_en_logs(
+    caplog, response_kwargs
+):
+    """Criterio de `security`: el body se lee (para poder decidir el match)
+    en toda rama de 402, no solo en la que matchea — ambas deben probarse."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, **response_kwargs)
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(fmp_client.FMPError):
+            await fmp_client.get_quote(client, SECRET_KEY, "ADBE")
+
+    assert SECRET_KEY not in caplog.text
+    assert "Payment Required" not in caplog.text
+    assert "subcaso=generico" in caplog.text
+
+
+async def test_error_402_body_no_legible_labelea_distinto_y_cae_a_generico(
+    monkeypatch, caplog
+):
+    """Criterio de `security`: si falla la lectura/decodificación del body,
+    (a) no propaga la excepción sin capturar, (b) el mensaje al usuario cae
+    en el genérico existente, (c) el log usa el label de "no legible", no el
+    de "genérico"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, content=b"algo")
+
+    def _raise_unicode_error(self):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "byte invalido")
+
+    monkeypatch.setattr(httpx.Response, "text", property(_raise_unicode_error))
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(fmp_client.FMPError) as exc_info:
+            await fmp_client.get_quote(client, SECRET_KEY, "ADBE")
+
+    assert str(exc_info.value) == GENERIC_402_MESSAGE
+    assert "subcaso=cuerpo_no_legible" in caplog.text
+    assert "subcaso=generico" not in caplog.text
+    assert SECRET_KEY not in caplog.text
+
+
+async def test_error_402_simbolo_premium_mensaje_no_incluye_apikey_ni_otros_params():
+    """El mensaje se arma únicamente con `params.get("symbol")` — ninguna
+    otra clave de `params` (representativo: `apikey`) debe aparecer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, SECRET_KEY, "MELI")
+
+    message = str(exc_info.value)
+    assert SECRET_KEY not in message
+    assert "apikey" not in message.lower()
+
+
+async def test_error_402_simbolo_premium_sin_symbol_en_params_no_lanza_keyerror():
+    """Caso defensivo (QA): si `params` no trae `"symbol"`, el mensaje no
+    debe crashear con `KeyError` — puede omitir el ticker."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client._get(
+            client, "/quote", {"apikey": SECRET_KEY}, endpoint_label="/quote"
+        )
+
+    message = str(exc_info.value)
+    assert "plan gratuito" in message
+    assert message != GENERIC_402_MESSAGE
+
+
+async def test_error_402_simbolo_premium_ticker_con_punto_aparece_verbatim():
+    """Ticker con caracteres no alfanuméricos comunes (`BRK.B`) aparece igual
+    en el mensaje — confirma interpolación simple, no regex."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await fmp_client.get_quote(client, "test-key", "BRK.B")
+
+    assert "BRK.B" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda client: fmp_client.get_quote(client, "test-key", "MELI"),
+        lambda client: fmp_client.get_profile(client, "test-key", "MELI"),
+        lambda client: fmp_client.get_income_statement(client, "test-key", "MELI"),
+    ],
+    ids=["/quote", "/profile", "/income-statement"],
+)
+async def test_error_402_simbolo_premium_en_tres_endpoints_confirmados(call):
+    """El `Estado objetivo` de la spec cita `/quote`, `/profile` e
+    `/income-statement` como confirmados con MELI/DRAM — los tres deben
+    pasar por la misma rama de `_get`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text=SYMBOL_PREMIUM_BODY_REAL)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(fmp_client.FMPError) as exc_info:
+        await call(client)
+
+    message = str(exc_info.value)
+    assert "MELI" in message
+    assert "plan gratuito" in message
+    assert message != GENERIC_402_MESSAGE

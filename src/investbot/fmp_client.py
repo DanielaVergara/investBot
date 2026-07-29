@@ -33,9 +33,31 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://financialmodelingprep.com/stable"
 DEFAULT_TIMEOUT = 10.0
 
+# Cota de tamaño para el match del sub-caso "símbolo premium" de un 402
+# (criterio de `security`): evita depender de un body anómalamente grande.
+_MAX_BODY_CHARS_402 = 2000
+
 
 class FMPError(Exception):
     """Error sanitizado de FMP — nunca incluye la URL ni la API key."""
+
+
+def _is_symbol_premium_402(body_text: Optional[str]) -> bool:
+    """True si el body de un 402 corresponde al sub-caso "símbolo puntual no
+    disponible en el plan gratuito" (confirmado con `curl` real para
+    MELI/DRAM sobre `/quote`), en vez de un 402 genérico no reconocido.
+
+    Función pura, sin efectos secundarios — no loguea ni lee red. Evalúa,
+    case-insensitive, si están presentes ambos substrings
+    `"special endpoint"` y `"symbol"` (AND, no OR — evita falsos positivos
+    sobre otros 402 no confirmados). Opera sobre como máximo los primeros
+    `_MAX_BODY_CHARS_402` caracteres del body, truncado antes de aplicar
+    `.lower()`/`in`.
+    """
+    if not body_text:
+        return False
+    truncated = body_text[:_MAX_BODY_CHARS_402].lower()
+    return "special endpoint" in truncated and "symbol" in truncated
 
 
 async def _get(
@@ -68,6 +90,30 @@ async def _get(
                 "La API key de FMP parece inválida o vencida. Revisa la "
                 "configuración del bot."
             )
+        if status == 402:
+            try:
+                body_text: Optional[str] = exc.response.text
+            except (UnicodeDecodeError, RuntimeError):
+                body_text = None
+
+            if body_text is None:
+                subcaso = "cuerpo_no_legible"
+                es_simbolo_premium = False
+            else:
+                es_simbolo_premium = _is_symbol_premium_402(body_text)
+                subcaso = "simbolo_premium" if es_simbolo_premium else "generico"
+
+            logger.warning(
+                "FMP error 402 — endpoint=%s subcaso=%s", endpoint_label, subcaso
+            )
+
+            if es_simbolo_premium:
+                symbol = params.get("symbol")
+                ticker_txt = f"El ticker {symbol}" if symbol else "Este ticker"
+                raise FMPError(
+                    f"{ticker_txt} no está disponible en el plan gratuito de "
+                    "FMP para esta consulta. Prueba con otro ticker."
+                )
         raise FMPError(f"FMP respondió con un error ({status}). Intenta más tarde.")
     except httpx.RequestError:
         logger.warning("FMP error de red — endpoint=%s", endpoint_label)

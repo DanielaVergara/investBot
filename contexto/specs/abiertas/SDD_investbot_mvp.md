@@ -824,3 +824,608 @@ Se confirma la afirmación de `architect`: B1-B4 son cambios puramente aritméti
 ### Veredicto de `qa`
 
 **SCOPE FREEZE confirmado.** Los 5 bloqueantes B1-B5 quedaron con comportamiento definido, estructura de retorno concreta (`modelos_excluidos`, `per_no_aplicable`, `liquidez_sin_pasivos_circulantes`) y criterios de aceptación con assert determinista, escribibles como test unitario sin inventar nada. El pipeline pasa **directo a `implementer`**, sin volver a `security` ni a `frontend`.
+
+---
+
+## Spec Patch [Iter-3] para: SDD_investbot_mvp.md — Escenarios Pesimista/Conservador/Optimista en los 3 modelos de valoración
+
+**Rol:** `architect`. **Fecha:** 2026-07-28.
+
+**Origen (distinto a Iter-2):** este patch **no** nace de una escalación de `qa`/`implementer` — el pipeline ya llegó a scope freeze en Iter-2 y el bot está desplegado en producción. Es un **pedido nuevo de negocio de Daniela** (textual): quiere que el bot calcule un rango Pesimista/Conservador/Optimista para los **3 modelos completos de valoración** (Múltiplos, Graham EPS Model, DCF) — hoy el único lugar donde existe algo parecido a un "rango" es el promedio de PER de peers dentro de Múltiplos, y ni siquiera se expone como rango. Se documenta como **spec patch (Iter-3)**, no como spec nueva, porque el cambio es acotado a `valuation.py`, `peers.py` y `summary.py`, sin reabrir stack, arquitectura de despliegue, modelo de datos SQLite, ni ninguna de las 5 secciones de `security` (Iter-1) — mismo criterio de alcance que ya se aplicó en Iter-2.
+
+**Nota de estado del código (para que `implementer` no se confunda con la spec):** `valuation.py` y `peers.py` en el repo real ya incorporan dos fixes post-despliegue no documentados formalmente en esta spec — migración de `/api/v3` (discontinuada) a la API "stable" de FMP, y reemplazo de `/key-metrics-ttm` (resultó ser de pago) por `/key-metrics` anual, derivando el PER de peers como `1 / earningsYield`. Este patch parte del código real tal como está hoy (leído directamente de `src/investbot/valuation.py`, `src/investbot/peers.py`, `src/investbot/rules.py`, `src/investbot/summary.py`), no de la redacción literal de endpoints de Iter-1/Iter-2.
+
+---
+
+### Estado actual
+
+- `valuation.py::compute_valuation(...)` calcula **un único punto** por modelo (Múltiplos, Graham, DCF) y un `valor_justo_total` (promedio simple de los modelos calculables), aplicando las guardas de exclusión de Iter-2 (B1/B2/B4). No existe ningún concepto de escenario.
+- `peers.py::get_peer_pe_average(...)` calcula **solo el promedio** de PER de los peers válidos (`PeerAverageResult(per_promedio, peers_usados)`) — no conserva la lista de PERs individuales, así que hoy no hay forma de derivar un mínimo/máximo sin recalcular.
+- `summary.py::build_valuation_section(...)` muestra un único número por modelo y un único `valor_justo_total`/"valor aproximado" (según cuántos modelos se excluyeron), sin ningún rango.
+- `tests/test_valuation.py::test_valuation_adobe_regression` llama a `compute_valuation(...)` directo y asume implícitamente que ese único resultado es "el" resultado — hoy equivale, sin decirlo explícitamente, al que este patch va a nombrar **escenario conservador**.
+
+### Estado objetivo
+
+Cada consulta de empresa calcula **3 escenarios completos** (pesimista/conservador/optimista) para los 3 modelos, reutilizando exactamente los mismos datos ya obtenidos de FMP/FRED en esa consulta (sin ninguna llamada HTTP adicional — ver punto 5 abajo). La respuesta a Daniela sigue centrada en un solo número accionable (el escenario conservador, sin cambios de comportamiento respecto a hoy) más una línea adicional de rango, sin abrumarla con 9 números.
+
+---
+
+### 1. Qué varía en cada modelo para generar los 3 escenarios
+
+**Principio general de diseño:** el escenario **conservador es, número por número, el cálculo que el bot ya hace hoy** (Iter-1/Iter-2, sin cambios) — nunca se toca su fórmula ni sus guardas. Pesimista y optimista son variaciones **alrededor** de ese mismo cálculo, no un modelo nuevo. Esto es deliberado: minimiza el riesgo de este patch (el comportamiento actual, ya validado con el caso Adobe, queda intacto) y responde directamente al punto 4 del pedido.
+
+**Múltiplos — se propone PER mínimo/promedio/máximo del set de peers, no desviación estándar.**
+- Pesimista = EPS TTM × **PER mínimo** de los peers válidos del sector.
+- Conservador = EPS TTM × **PER promedio** de los peers válidos (sin cambios respecto a hoy).
+- Optimista = EPS TTM × **PER máximo** de los peers válidos.
+- **Por qué min/max y no desviación estándar:** el set de peers es de 3 a 5 tickers (Decisión #9, Iter-1) — una desviación estándar sobre una muestra de n=3-5 es estadísticamente ruidosa (un solo peer atípico la distorsiona) y, más importante, es difícil de explicar en el formato "explícamelo como si fuera tonto" (¿cómo le explicás una desviación estándar a Daniela sin jerga?). El mínimo/máximo, en cambio, es literal y verificable: "el peer más barato" y "el peer más caro" del set — consistente con el principio de transparencia ya usado en toda la spec (ej. Decisión #9 ya dice "PER promedio de un set fijo de comparables, no del sector completo").
+- **Caso degenerado (menos de 2 peers con PER válido):** si solo hay 1 peer válido (o 0, que ya excluye el modelo entero por Iter-2), mínimo = promedio = máximo — no hay rango real. Se documenta explícitamente en la respuesta ("no hay rango disponible para Múltiplos: solo 1 comparable con datos válidos") en vez de mostrar 3 números iguales sin explicación.
+
+**Graham EPS Model — se propone desplazar `g` (CAGR histórico) en puntos porcentuales absolutos, no multiplicarlo por un factor.**
+- Pesimista: `g_pesimista = g_conservador - DELTA_G`
+- Conservador: `g` = CAGR histórico tal cual (Decisión #4, sin cambios).
+- Optimista: `g_optimista = g_conservador + DELTA_G`
+- `DELTA_G` propuesto: **3 puntos porcentuales (0.03 en fracción decimal)** — constante documentada, ajustable por Daniela (mismo tratamiento que la prima de riesgo de mercado de 5.5% en la Decisión #10 — asunción explícita del `architect`, no viene del material fuente).
+- **Por qué un desplazamiento absoluto (±3pp) y no un factor multiplicativo (ej. ×0.5 / ×1.5):** un factor multiplicativo invierte la lógica cuando `g` ya es negativo (una empresa con EPS decreciente) — multiplicar un `g` negativo por 1.5 lo hace *más* negativo, lo cual describir como "optimista" sería contradictorio y confuso de explicar. Un desplazamiento absoluto es direccionalmente consistente sin importar el signo de `g`: pesimista siempre resta, optimista siempre suma, sea cual sea el punto de partida.
+- **Guarda nueva (cierra un hueco que ya existía en Iter-2, expuesto ahora por este patch):** la fórmula de Graham usa el multiplicador `(8.5 + 2×g_pct)`. Iter-2 (bloqueante B1, sección "casos límite financieros") ya reconocía que "la fórmula funciona matemáticamente con g negativo mientras `(8.5 + 2×g) > 0`" pero **nunca agregó esa guarda al código** — `calculate_graham_fair_value` hoy no valida el signo del multiplicador. Con `g` conservador cercano a cero y `DELTA_G` restándole 3 puntos, el escenario pesimista puede empujar el multiplicador a cero o negativo con más frecuencia que antes (antes solo ocurría con un CAGR histórico ya muy negativo). Este patch **agrega la guarda**: si `(8.5 + 2×g_pct) <= 0` para un escenario dado, ese escenario de Graham se excluye (no se calcula un "valor justo" negativo o cero). Esta guarda aplica a los 3 escenarios por igual (incluido el conservador, cerrando el hueco de Iter-2 de forma retroactiva y consistente).
+
+**DCF — se propone variar tanto el WACC como la tasa de crecimiento del FCF proyectado, con el mismo criterio de desplazamiento absoluto.**
+- `wacc_pesimista = wacc_conservador + DELTA_WACC` (mayor tasa de descuento → menor valor presente → más pesimista).
+- `wacc_optimista = wacc_conservador - DELTA_WACC` (menor tasa de descuento → mayor valor presente → más optimista).
+- `wacc_conservador` = el WACC ya calculado hoy (sin cambios, Decisión #10).
+- `g_fcf` (CAGR de FCF usado para proyectar los 5 años) se desplaza con el **mismo `DELTA_G`** que Graham (±3pp) — no se introduce una constante separada por modelo; es la misma idea de "crecimiento futuro más pesimista/optimista" aplicada al mismo tipo de dato (un CAGR histórico), y usar una única constante es más simple de mantener y de explicar que dos constantes con el mismo propósito.
+- `DELTA_WACC` propuesto: **1 punto porcentual (0.01 en fracción decimal)** — constante documentada, ajustable.
+- La tasa de crecimiento terminal (`TERMINAL_GROWTH_RATE = 2.5%`, perpetuidad de Gordon Growth) **no varía por escenario** — decisión del `architect`, no pregunta abierta: es un supuesto macro de largo plazo (crecimiento nominal de la economía), independiente del optimismo/pesimismo específico de la empresa consultada; ya son 2 palancas (WACC + `g_fcf`) las que generan el rango, agregar una tercera variable compuesta sobre una perpetuidad no aporta señal adicional proporcional a la complejidad que suma.
+- **Reutiliza la guarda ya existente** (`wacc <= terminal_growth → None`, `calculate_dcf_fair_value`, Iter-1/Iter-2) sin cambios — si `wacc_optimista` (el más bajo de los 3) cae por debajo de `TERMINAL_GROWTH_RATE`, el escenario optimista del DCF queda excluido por la guarda que ya existe, sin código nuevo para ese caso puntual.
+
+---
+
+### 2. Interacción con la regla de "exclusión de modelo" de Iter-2 — dos niveles de exclusión
+
+Se introduce una distinción explícita que Iter-2 no necesitaba (porque no existían escenarios):
+
+- **Exclusión de base (nivel 1, igual en los 3 escenarios):** cuando el dato crudo de entrada es inválido o insuficiente independientemente del escenario — `EPS TTM <= 0` (B4), historial de EPS/FCF con menos de 3 registros o con año base/reciente no positivo (B1/B2), `Y` no disponible, `market_cap <= 0` (WACC no calculable), o 0 peers con PER válido. Si un modelo falla en este nivel, **está excluido en los 3 escenarios por igual**, y se reporta **una sola vez** (no 3 veces) — la razón no cambia entre pesimista/conservador/optimista, así que repetirla 3 veces sería ruido, no transparencia.
+- **Exclusión por escenario (nivel 2, puede diferir entre escenarios):** cuando el dato de base es válido (el modelo es calculable en al menos un escenario) pero el desplazamiento pesimista u optimista empuja un valor intermedio fuera de su rango matemáticamente válido. Dos casos concretos ya identificados arriba:
+  - Graham: `(8.5 + 2×g_pct) <= 0` en el escenario pesimista (o, en un caso extremo con `g` conservador ya muy negativo, también en conservador — ver guarda nueva arriba) pero no en optimista.
+  - DCF: `wacc_optimista <= TERMINAL_GROWTH_RATE` cuando `wacc_conservador` y `wacc_pesimista` sí lo superan.
+  - Un modelo puede entonces **estar presente en 2 de 3 escenarios y ausente en el tercero** — esto es un comportamiento esperado y correcto del diseño, no un bug: cada escenario se evalúa de forma independiente con sus propios parámetros desplazados, igual que Iter-2 ya evalúa cada uno de los 3 modelos de forma independiente dentro de un mismo escenario.
+- **Respuesta a la pregunta 2 del pedido, en una frase:** un modelo excluido en el escenario conservador (nivel 1, dato de base inválido) lo está en los 3 escenarios por igual; un modelo válido en conservador puede sin embargo excluirse solo en pesimista u optimista (nivel 2, el desplazamiento de escenario lo saca de rango matemáticamente válido) — nunca al revés (si un modelo no es calculable en conservador con sus parámetros centrales, tampoco lo es en un escenario que lo empeora o lo mejora, porque el problema está en el dato de entrada, no en el desplazamiento).
+
+**Estructura de datos propuesta** (extiende, sin romper, la de Iter-2):
+
+```python
+@dataclass
+class ScenarioValuationResult:
+    valor_justo_multiplos: Optional[float] = None
+    valor_justo_graham: Optional[float] = None
+    valor_justo_dcf: Optional[float] = None
+    valor_justo_total: Optional[float] = None
+    modelos_excluidos: list[ModeloExcluido] = field(default_factory=list)  # incluye nivel 1 + nivel 2
+
+@dataclass
+class ValuationScenarios:
+    pesimista: ScenarioValuationResult
+    conservador: ScenarioValuationResult   # idéntico, campo a campo, al resultado de compute_valuation() hoy
+    optimista: ScenarioValuationResult
+    modelos_excluidos_base: list[ModeloExcluido]  # solo nivel 1 — igual en los 3, se reporta una vez
+```
+
+`compute_valuation(...)` (la función que ya existe) **no se toca** — sigue existiendo tal cual, con la misma firma y el mismo comportamiento, y pasa a ser (conceptualmente) el cálculo del escenario conservador. Se agrega una función nueva, `compute_valuation_scenarios(...)`, que:
+1. Calcula una vez las exclusiones de nivel 1 (reutilizando la lógica ya existente en `compute_valuation`).
+2. Para cada uno de los 3 escenarios, recalcula únicamente los modelos que pasaron el nivel 1, con sus parámetros desplazados (`per_promedio_peers` → min/prom/max; `g` → g∓DELTA_G; `wacc` → wacc±DELTA_WACC), aplicando las guardas de nivel 2 correspondientes.
+3. No dispara ninguna llamada a `fmp_client.py`/`treasury_client.py`/`peers.py` con red real — recibe los mismos datos ya resueltos que hoy recibe `compute_valuation` (ver punto 5).
+
+Esto evita triplicar la lógica de negocio (un solo camino de cálculo por modelo, parametrizado, no 3 copias) — consistente con el criterio de `qa` (Iter-1, sección 6) de "no hay lógica de negocio escondida/duplicada".
+
+**Cambio requerido en `peers.py`:** `get_peer_pe_average(...)` debe exponer también la lista de PERs individuales de los peers válidos (no solo el promedio), para poder derivar mínimo/máximo sin volver a golpear `/key-metrics`:
+```python
+@dataclass
+class PeerAverageResult:
+    per_promedio: Optional[float]
+    per_minimo: Optional[float]   # nuevo
+    per_maximo: Optional[float]   # nuevo
+    peers_usados: list[str]
+```
+
+---
+
+### 3. Presentación dummy-friendly (`summary.py`) — sin abrumar con 9 números
+
+**Actualizado 2026-07-28 — Daniela respondió (b) y (d), reemplazando la propuesta default original:** quiere el desglose por cada uno de los 3 modelos (no solo el total) **y** la clasificación "barata"/"cara" evaluada en los 3 escenarios, no solo en el conservador. Se rediseña el formato de esta sección para incorporar ambas cosas sin volverla una tabla fría de 9 números sueltos.
+
+**Formato definido:**
+
+Una sola sección de rango, con una línea por modelo + la línea de total, alineando los 3 escenarios en el mismo orden siempre (Pesimista | Conservador | Optimista) para que Daniela no tenga que releer una leyenda cada vez:
+
+```
+*Rango de Valor Justo (Pesimista | Conservador | Optimista):*
+- Múltiplos: $610 | $658 | $705
+- Graham EPS Model: $520 | $555 | $590
+- DCF: $270 | $289 | $310
+
+*Valor Justo Total: $467 | $500 | $535*
+```
+
+- Si un modelo está excluido en **todos** los escenarios (exclusión de nivel 1): no aparece como fila de números — aparece como la frase de exclusión ya definida en Iter-2 ("el modelo Graham no se pudo calcular: ..."), una sola vez, igual que hoy.
+- Si un modelo está excluido **solo en un escenario** (exclusión de nivel 2): esa celda puntual se muestra como `N/D` en vez de omitir la fila entera, y se agrega una frase aclaratoria corta al pie (ej. `"DCF no disponible en el escenario Optimista con estos supuestos — se promedia sin él en ese caso."`) — así Daniela ve que el modelo sí existe, solo que ese escenario puntual no lo pudo calcular.
+- Caso degenerado de Múltiplos con < 2 peers válidos (ya definido arriba, sección 1): los 3 valores de esa fila son iguales y se agrega la nota "no hay rango disponible para Múltiplos: solo N comparable(s) válido(s)".
+
+**Clasificación "barata"/"cara" — evaluada de forma independiente en los 3 escenarios (decisión nueva, reemplaza la propuesta default anclada solo a conservador):**
+
+Se compara el precio actual contra el `valor_justo_total` de **cada** escenario por separado — no un solo booleano, sino 3 (uno por escenario), cada uno pudiendo ser `None` si ese escenario en particular no tiene `valor_justo_total` (los 3 modelos excluidos en ese escenario puntual — caso extremo, ver criterio de aceptación nuevo abajo):
+
+```python
+def classify_scenario(precio_actual: float, valor_justo_total: Optional[float]) -> Optional[bool]:
+    """True = barata (precio < valor justo), False = cara, None = no determinable
+    (valor_justo_total es None en ese escenario — los 3 modelos quedaron
+    excluidos justo en ese escenario)."""
+    if valor_justo_total is None:
+        return None
+    return precio_actual < valor_justo_total
+```
+
+**Regla de combinación para el texto final (determinista, sin ambigüedad de redacción):**
+- Si los 3 escenarios (pesimista, conservador, optimista) dan el mismo resultado (los 3 `True` o los 3 `False`, ninguno `None`): se muestra **una sola frase consolidada** — `"Barata en los 3 escenarios (Pesimista, Conservador y Optimista) — señal de confianza adicional."` o el equivalente en "cara". Este es el caso más común (Adobe, por ejemplo, con el rango calibrado hoy da `True` en los 3).
+- Si los 3 escenarios **no** coinciden (mezcla de `True`/`False`, o alguno es `None`): se muestra el **desglose explícito por escenario**, nunca se "resume" ocultando la discrepancia (mismo principio de transparencia que gobierna toda la spec):
+  ```
+  Precio actual: $333
+  - Pesimista: Cara (valor justo $310)
+  - Conservador: Barata (valor justo $500)
+  - Optimista: Barata (valor justo $535)
+  ```
+- Si un escenario da `None` (caso extremo, 0 de 3 modelos calculables en ese escenario puntual): en el desglose se muestra `"no se pudo determinar en este escenario"` para esa fila, en vez de tratarlo como "cara" por default (nunca inventar una clasificación cuando no hay dato — mismo principio de exclusión de Iter-2).
+
+**Por qué esta regla y no promediar los 3 booleanos o mostrar siempre las 3 líneas:** promediar/forzar un solo veredicto ocultaría justamente la señal que Daniela pidió ("barata incluso en el peor escenario" es información nueva, no ruido) — pero mostrar siempre las 3 líneas aunque coincidan agregaría 2 líneas repetitivas al caso más común. La regla "consolidar si coincide, desglosar si no" da la respuesta más corta posible sin nunca esconder una discrepancia real.
+
+---
+
+### 4. Impacto en el caso de regresión Adobe
+
+- **`test_valuation_adobe_regression` no se modifica.** Sigue llamando a `compute_valuation(...)` (sin cambios de firma ni de comportamiento) y sigue verificando exactamente lo mismo que hoy: Múltiplos≈658, DCF≈289, EPS Model≈555, promedio≈500, tolerancia ±1%. Este test pasa a documentarse (en un comentario, no en el código de assert) como "el caso de regresión valida el escenario conservador" — pero no requiere ni un solo cambio de línea.
+- **Se agrega un test nuevo**, `test_valuation_adobe_scenarios`, que reutiliza el mismo fixture de `tests/fixtures/adobe/` y llama a `compute_valuation_scenarios(...)`, verificando:
+  - El escenario `conservador` es **campo a campo idéntico** al resultado de `compute_valuation(...)` sobre el mismo fixture (no una aproximación — igualdad exacta, ya que es la misma función internamente).
+  - `valor_justo_total` sigue la relación `pesimista <= conservador <= optimista` (relación, no un número fijo — Daniela no dio un caso de referencia numérico para pesimista/optimista de Adobe, a diferencia del caso conservador que sí viene documentado en la spec desde Iter-1).
+  - Los 3 modelos siguen calculables en los 3 escenarios para el caso Adobe con los fixtures actuales (Adobe con datos "sanos" no debería disparar ninguna exclusión de nivel 2) — si algún escenario excluye un modelo inesperadamente, es señal de que `DELTA_G`/`DELTA_WACC` propuestos son demasiado agresivos para este fixture, y debe ajustarse antes de cerrar el patch (`qa` lo confirma en su revisión, no `architect` en soledad).
+- **Respuesta directa a la pregunta 4 del pedido:** sí, el test existente pasa a validar (implícitamente, sin cambiar código) solo el escenario conservador — y se define un test nuevo separado para pesimista/optimista, con un criterio de relación en vez de un número exacto, porque no existe (todavía) un caso de referencia documentado por Daniela para esos dos escenarios.
+
+---
+
+### 5. Impacto en el presupuesto de requests de FMP — confirmado explícitamente: ninguno
+
+Este patch es una **transformación matemática pura sobre datos ya obtenidos** en la misma consulta — no agrega ninguna llamada HTTP nueva a FMP, FRED ni ningún otro proveedor:
+- Los 3 escenarios reutilizan exactamente el mismo `eps_historial`, `fcf_historial`, `wacc_inputs`, `y`, y los mismos PERs de peers (mínimo/promedio/máximo se derivan de la misma respuesta de `/key-metrics` por peer que ya se pedía en Iter-1 — antes se descartaba todo menos el promedio, ahora se conservan también el mínimo y el máximo del mismo array de datos ya en memoria).
+- No cambia la sección "Presupuesto de requests FMP (plan gratuito)" de Iter-1: sigue siendo 9-12 requests por consulta completa, ~20-27 consultas/día. **Confirmado.**
+
+---
+
+### 6. Contexto de mercado — momentum y comparación con peers (agregado 2026-07-28, mismo Iter-3, antes de pasar a `security`)
+
+**Origen:** pedido nuevo de Daniela (textual): *"aparte de temas de finanzas no hay que ver también el mercado como se comporta? comparar con otras empresas para saber si se está bien y también coger el miedo del mercado y de cómo está"*. Se aterriza en dos piezas concretas — momentum de precio (proxy barato del "cómo está el mercado viendo esta acción", sin depender de un índice de sentimiento real) y comparación explícita contra peers (hoy invisible, solo insumo silencioso del modelo de Múltiplos). Se agrega **a esta misma iteración** (Iter-3 no pasó a `security` todavía) — no reabre las secciones 1-5 ya cerradas con las decisiones de Daniela.
+
+**Regla dura que gobierna todo el diseño de esta sección (restricción de Daniela, aprendida dos veces en esta misma sesión — `/api/v3` legacy discontinuada, `/key-metrics-ttm` resultó de pago pese a parecer gratis en la documentación):** ningún dato nuevo de esta sección depende de un endpoint no verificado. Todo el diseño default se apoya exclusivamente en campos que **ya vienen gratis, en la misma llamada a `/quote` que ya se hace hoy por cada ticker** (cero llamadas nuevas): `priceAvg50`, `priceAvg200`, `yearHigh`, `yearLow` (confirmados en esta sesión con una key real, respuesta de `/stable/quote` para AAPL) — más el set fijo de peers que `peers.py` ya resuelve para el modelo de Múltiplos (Decisión #9, Iter-1). Un índice tipo VIX/Fear & Greed **no se diseña como dependencia dura** — ver pregunta abierta (f) al final.
+
+#### 6.1 Momentum de precio (proxy de "cómo está el mercado viendo esta acción")
+
+**Qué se muestra:**
+- Posición dentro del rango de 52 semanas: `% por debajo de su máximo anual` y `% por encima de su mínimo anual`, derivados de `price` (ya obtenido) vs. `yearHigh`/`yearLow`.
+- Posición relativa a las medias móviles: `% por encima/debajo de su promedio de 50 días` y `% por encima/debajo de su promedio de 200 días`, derivados de `price` vs. `priceAvg50`/`priceAvg200`.
+- Una etiqueta cualitativa única y determinista, no un índice numérico inventado:
+  - **"impulso positivo"** si `price > priceAvg50` **y** `price > priceAvg200`.
+  - **"impulso negativo"** si `price < priceAvg50` **y** `price < priceAvg200`.
+  - **"mixto"** si está por encima de uno pero no del otro (ej. por encima del promedio de 50 días pero todavía por debajo del de 200 días).
+  - **"no disponible"** si falta `priceAvg50` o `priceAvg200` en la respuesta de FMP para ese ticker (puede pasar con compañías muy nuevas, con menos de 200 días de historial de cotización) — nunca se sustituye por un valor inventado, mismo principio de exclusión de toda la spec.
+
+**Estructura de datos propuesta** (función pura, sin I/O, mismo estándar que `valuation.py`/`rules.py`):
+```python
+@dataclass
+class MomentumResult:
+    pct_vs_year_high: Optional[float]   # negativo o 0 si está en su máximo anual
+    pct_vs_year_low: Optional[float]    # positivo típicamente
+    pct_vs_avg_50: Optional[float]
+    pct_vs_avg_200: Optional[float]
+    etiqueta: str  # "impulso_positivo" | "impulso_negativo" | "mixto" | "no_disponible"
+
+def calculate_momentum(
+    *, price: float, year_high: Optional[float], year_low: Optional[float],
+    price_avg_50: Optional[float], price_avg_200: Optional[float],
+) -> MomentumResult:
+    """Nunca lanza excepción; campos faltantes producen None puntual y
+    etiqueta="no_disponible" si faltan los dos promedios móviles."""
+```
+
+**Transparencia obligatoria en el texto (mismo principio que toda la spec):** esta sección se presenta explícitamente como *"un proxy simple de impulso de precio, no un índice de sentimiento de mercado real (como el VIX o el Fear & Greed Index)"* — para que Daniela no confunda esto con la "medida del miedo del mercado" que pidió textualmente; ver pregunta abierta (f) para esa pieza específica.
+
+**Decisión explícita de scope (no pregunta abierta):** `changePercentage` (variación del día, también gratis en `/quote`) **no se muestra** en esta sección por default — es ruido de corto plazo que no aporta a la narrativa de "cómo está posicionada la empresa" que pidió Daniela (a diferencia del rango de 52 semanas y las medias móviles, que sí son señales de mediano/largo plazo). Queda disponible en la estructura de datos por si se pide un modo más detallado en el futuro (backlog, no bloqueante).
+
+#### 6.2 Comparación explícita con peers (sección nueva, visible)
+
+**Qué se muestra:** el PER de la empresa consultada contra el PER mínimo/promedio/máximo de su set fijo de peers (Decisión #9, ya calculado en la sección 1/2 de este mismo patch para el modelo de Múltiplos) — con una posición relativa explícita:
+- **"más barata que sus comparables"** si `per_propio < per_minimo_peers` (más barata que el peer más barato).
+- **"en línea con sus comparables"** si `per_minimo_peers <= per_propio <= per_maximo_peers`.
+- **"más cara que sus comparables"** si `per_propio > per_maximo_peers`.
+- **"no comparable"** si `per_propio` es `None` (EPS TTM ≤ 0, `per_no_aplicable=True` — B4, Iter-2) o si no hay ningún peer con PER válido — en ese caso, la sección lo dice explícitamente en vez de omitirse en silencio, y sugiere mirar el P/S como ya hace el resto de la spec en el mismo caso.
+
+**¿Es información nueva o duplica el modelo de Múltiplos?** Es **el mismo dato de peers, presentado con un enfoque distinto y genuinamente nuevo para Daniela** — no se duplica el cálculo, se reutiliza:
+- El modelo de Múltiplos (sección 1 de este patch) responde: *"¿cuánto vale mi empresa en dólares, si pagaran por ella lo mismo que pagan por empresas parecidas?"* (un Valor Justo, en la fila de la tabla de escenarios).
+- Esta sección nueva responde: *"¿mi empresa está cara o barata **en términos relativos**, comparada con esas mismas empresas, sin pasar por un cálculo de Valor Justo en dólares?"* — sigue siendo útil incluso cuando el modelo de Múltiplos queda **excluido** de la valoración (ej. EPS TTM ≤ 0, B4 de Iter-2): en ese caso la fila de Múltiplos de la tabla de escenarios no existe, pero esta sección de comparación puede seguir mostrando el PER de los peers (aunque marque "no comparable" para la empresa propia, dado que no tiene PER).
+- No se pide ningún dato nuevo: `per_minimo`/`per_promedio`/`per_maximo` de `peers.py::PeerAverageResult` ya se agregaron en la sección 2 de este mismo patch — esta sección solo los consume desde un ángulo de presentación distinto.
+
+**Estructura de datos propuesta:**
+```python
+@dataclass
+class PeerComparisonResult:
+    per_propio: Optional[float]
+    per_minimo_peers: Optional[float]
+    per_promedio_peers: Optional[float]
+    per_maximo_peers: Optional[float]
+    peers_usados: list[str]
+    posicion: str  # "mas_barata" | "en_linea" | "mas_cara" | "no_comparable"
+
+def compare_to_peers(
+    *, per_propio: Optional[float], per_minimo_peers: Optional[float],
+    per_promedio_peers: Optional[float], per_maximo_peers: Optional[float],
+    peers_usados: list[str],
+) -> PeerComparisonResult:
+    """Función pura, sin I/O. `posicion='no_comparable'` si `per_propio` es
+    None o no hay ningún peer con PER válido — nunca inventa una posición."""
+```
+
+**Dónde vive:** módulo nuevo `src/investbot/market_context.py` (no se mezcla con `valuation.py`, que es específicamente el motor de los 3 modelos de Valor Justo, ni con `rules.py`, que son ratios/pilares de la empresa propia sin comparación externa) — mantiene la separación de responsabilidades ya exigida por `qa` (Iter-1, sección 6).
+
+#### 6.3 Integración en `summary.py`
+
+Se agrega una sección nueva, **"Contexto de mercado"**, ubicada después de "Pilares de buena empresa" y antes de "Encaje con tu perfil de riesgo" (orden de lectura: valor justo → pilares → contexto de mercado → encaje de riesgo → notas de transparencia):
+
+```
+*Contexto de mercado:*
+- Cotiza a $187, un 4.2% por debajo de su máximo de 52 semanas ($195) y un 18.6% por encima de su mínimo de 52 semanas ($158).
+- Por encima de su promedio de 50 días y de 200 días → impulso positivo.
+- Comparada con sus comparables del sector (MSFT, ORCL, CRM): tu PER (28.4) está en línea con el rango de tus peers (mínimo 22.1, promedio 27.9, máximo 33.5).
+
+_Nota: el momentum es un proxy simple de precio, no un índice de sentimiento de mercado (VIX/Fear & Greed) — ver limitación conocida en README.md._
+```
+
+- Si `MomentumResult.etiqueta == "no_disponible"`: se omite esa línea puntual (no se muestra "impulso: no disponible" como ruido) y se deja constancia solo si Daniela pregunta por qué falta (backlog, no bloqueante para este patch).
+- Si `PeerComparisonResult.posicion == "no_comparable"`: se muestra la frase explícita de por qué ("tu PER no aplica por EPS negativo/cero — mirá el P/S como referencia"), igual que ya hace la sección de ratios (B4, Iter-2) — no se omite en silencio.
+
+#### 6.4 Presupuesto de requests de FMP — confirmado explícitamente: ninguna llamada nueva
+
+- El momentum usa exclusivamente campos ya presentes en la respuesta de `/quote` del ticker propio, que **ya se pide hoy** (Decisión #8, Iter-1) — cero llamadas adicionales.
+- La comparación con peers reutiliza el mismo array de PERs de peers que la sección 2 de este mismo patch ya calcula (vía `/key-metrics` por peer, ya presupuestado en Iter-1/Decisión #9) — cero llamadas adicionales.
+- **Confirmado:** el presupuesto de requests FMP no cambia (sigue 9-12 por consulta completa, ~20-27 consultas/día).
+
+#### 6.5 VIX / Fear & Greed Index — atajo opcional a verificar, NO dependencia dura
+
+No se puede confirmar sin una key real si un índice tipo `^VIX` (o un endpoint equivalente de sentimiento de mercado) está disponible en el plan gratuito de FMP — la documentación pública de FMP ya mostró ser un mal predictor de disponibilidad real dos veces en este mismo proyecto (`/api/v3` legacy discontinuada, `/key-metrics-ttm` de pago pese a parecer gratis). Siguiendo el mismo patrón que Iter-1 ya usó para `/dcf`/`/sector-pe-ratio`/`/treasury-rates` (Decisión #8): **no se diseña como dependencia dura**. El diseño default de esta sección (6.1-6.4) funciona completo sin ningún índice de mercado externo. Ver pregunta abierta (f) para la verificación.
+
+---
+
+### Criterios de aceptación (nuevos, Iter-3)
+
+- [ ] `compute_valuation(...)` no cambia de firma ni de comportamiento — `test_valuation_adobe_regression` sigue pasando sin modificar ni una línea de ese test.
+- [ ] `calculate_graham_fair_value` agrega la guarda `(8.5 + 2×g_pct) <= 0 → None` (motivo `"graham_multiplicador_no_positivo"`), aplicada en los 3 escenarios por igual, incluido el conservador.
+- [ ] Nueva función `compute_valuation_scenarios(...)` retorna `ValuationScenarios` (pesimista/conservador/optimista + `modelos_excluidos_base` de nivel 1), sin triplicar la lógica de cálculo de cada modelo.
+- [ ] `peers.py::PeerAverageResult` expone `per_minimo` y `per_maximo` además de `per_promedio`, derivados del mismo array de PERs de peers válidos ya calculado (sin llamada adicional a `/key-metrics`).
+- [ ] `DELTA_G = 0.03` y `DELTA_WACC = 0.01` viven como constantes documentadas en `valuation.py` (mismo patrón que `MARKET_RISK_PREMIUM`/`TERMINAL_GROWTH_RATE` de Iter-1), ajustables sin que sea una "regresión" de un criterio verde.
+- [ ] Cuando un modelo se excluye a nivel base (nivel 1): se reporta una sola vez en `modelos_excluidos_base`, no repetido en cada escenario.
+- [ ] Cuando un modelo se excluye solo en un escenario (nivel 2): el `ScenarioValuationResult` de ese escenario específico lo incluye en su propio `modelos_excluidos`, y los otros 2 escenarios lo calculan con normalidad si sus parámetros no disparan la misma guarda.
+- [ ] Caso degenerado de Múltiplos con < 2 peers válidos: pesimista/conservador/optimista son el mismo número, y `summary.py` lo aclara explícitamente ("no hay rango disponible, solo N comparable(s) válido(s)") en vez de mostrar 3 valores iguales sin contexto.
+- [ ] `test_valuation_adobe_scenarios` (nuevo): conservador idéntico a `compute_valuation()`, relación `pesimista <= conservador <= optimista` en `valor_justo_total`, y los 3 modelos calculables en los 3 escenarios para el fixture de Adobe (sin exclusiones de nivel 2 inesperadas).
+- [ ] `summary.py` muestra el rango Pesimista | Conservador | Optimista **desglosado por cada uno de los 3 modelos individuales** (Múltiplos, Graham, DCF) además de la línea de `Valor Justo Total` — no solo el total (actualizado 2026-07-28 por respuesta (d) de Daniela).
+- [ ] Una celda de modelo excluido solo en un escenario puntual (nivel 2) se muestra como `N/D` en esa posición específica (no se omite la fila completa), con una frase aclaratoria al pie indicando cuál escenario y por qué.
+- [ ] Nueva función pura `classify_scenario(precio_actual, valor_justo_total) -> Optional[bool]` (vive en `valuation.py`, sin I/O) retorna `True`/`False`/`None` según el `valor_justo_total` de cada escenario sea mayor/menor/inexistente frente al precio actual.
+- [ ] La clasificación "barata"/"cara" se calcula de forma **independiente en los 3 escenarios** (actualizado 2026-07-28 por respuesta (b) de Daniela, reemplaza el criterio anterior que la anclaba solo a conservador): `summary.py` aplica la regla de combinación — si los 3 escenarios coinciden (los 3 `True` o los 3 `False`), se muestra una sola frase consolidada; si no coinciden o alguno es `None`, se muestra el desglose explícito por escenario, nunca un promedio ni un veredicto único que oculte la discrepancia.
+- [ ] Test `test_classify_scenario_barata`/`test_classify_scenario_cara`/`test_classify_scenario_none`: casos con `valor_justo_total` mayor, menor e inexistente (`None`) frente al precio actual.
+- [ ] Test `test_combinar_clasificacion_consolidada_barata`/`_cara`: los 3 escenarios coinciden → una sola frase, sin desglose.
+- [ ] Test `test_combinar_clasificacion_desglosada`: al menos un escenario difiere de los otros dos (ej. pesimista `False`, conservador/optimista `True`) → las 3 líneas de desglose aparecen explícitamente, ninguna se omite.
+- [ ] Test `test_combinar_clasificacion_con_none`: un escenario con `valor_justo_total=None` → esa fila del desglose dice "no se pudo determinar en este escenario", nunca se clasifica como cara/barata por default.
+- [ ] Ninguna llamada HTTP nueva a FMP/FRED se agrega en este patch — confirmado por revisión de código (`fmp_client.py`/`treasury_client.py`/`peers.py` no ganan ninguna función nueva de red, solo `valuation.py`/`peers.py` ganan cálculo puro adicional sobre datos ya obtenidos).
+
+**Sección 6 — Contexto de mercado (momentum + comparación con peers), agregado 2026-07-28:**
+
+- [ ] Nueva función pura `calculate_momentum(...)` (`market_context.py`) retorna `MomentumResult` con `pct_vs_year_high`, `pct_vs_year_low`, `pct_vs_avg_50`, `pct_vs_avg_200` y `etiqueta` (`"impulso_positivo"`/`"impulso_negativo"`/`"mixto"`/`"no_disponible"`), sin lanzar excepción si falta `priceAvg50`/`priceAvg200`/`yearHigh`/`yearLow`.
+- [ ] `test_momentum_impulso_positivo`/`_negativo`/`_mixto`/`_no_disponible`: 4 casos con `price`/`priceAvg50`/`priceAvg200` conocidos, verificados a mano.
+- [ ] Nueva función pura `compare_to_peers(...)` (`market_context.py`) retorna `PeerComparisonResult` con `posicion` (`"mas_barata"`/`"en_linea"`/`"mas_cara"`/`"no_comparable"`), usando `per_minimo_peers`/`per_promedio_peers`/`per_maximo_peers` ya expuestos por `peers.py::PeerAverageResult` (sección 2 de este patch) — sin llamada adicional a `/key-metrics`.
+- [ ] `test_compare_to_peers_mas_barata`/`_en_linea`/`_mas_cara`/`_no_comparable_eps_negativo`/`_no_comparable_sin_peers_validos`: 5 casos con `per_propio` y el trío mínimo/promedio/máximo de peers conocidos, verificados a mano.
+- [ ] `summary.py` agrega la sección "Contexto de mercado" (momentum + comparación con peers) entre "Pilares de buena empresa" y "Encaje con tu perfil de riesgo", con la nota de transparencia explícita de que el momentum es un proxy simple de precio, no un índice de sentimiento de mercado.
+- [ ] Cuando `MomentumResult.etiqueta == "no_disponible"`: esa línea se omite de la respuesta (no se muestra como ruido "impulso: no disponible").
+- [ ] Cuando `PeerComparisonResult.posicion == "no_comparable"`: se muestra la frase explícita del motivo (EPS no positivo → sugerencia de mirar P/S, o sin peers con PER válido), nunca se omite en silencio.
+- [ ] `changePercentage` (variación diaria) no se muestra en la sección de contexto de mercado — decisión explícita de scope (no aporta a la narrativa de mediano/largo plazo pedida por Daniela), disponible en la estructura de datos para un futuro modo detallado (backlog).
+- [ ] Confirmado explícitamente: ninguna llamada HTTP nueva para esta sección — momentum usa campos ya presentes en `/quote` del ticker propio (ya solicitado hoy); comparación con peers reutiliza el mismo array de PERs de peers que la sección 2 de este patch ya calcula (vía `/key-metrics` por peer, ya presupuestado en Iter-1). Presupuesto de requests FMP sin cambios (9-12/consulta, ~20-27/día).
+- [ ] Ningún endpoint tipo `^VIX`/Fear & Greed se usa como dependencia dura — el diseño default (6.1-6.4) funciona completo sin él (ver pregunta abierta (f)).
+
+### Artefactos a crear/modificar
+
+- `src/investbot/valuation.py` → agrega `compute_valuation_scenarios(...)`, `ScenarioValuationResult`, `ValuationScenarios`, constantes `DELTA_G`/`DELTA_WACC`, y la guarda nueva de multiplicador de Graham en `calculate_graham_fair_value`. `compute_valuation(...)` no cambia.
+- `src/investbot/peers.py` → `PeerAverageResult` gana `per_minimo`/`per_maximo`; `get_peer_pe_average(...)` los deriva del mismo array de PERs ya calculado.
+- `src/investbot/summary.py` → `build_valuation_section(...)` (o una función nueva que la envuelva) agrega el desglose de rango por modelo (Múltiplos/Graham/DCF) y total, la nota de exclusión por escenario (`N/D` puntual), y la regla de combinación de clasificación cara/barata por escenario (consolidada si coinciden, desglosada si no) — actualizado 2026-07-28 por las respuestas (b) y (d) de Daniela.
+- `src/investbot/valuation.py` → agrega también `classify_scenario(...)` (función pura, sin I/O) como parte de este patch (respuesta (b) de Daniela).
+- `tests/test_valuation.py` → agrega `test_valuation_adobe_scenarios` y tests unitarios de `compute_valuation_scenarios`/guarda nueva de Graham/min-max de peers; `test_valuation_adobe_regression` no se modifica.
+- `tests/test_peers.py` (si existe, o se crea) → tests de `per_minimo`/`per_maximo`.
+- `src/investbot/market_context.py` → **nuevo** — `calculate_momentum(...)`/`MomentumResult` y `compare_to_peers(...)`/`PeerComparisonResult` (sección 6, agregado 2026-07-28). Funciones puras, sin I/O, mismo estándar que `valuation.py`/`rules.py`.
+- `tests/test_market_context.py` → **nuevo** — tests de `calculate_momentum`/`compare_to_peers` listados en "Criterios de aceptación", sección 6.
+- `src/investbot/summary.py` → (además de lo ya listado arriba para escenarios) agrega la sección "Contexto de mercado" (momentum + comparación con peers), ubicada entre "Pilares de buena empresa" y "Encaje con tu perfil de riesgo".
+- `contexto/specs/abiertas/SDD_investbot_mvp.md` → este mismo archivo (este patch).
+
+### Restricciones / Criterios que NO cambian
+
+- Stack, arquitectura de despliegue (long polling, sin Traefik), modelo de datos SQLite, cuestionario de perfil de riesgo, presupuesto de requests FMP (9-12/consulta, ~20-27/día) — sin cambios, incluida la sección 6 (confirmado explícitamente en 6.4: cero llamadas HTTP nuevas).
+- Las 5 secciones de `security` (Iter-1) — vigentes sin cambios; este patch no agrega ninguna llamada HTTP, ningún secreto nuevo, ni un vector de input no validado nuevo (es cálculo puro sobre datos ya resueltos, mismo criterio que exoneró a Iter-2 de volver a pasar por `security`). Esto incluye la sección 6: `market_context.py` es tan "cálculo puro sobre datos ya resueltos" como `valuation.py`/`rules.py`.
+- Las Decisiones de diseño #1-#10 (Iter-1) y B1-B5 (Iter-2) — sin cambios; este patch **refina** la fórmula de Graham (agrega la guarda de multiplicador, un hueco preexistente de Iter-2 que este patch expone y cierra) pero no contradice ninguna decisión previa.
+- El texto/opciones/puntajes del cuestionario, la regla beta↔perfil, "ventaja competitiva" siempre cualitativa — sin cambios.
+- Ningún endpoint premium/no verificado (`/dcf`, `/sector-pe-ratio`, `/treasury-rates`, y ahora `^VIX`/Fear & Greed) es dependencia dura de ningún diseño de esta spec — mismo tratamiento en Iter-1 y en la sección 6 de este patch.
+
+---
+
+### Preguntas abiertas para Daniela — (a)-(e) RESUELTAS 2026-07-28, (f) NUEVA y pendiente
+
+Las 5 preguntas de la versión anterior de este patch quedaron respondidas por Daniela. Se documentan aquí como decisión cerrada, ya no bloquean scope freeze de este patch (sigue vigente que `security`/`qa` deben confirmar testabilidad antes de `implementer`, como cualquier otro criterio nuevo). La sección 6 (agregada el mismo día) trae una pregunta nueva, (f), que sí sigue abierta — depende de verificar un endpoint que no se puede confirmar sin una key real, mismo tratamiento que ya tuvo el resto de la spec con endpoints premium de FMP.
+
+**(a) RESUELTA — Magnitudes y criterio de Múltiplos:** confirmada tal cual la propuesta del `architect`: PER mínimo/máximo de peers (no desviación estándar) para Múltiplos, `DELTA_G = 0.03` (±3pp) para Graham y para el `g_fcf` del DCF, `DELTA_WACC = 0.01` (±1pp) para el WACC del DCF. Sin cambios respecto a la sección 1 de este patch — no requirió ningún ajuste.
+
+**(b) RESUELTA — Clasificación "barata"/"cara": se evalúa en los 3 escenarios, no solo en conservador.** Cambia la propuesta default original (que la anclaba solo al conservador). Ver sección 3 actualizada arriba ("Presentación dummy-friendly") para el diseño completo: `classify_scenario(...)` clasifica cada escenario de forma independiente, y la regla de combinación consolida la frase si los 3 coinciden o desglosa explícitamente si no — nunca se promedia ni se esconde una discrepancia.
+
+**(c) RESUELTA — Presentación:** confirmada la propuesta default: el rango aparece siempre en cada consulta, sin comando ni palabra clave separada.
+
+**(d) RESUELTA — Nivel de detalle: se desglosa por cada uno de los 3 modelos individuales, no solo el total.** Cambia la propuesta default original (que mostraba solo el total). Ver sección 3 actualizada arriba para el formato exacto (una línea Pesimista | Conservador | Optimista por modelo + la línea de total).
+
+**(e) RESUELTA — Nombres de escenarios:** confirmado literal **"Pesimista / Conservador / Optimista"** en el texto hacia Daniela — no se usa la variante "peor caso/número de referencia/mejor caso".
+
+**(f) NUEVA, pendiente — ¿Está `^VIX` (u otro índice de sentimiento de mercado tipo Fear & Greed) disponible en el plan gratuito de FMP?** El `architect` no puede confirmarlo sin una key real (ya hubo dos sorpresas en este proyecto con endpoints que la documentación pública sugería gratis y no lo eran: `/api/v3` legacy, `/key-metrics-ttm`). Se propone como **verificación durante la implementación** (mismo patrón que Iter-1 ya usó para `/dcf`/`/sector-pe-ratio`/`/treasury-rates`, Decisión #8): si `implementer` confirma que algún endpoint de este tipo responde gratis con la key real de Daniela, puede agregarse como una línea adicional opcional en "Contexto de mercado" (ej. `"VIX actual: 14.2 (miedo bajo)"`), documentado como atajo opcional — **nunca como requisito** para que la sección funcione, porque el diseño default (6.1-6.4) ya cubre "cómo está el mercado viendo esta acción" sin depender de ningún índice externo. Si no está disponible gratis, el diseño ya funciona sin cambios. No bloquea scope freeze de este patch (el resto de la sección 6 es independiente de esta respuesta) — sí queda como pendiente explícito para `implementer`/`qa`, no se decide en soledad.
+
+---
+
+## Handoff → security
+
+### Specs producidas
+- Este Spec Patch [Iter-3], agregado al final de `SDD_investbot_mvp.md` (no reemplaza ninguna sección anterior).
+
+### Criterios de aceptación base
+Ver "Criterios de aceptación (nuevos, Iter-3)" arriba — se suman a todos los de Iter-1 + Spec Patch Iter-2, que siguen vigentes sin cambios.
+
+### Decisiones de diseño tomadas (no reabrir)
+1. Múltiplos: pesimista/conservador/optimista = PER mínimo/promedio/máximo de los peers válidos del set fijo de sector (no desviación estándar). Confirmado por Daniela (pregunta (a)), sin ajustes.
+2. Graham: pesimista/conservador/optimista = CAGR histórico ∓/=/± `DELTA_G` (3pp, desplazamiento absoluto, no multiplicativo), con guarda nueva de multiplicador `(8.5+2g_pct)>0` aplicada a los 3 escenarios. Confirmado por Daniela (pregunta (a)), sin ajustes.
+3. DCF: pesimista/conservador/optimista = WACC ±/=/∓ `DELTA_WACC` (1pp) y `g_fcf` con el mismo `DELTA_G` de Graham; tasa de crecimiento terminal fija, no varía por escenario. Confirmado por Daniela (pregunta (a)), sin ajustes.
+4. Exclusión en 2 niveles: nivel 1 (dato base inválido, igual en los 3 escenarios, se reporta una vez) vs. nivel 2 (desplazamiento de escenario saca un valor intermedio de rango válido, puede diferir por escenario).
+5. `compute_valuation(...)` no cambia; escenario conservador es, literalmente, ese mismo cálculo — `test_valuation_adobe_regression` no se modifica.
+6. Sin llamadas HTTP nuevas — confirmado explícitamente, es transformación matemática sobre datos ya obtenidos en la misma consulta.
+7. **(2026-07-28, respuesta (b) de Daniela — reemplaza la propuesta default original)** Clasificación "barata"/"cara" evaluada de forma independiente en los 3 escenarios vía `classify_scenario(...)` (función pura, `valuation.py`); `summary.py` consolida en una frase si los 3 escenarios coinciden, o desglosa explícitamente si no coinciden o si algún escenario da `None` (0 de 3 modelos calculables en ese escenario puntual) — nunca promedia ni elige un único veredicto que oculte una discrepancia real.
+8. **(2026-07-28, respuesta (d) de Daniela — reemplaza la propuesta default original)** `summary.py` muestra el rango Pesimista | Conservador | Optimista desglosado por cada uno de los 3 modelos individuales (Múltiplos, Graham, DCF), además de la línea de total — no solo el total. Un modelo excluido solo en un escenario puntual (nivel 2) se muestra como `N/D` en esa celda específica, no se omite la fila completa.
+9. **(2026-07-28, sección 6 — feature nueva, pedido textual de Daniela)** Se agrega "Contexto de mercado": momentum de precio (`calculate_momentum`, basado en `priceAvg50`/`priceAvg200`/`yearHigh`/`yearLow`, ya gratis en `/quote`) + comparación explícita con peers (`compare_to_peers`, reutiliza `per_minimo`/`per_promedio`/`per_maximo` de `peers.py` ya agregados en el punto 1 de este patch). Vive en un módulo nuevo, `market_context.py`, funciones puras sin I/O. Un índice tipo VIX/Fear & Greed **no es dependencia dura** — queda como verificación opcional durante la implementación (pregunta (f), pendiente), sin bloquear el resto del patch.
+
+### Foco esperado para `security`
+- Confirmar (como ya hizo en Iter-2 con B1-B5) que las nuevas guardas/constantes/funciones (`DELTA_G`, `DELTA_WACC`, guarda de multiplicador de Graham, `classify_scenario(...)`, la lógica de combinación de clasificación en `summary.py`, y ahora también `calculate_momentum(...)`/`compare_to_peers(...)` de `market_context.py`) son funciones puras sin I/O, sin secreto nuevo, sin vector de input no validado — mismo análisis que ya cerró Iter-2 sin hallazgos bloqueantes, aplicado ahora a este patch completo (incluida la sección 6).
+- Confirmar que no hay ninguna superficie nueva de logging (los nuevos campos `per_minimo`/`per_maximo`/`modelos_excluidos_base`, las clasificaciones booleanas por escenario, y los campos de `/quote` reutilizados para momentum — `priceAvg50`, `priceAvg200`, `yearHigh`, `yearLow` — no exponen nada distinto a lo que ya cubren los criterios de la sección 2 de `security`, Iter-1 — no incluyen URLs, keys ni datos sensibles).
+- **Foco específico nuevo de la sección 6:** si `implementer` verifica durante la implementación que un endpoint tipo `^VIX` está disponible gratis (pregunta abierta (f)) y lo agrega como atajo opcional, `security` debe revisar ese caso puntual cuando ocurra (nueva URL/parámetros de un proveedor no contemplado hasta ahora) — pero **no bloquea este handoff**: mientras esa verificación no ocurra, no hay ninguna superficie nueva que revisar más allá de lo ya listado (cálculo puro sobre `/quote` y `/key-metrics`, ambos ya auditados en Iter-1).
+- Si `security` confirma que no hay hallazgos (escenario esperado, dado que es cálculo puro), el patch pasa directo a `qa` (que confirma testabilidad de los criterios nuevos, mismo patrón que su confirmación corta de Iter-2) y luego a `implementer` — sin reabrir `frontend` (sigue sin haber UI web).
+
+### Preguntas de negocio — (a)-(e) ya resueltas por Daniela, (f) pendiente y explícitamente fuera del alcance de `security`
+Las (a)-(e) de la sección "Preguntas abiertas para Daniela" ya quedaron resueltas por escrito (2026-07-28, ver esa sección arriba) — eran de negocio/producto (magnitudes de escenario, presentación al usuario), no de seguridad. La (f) (disponibilidad gratuita de un índice tipo VIX) tampoco es una pregunta de seguridad — es una verificación de plan/presupuesto que le corresponde a `implementer` confirmar con una key real, no a `security` decidir. `security` no necesita resolver ninguna de las 6; solo evalúa la superficie técnica de las decisiones ya tomadas, listada arriba en "Foco esperado".
+
+---
+
+## Criterios de seguridad — agregado por `security` [Iter-3, 2026-07-28]
+
+**Rol:** `security`. Esta sección revisa **solo** el Spec Patch [Iter-3] (escenarios de valoración, secciones 1-5, y "Contexto de mercado", sección 6). Iter-1 y Iter-2 quedan congelados y no se reabren — se referencian únicamente como base de comparación. Verificación hecha contra el **código real del repo** (no solo la prosa del patch): se leyeron `src/investbot/valuation.py`, `src/investbot/peers.py`, `src/investbot/rules.py`, `src/investbot/fmp_client.py` y `src/investbot/query_handler.py` tal como están hoy en `/Users/danielavergara/Documents/Personal/InvestBot/src/investbot/`.
+
+**Nivel de verificación:** sin cambios respecto a Iter-1 — ASVS L1 general, mismo rigor de secretos/logging que FoodMindAI. Este patch no introduce ningún dato de mayor sensibilidad (sigue siendo aritmética sobre cotizaciones públicas).
+
+---
+
+### 1. ¿Son realmente funciones puras, sin I/O? — verificado contra el código, no asumido
+
+Las funciones nuevas de Iter-3 (`compute_valuation_scenarios`, `classify_scenario`, `calculate_momentum`, `compare_to_peers`) todavía no existen en el repo — las escribe `implementer`. No se puede "leer" su pureza directamente. Lo que sí se verificó es el **precedente que deben seguir**, para confirmar que el patrón es real y no solo aspiracional:
+
+- `valuation.py` (Iter-1/Iter-2, código actual) — `calculate_cagr`, `calculate_multiplos_fair_value`, `calculate_graham_fair_value`, `calculate_wacc`, `calculate_dcf_fair_value` y el orquestador `compute_valuation` (líneas 45-332) son, en efecto, funciones que solo reciben `float`/`Optional[float]`/`list[float]`/`dict` ya resueltos y devuelven datos — cero `import httpx`, cero `await`, cero acceso a red o a `db.py` dentro del módulo. El único I/O del proyecto vive en `fmp_client.py`/`treasury_client.py`, inyectado como callable (`get_peer_metrics_fn` en `peers.py:44-50`), nunca instanciado dentro de la función de cálculo.
+- `rules.py` (`calculate_eps`, `calculate_liquidity_ratio`, `calculate_per`, `calculate_ps`, `evaluate_pillars`) sigue el mismo patrón: solo aritmética y comparaciones sobre parámetros.
+- `compute_valuation_scenarios(...)` (diseño, sección 2 del patch) está especificado para **reutilizar** `calculate_multiplos_fair_value`/`calculate_graham_fair_value`/`calculate_wacc`/`calculate_dcf_fair_value` ya existentes, con parámetros desplazados (`per_promedio_peers`→min/prom/max, `g`→g∓Δ, `wacc`→wacc±Δ) — es composición de las mismas funciones puras ya auditadas, no un camino nuevo de I/O. `classify_scenario(...)` (sección 3 del patch) es una comparación de dos `float`/`None`, sin estado ni dependencia externa — el pseudocódigo mostrado en el patch (`if valor_justo_total is None: return None; return precio_actual < valor_justo_total`) no deja margen para I/O accidental.
+- `calculate_momentum(...)`/`compare_to_peers(...)` (`market_context.py`, sección 6) están especificadas con firma `def calculate_momentum(*, price, year_high, price_avg_50, ...) -> MomentumResult` y `def compare_to_peers(*, per_propio, per_minimo_peers, ...) -> PeerComparisonResult` — mismo estilo `kwargs`-only que ya usa `calculate_wacc` (`valuation.py:111-121`) y `evaluate_pillars` (`rules.py:100-106`), consistente con el patrón de pureza ya establecido en el proyecto.
+
+**Criterio de aceptación nuevo (verificación post-implementación, no bloqueante para el diseño):**
+- [ ] `compute_valuation_scenarios`, `classify_scenario`, `calculate_momentum`, `compare_to_peers` no importan `httpx`, `sqlite3`, ni ningún módulo de `investbot` que haga I/O (`fmp_client`, `treasury_client`, `db`) — verificable por `grep -n "^import\|^from" src/investbot/market_context.py src/investbot/valuation.py` en la revisión de `qa`/code review del PR de `implementer`, no solo por lectura de la spec.
+- [ ] `market_context.py` no recibe el cliente HTTP ni la API key como parámetro en ninguna de sus dos funciones — si `implementer` necesitara pasar el cliente HTTP a `calculate_momentum`/`compare_to_peers` "por si acaso", eso sería una señal de que se coló I/O donde no debería y `qa` debe rechazarlo en revisión.
+
+---
+
+### 2. Vector de input no validado nuevo — confirmado que no hay
+
+Analizado explícitamente, no dado por sentado:
+
+- **Escenarios de valoración (secciones 1-5):** los inputs de `compute_valuation_scenarios` son los mismos que ya recibe `compute_valuation` hoy (`eps_ttm`, `eps_historial`, `per_promedio_peers`, `fcf_historial`, `y`, `wacc_inputs`, `shares_outstanding`) — todos numéricos, ya extraídos y validados en `fmp_client.py`/`query_handler.py` antes de llegar a `valuation.py`. `DELTA_G`/`DELTA_WACC` son constantes de código (`0.03`/`0.01`), no vienen de ningún input de Daniela ni de FMP — no hay superficie de input externo nueva aquí, es una constante estática igual que `MARKET_RISK_PREMIUM`/`TERMINAL_GROWTH_RATE` ya existentes (`valuation.py:38,40`).
+- **`peers.py::PeerAverageResult` con `per_minimo`/`per_maximo`:** se confirma en el código actual (`peers.py:68-80`) que `get_peer_pe_average` ya arma la lista completa `pes: list[float]` antes de promediar — agregar `min(pes)`/`max(pes)` es leer el mismo array ya en memoria, cero parsing nuevo de respuesta HTTP, cero endpoint nuevo. No hay vector nuevo.
+- **Contexto de mercado (sección 6):** `calculate_momentum` consume `priceAvg50`, `priceAvg200`, `yearHigh`, `yearLow` — campos del mismo objeto `/quote` que `fmp_client.py::get_quote` (línea 96-102) ya trae hoy para el ticker propio, con la misma llamada `params=` que evita inyección en la URL (criterio de `security` Iter-1, sección 4, ya vigente y sin cambios). `compare_to_peers` consume `per_propio`/`per_minimo_peers`/`per_maximo_peers`/`peers_usados` — todos derivados, no texto libre de Daniela ni respuesta cruda de un proveedor nuevo. Ninguna de las dos funciones recibe directamente el texto que Daniela escribió en el chat (eso ya se resuelve y sanitiza antes, en `query_handler.py`, criterio de Iter-1 sección 4, sin cambios).
+- **Confirmado explícitamente:** ninguna de las funciones nuevas de Iter-3 introduce un punto de entrada de datos que no haya pasado ya por la validación/tipado de Iter-1 (`fmp_client.py` parsea JSON de FMP con claves conocidas; nunca hay `eval`/deserialización insegura en el proyecto). No hay hallazgo aquí.
+
+---
+
+### 3. ¿El logging de estos módulos podría filtrar algo nuevo?
+
+Revisado contra el código de logging real, no solo contra la ausencia de secretos "obvia":
+
+- `fmp_client.py` (líneas 26-79) ya loguea únicamente `endpoint_label`/`status` en `logger.warning(...)` — nunca la URL completa ni el diccionario `params` (que es donde vive `apikey`). Esto es el patrón que exigió `security` en Iter-1 sección 2-3 y sigue vigente; Iter-3 no toca `fmp_client.py` en absoluto (ni se agrega un endpoint nuevo, ver punto 4 abajo), así que no hay regresión posible aquí.
+- `query_handler.py` ya usa `sanitize_for_log(...)` (línea 248) antes de loguear el texto libre de Daniela — criterio de Iter-1 sección 4, vigente sin cambios. Iter-3 no agrega ningún nuevo punto donde texto de usuario llegue a un logger.
+- `peers.py` (código actual) **no tiene ningún `logger.*` hoy** — agregar `per_minimo`/`per_maximo` a `PeerAverageResult` no crea una superficie de logging nueva porque no hay logging en ese módulo para empezar. Si `implementer` decide loguear el resultado completo de `PeerAverageResult` en algún punto de `query_handler.py` (no está en la spec, pero es plausible como debug), esos campos son floats de PER — no secretos, no URLs, no datos personales de Daniela. Sin riesgo de severidad comparable a la sección 2/3 de Iter-1 (que trataba específicamente de `apikey`/tokens).
+- `market_context.py` (módulo nuevo, no escrito todavía): dado que no recibe cliente HTTP ni API key (punto 1 arriba), no hay forma de que un log de este módulo contenga una URL con query string ni un token — a diferencia del hallazgo de mayor severidad de Iter-1 (sección 2, logging DEBUG de `httpx`/`telegram` filtrando el token en la URL), que era posible precisamente porque esos módulos sí hacen la llamada HTTP. `market_context.py`, al ser cálculo puro downstream de datos ya obtenidos, estructuralmente no puede reproducir ese hallazgo.
+- **Conclusión:** ningún campo nuevo de Iter-3 (`per_minimo`, `per_maximo`, `modelos_excluidos_base`, las clasificaciones booleanas por escenario, `pct_vs_year_high`/`pct_vs_avg_50`/etc., `posicion` de `PeerComparisonResult`) es de mayor sensibilidad que un ratio financiero ya expuesto por Iter-1/Iter-2 (`ratio_liquidez`, `per`, `valor_justo_total`) — todos son números derivados de cotizaciones públicas, no secretos ni PII.
+
+**Criterio de aceptación nuevo:**
+- [ ] Si `implementer` agrega logging de depuración sobre `ValuationScenarios`/`PeerAverageResult`/`MomentumResult`/`PeerComparisonResult` en algún punto (no exigido por la spec, pero plausible), ese log nunca debe incluir el objeto `wacc_inputs` completo sin filtrar si en el futuro ese diccionario llegara a incorporar algo más que datos financieros públicos — hoy no lo hace (son floats de balance/income statement), se deja como nota preventiva, no como hallazgo activo.
+
+---
+
+### 4. Condición sobre un futuro endpoint tipo `^VIX`/Fear & Greed (pregunta abierta (f), no bloqueante hoy)
+
+La spec ya documenta correctamente que esto es una verificación de `implementer`, no una decisión de `security`. Se agrega aquí el criterio condicional que pide el patch: **si** `implementer` confirma que un endpoint de este tipo responde gratis y lo integra, esa llamada nueva debe cumplir, sin excepción, los mismos criterios ya establecidos en `security` Iter-1 secciones 2-4 antes de mezclarse con el resto del bot:
+
+- [ ] **Secretos (Iter-1 sección 2):** si el endpoint requiere su propia API key o reutiliza `FMP_API_KEY`, esa key se lee de variable de entorno, nunca hardcodeada, y se pasa vía `params=` de `httpx` (nunca f-string/concatenación) — mismo patrón que `search_company`/`get_quote`/`get_profile` ya usan en `fmp_client.py`.
+- [ ] **Logging (Iter-1 sección 2-3):** el wrapper de esa llamada nueva loguea únicamente `endpoint_label`/`status`, nunca la URL completa ni el diccionario de `params` — mismo patrón que las funciones existentes de `fmp_client.py` (líneas 54, 60, 73, 79). Si se agrega a un módulo nuevo en vez de a `fmp_client.py`, ese módulo nuevo hereda el mismo estándar, no un logging más permisivo "porque es un módulo distinto".
+- [ ] **Manejo de errores (Iter-1 sección 3):** excepción propia que no propaga la URL/params originales hacia el mensaje a Telegram ni hacia ningún `logger.*`, igual que `FMPError`/`TreasuryError` ya exigen.
+- [ ] **Presupuesto/disponibilidad (no es criterio de seguridad, se marca aquí solo para que `qa`/`implementer` no lo pierdan de vista):** si el endpoint no es gratuito o consume el cupo de 250 req/día de forma no presupuestada, eso es un problema de diseño (`architect`), no de seguridad — pero si `security` detecta en la revisión del PR que la key usada es de un tier pago sin que Daniela lo haya aprobado, debe señalarlo igual que ya se hizo con `/key-metrics-ttm` en esta misma sesión (hallazgo operativo, no de este documento).
+
+Este criterio queda **condicional, no bloqueante**: mientras esa verificación no ocurra, no hay ninguna superficie nueva que auditar más allá de lo ya cubierto en los puntos 1-3 de esta sección.
+
+---
+
+### Veredicto de `security`
+
+**Ningún hallazgo bloqueante.** Iter-3 completo (escenarios de valoración + contexto de mercado) es, tal como está diseñado y consistente con el código real ya auditado del proyecto, una capa de cálculo puro sobre datos que Iter-1/Iter-2 ya validaron y sanitizaron:
+
+- Las funciones nuevas siguen el mismo patrón de pureza (sin I/O, `kwargs`-only, tipos numéricos) que `calculate_cagr`/`calculate_wacc`/`evaluate_pillars` ya implementan hoy en el repo — verificado leyendo el código, no asumido.
+- No hay vector de input no validado nuevo: todos los datos de entrada de las 4 funciones nuevas ya pasaron por la validación/parsing de Iter-1 antes de llegar aquí; las 2 constantes nuevas (`DELTA_G`, `DELTA_WACC`) son literales de código, no input externo.
+- No hay superficie de logging nueva de mayor severidad que la ya cubierta en Iter-1 secciones 2-3: `peers.py` no loguea hoy, `market_context.py` no tocará ni el cliente HTTP ni las API keys por diseño, y los campos nuevos son floats derivados de cotizaciones públicas, no secretos.
+- La única pieza condicional (un futuro endpoint tipo `^VIX`, pregunta (f)) queda con un criterio explícito de qué debe cumplir si se agrega, sin bloquear el patch actual.
+
+**Este patch puede pasar directo a `qa` sin volver a `architect`.** No se identificó ningún hallazgo que requiera un spec patch adicional ni que reabra las decisiones de diseño de las secciones 1-6 del Iter-3, ni las de Iter-1/Iter-2.
+
+---
+
+## Handoff → qa
+
+### Specs producidas
+- Este Spec Patch [Iter-3] completo (secciones 1-6, criterios de aceptación, y esta sección de `security`), agregado al final de `SDD_investbot_mvp.md`.
+
+### Criterios de aceptación (base + Iter-3 + seguridad Iter-3)
+Ver "Criterios de aceptación (nuevos, Iter-3)" + los criterios de esta sección de `security` (puntos 1-4 arriba) — se suman a todo lo vigente de Iter-1 + Iter-2, sin reemplazarlo.
+
+### Sin bloqueantes
+`security` no encontró ningún hallazgo que requiera volver a `architect`. Todas las funciones nuevas (diseñadas, no implementadas todavía) siguen el patrón de pureza ya verificado en el código existente del proyecto; no hay vector de input nuevo ni superficie de logging de mayor severidad que la ya auditada en Iter-1.
+
+### Foco esperado para `qa`
+- Confirmar testabilidad de los ~25 criterios de aceptación nuevos de Iter-3 (sección "Criterios de aceptación (nuevos, Iter-3)") — en particular los tests de exclusión de nivel 2 (`test_valuation_adobe_scenarios`) y los 9 tests de `classify_scenario`/combinación de clasificación, que dependen de fixtures numéricos concretos, no de mocks de red.
+- Confirmar el criterio nuevo de `security` punto 1 ("no importan `httpx`/`sqlite3`/módulos de I/O") como parte de la revisión de estructura de código que `qa` ya exige en Iter-1 sección 6 ("no hay lógica de negocio escondida") — mismo tipo de chequeo, ahora aplicado a `market_context.py` y a `compute_valuation_scenarios`.
+- Confirmar que `test_valuation_adobe_scenarios` efectivamente verifica que los 3 modelos son calculables en los 3 escenarios para el fixture de Adobe sin exclusiones de nivel 2 inesperadas (criterio de aceptación ya listado por `architect`) — si `DELTA_G`/`DELTA_WACC` resultan demasiado agresivos para ese fixture, es un hallazgo de `qa`/`implementer`, no algo que `security` deba resolver.
+- Si `qa` confirma testabilidad, el pipeline va directo a `implementer` (sin volver a `frontend`, sigue sin haber UI web).
+
+---
+
+## Criterios QA — agregado por `qa` [Iter-3, 2026-07-28]
+
+**Rol:** `qa`. Revisión de testabilidad del Spec Patch [Iter-3] completo (secciones 1-6 + `security` Iter-3). No repite el análisis de Iter-1 ni la confirmación de Iter-2 (ambos congelados). Mismo patrón que la confirmación corta de Iter-2: no se rediseña nada, solo se confirma si los criterios ya escritos alcanzan para tests deterministas, y se documentan como bloqueante únicamente los huecos reales.
+
+**Verificación hecha contra código y fixtures reales, no solo contra la prosa del patch** (mismo estándar que ya aplicó `security` en esta iteración): se leyó `src/investbot/valuation.py`, `src/investbot/peers.py`, `src/investbot/rules.py` tal como están hoy, y se ejecutaron a mano (con el intérprete real del proyecto, no una calculadora aparte) los datos de `tests/fixtures/adobe/` con `DELTA_G=0.03`/`DELTA_WACC=0.01` — ver punto 1 abajo. Ninguna de las funciones de escenarios (`compute_valuation_scenarios`, `classify_scenario`, `calculate_momentum`, `compare_to_peers`) existe todavía en el repo, consistente con lo que ya reportó `security`.
+
+---
+
+### 1. Caso Adobe: ¿`DELTA_G=0.03`/`DELTA_WACC=0.01` disparan exclusiones de nivel 2 con los números reales del fixture? — verificado, **no las disparan**
+
+El patch (sección 4) dejó esto explícitamente sin verificar ("si algún escenario excluye un modelo inesperadamente... debe ajustarse antes de cerrar el patch, `qa` lo confirma en su revisión, no `architect` en soledad"). Se corrió el cálculo real con `tests/fixtures/adobe/*.json` y las funciones ya existentes (`calculate_cagr`, `calculate_graham_fair_value`, `calculate_wacc`, `calculate_dcf_fair_value`) aplicando manualmente los desplazamientos propuestos, para emular lo que hará `compute_valuation_scenarios`:
+
+| Escenario | Múltiplos (min/prom/max PER peers) | Graham (`g∓0.03`) | DCF (`WACC±0.01`, `g_fcf∓0.03`) | Total |
+|---|---|---|---|---|
+| Pesimista | 20.00 × 30.0 = 600.00 | `g=6.64%` → 435.64 | `WACC=11.26%`, `g_fcf=5.0%` → 225.64 | **420.43** |
+| Conservador | 20.00 × 32.9 = 658.00 | `g=9.64%` → 555.64 | `WACC=10.26%`, `g_fcf=8.0%` → 288.82 | **500.82** (= regresión ya validada) |
+| Optimista | 20.00 × 35.7 = 714.00 | `g=12.64%` → 675.64 | `WACC=9.26%`, `g_fcf=11.0%` → 376.50 | **588.71** |
+
+- Graham: el multiplicador `(8.5+2×g_pct)` da **21.78** en pesimista y **33.78** en optimista — lejos de cruzar 0 (haría falta un `g` conservador menor a aprox. -4.25% para que el pesimista, con `-3pp` adicionales, cruce cero). La guarda nueva de la sección 1 del patch **no se activa** con este fixture.
+- DCF: `WACC` optimista (9.26%) queda muy por encima de `TERMINAL_GROWTH_RATE` (2.5%) — la guarda existente (`wacc <= terminal_growth → None`) tampoco se activa.
+- Múltiplos: los 3 peers (MSFT/ORCL/CRM) tienen `earningsYield` válido en `peers_metrics.json` → nunca es el caso degenerado de <2 peers.
+- **Conclusión:** con el fixture actual, los 3 modelos son calculables en los 3 escenarios, sin ninguna exclusión de nivel 2 — `test_valuation_adobe_scenarios` es escribible tal como lo especifica el patch (relación `pesimista ≤ conservador ≤ optimista` verificada arriba: 420.43 ≤ 500.82 ≤ 588.71) y **pasará** sin necesidad de ajustar `DELTA_G`/`DELTA_WACC` para este caso. Esto no es un hallazgo bloqueante — es la verificación que el patch pidió explícitamente que `qa` hiciera antes de cerrar, y queda cerrada con evidencia numérica trazable (arriba). Recomendación operativa para `implementer`: dejar esta tabla (o su equivalente) como comentario en el test nuevo, igual que ya hace `tests/fixtures/adobe/README.md` con el caso conservador — evita que alguien repita esta verificación a mano en el futuro.
+
+---
+
+### 2. `classify_scenario` / combinación barata-cara — cobertura de casos
+
+Los 4 tests listados (`test_classify_scenario_barata/cara/none`, `test_combinar_clasificacion_consolidada_barata/cara`, `_desglosada`, `_con_none`) tienen assert determinista porque `classify_scenario` es una función pura de 2 argumentos con contrato explícito en pseudocódigo — no hace falta un caso de referencia de negocio para escribirlos, cualquier par `(precio, valor_justo)` inventado sirve. Sin hallazgo en eso.
+
+**Hueco real — interacción no definida con el caso "0 de 3 modelos" ya existente de Iter-2 (`test_valuation_0_de_3_modelos`):**
+
+Si el escenario **conservador** ya tiene los 3 modelos excluidos a **nivel 1** (el caso que Iter-2 ya define: historial insuficiente + EPS TTM≤0 simultáneos, mensaje "no fue posible valorar la empresa"), entonces por la propia regla de la sección 2 de este patch ("un modelo excluido a nivel 1 lo está en los 3 escenarios por igual"), **los 3 escenarios** tienen `valor_justo_total=None` simultáneamente — no es el mismo caso que `test_combinar_clasificacion_con_none` (que cubre **un** escenario en `None`, no los 3).
+
+La spec no dice qué hace `summary.py` en ese caso: ¿omite por completo la sección de clasificación barata/cara (porque ya se mostró el mensaje de Iter-2 de "no fue posible valorar")? ¿O aplica igual la regla de combinación de la sección 3 de este patch y agrega un desglose de 3 líneas "no se pudo determinar en este escenario" — que sería redundante con el mensaje que Iter-2 ya muestra para el mismo caso? Sin definir esto, no hay un assert determinista posible para `test_valuation_0_de_3_modelos` en su forma extendida a Iter-3 (el test de Iter-2 ya existente solo verifica `valor_justo_total=None`, no toca clasificación, así que no cubre este caso nuevo por accidente).
+
+Recomendación de `qa` (no vinculante, consistente con el principio de "nunca mostrar ruido redundante" ya usado en la sección 3 para el caso de 3 escenarios coincidentes): cuando el escenario conservador ya tiene `valor_justo_total=None` por exclusión de nivel 1 de los 3 modelos, `summary.py` omite entera la sección de clasificación barata/cara — el mensaje de Iter-2 ("no fue posible valorar la empresa...") ya comunica que no hay nada que clasificar, y desglosar 3 veces "no se pudo determinar" no aporta información nueva.
+
+---
+
+### 3. `market_context.py` — datos faltantes o insuficientes: 2 huecos reales
+
+**3a. `calculate_momentum` — caso de un solo promedio móvil ausente (no los dos).**
+
+La sección 6.1 solo define `etiqueta="no_disponible"` para el caso "faltan los **dos** promedios móviles" (`price_avg_50` **y** `price_avg_200`). No define qué pasa si falta **solo uno** de los dos — caso real, no hipotético: una empresa con 60-90 días de historial de cotización (ej. IPO reciente) puede tener `priceAvg50` disponible en FMP pero `priceAvg200` todavía en `null` porque no acumuló 200 días de precios. Los 4 tests listados (`test_momentum_impulso_positivo/_negativo/_mixto/_no_disponible`) no incluyen este quinto caso. Sin definirlo, `calculate_momentum(price=X, price_avg_50=Y, price_avg_200=None, ...)` no tiene un assert determinista: ¿`etiqueta="no_disponible"` también en este caso (extendiendo la guarda a "falta cualquiera de los dos", no solo "faltan los dos"), o se intenta una etiqueta parcial (ej. "mixto" o "impulso_positivo" comparando solo contra el promedio disponible)?
+
+Recomendación de `qa` (no vinculante, mismo principio de "nunca inventar en silencio" que ya rige toda la spec): `etiqueta="no_disponible"` si falta **cualquiera** de los dos promedios (no solo si faltan los dos) — las 3 etiquetas cualitativas (positivo/negativo/mixto) están definidas explícitamente sobre la comparación **simultánea** contra ambos promedios; calcular una etiqueta con un solo dato disponible sería una fracción de la definición original, no una aproximación razonable de ella.
+
+**3b. `compare_to_peers` — caso degenerado de exactamente 1 peer válido, no cubierto (mismo tipo de hueco que la sección 1 ya cerró para Múltiplos).**
+
+La sección 6.2 define `posicion="no_comparable"` solo para `per_propio is None` o "0 peers con PER válido". No replica el caso degenerado que la **propia sección 1 de este mismo patch** ya identificó y resolvió explícitamente para el modelo de Múltiplos: "si solo hay 1 peer válido... mínimo=promedio=máximo, no hay rango real — se documenta explícitamente en vez de mostrar 3 números iguales sin explicación". Con exactamente 1 peer válido, `per_minimo_peers == per_promedio_peers == per_maximo_peers` (mismo valor) y la función `compare_to_peers`, tal como está especificada, produciría mecánicamente `"en_linea"` (si `per_propio` coincide con ese único valor) o `"mas_barata"`/`"mas_cara"` — pero calificar eso de **"en línea con tus comparables"** (plural, sugiere un rango real) cuando en realidad hay un solo comparable es información engañosa para Daniela, y contradice el estándar de transparencia que la sección 1 de este mismo patch ya aplicó al mismo tipo de dato.
+
+Los 5 tests listados (`_mas_barata/_en_linea/_mas_cara/_no_comparable_eps_negativo/_no_comparable_sin_peers_validos`) no incluyen un caso "1 peer válido" — falta definir si ese caso es un sexto valor de `posicion` (ej. `"no_comparable"` también aquí, con un motivo distinto, o una posición nueva tipo `"comparacion_limitada"`), o si se acepta mostrar `"en_linea"`/`"mas_barata"`/`"mas_cara"` con un solo dato sin aclaración. Sin definirlo, no hay un assert determinista para ese input específico.
+
+Recomendación de `qa` (no vinculante, consistencia directa con la sección 1 del mismo patch): tratar `<2` peers válidos igual en `compare_to_peers` que en Múltiplos — `posicion="no_comparable"` con un motivo adicional (ej. `"un_solo_peer_valido"`) en vez de una posición que implica un rango que no existe.
+
+---
+
+### 4. Estructura de datos y firmas — ¿alcanza para un assert determinista?
+
+- `classify_scenario`, `calculate_momentum`, `compare_to_peers`: firma completa (parámetros `kwargs`-only, tipos, retorno) especificada en el patch — sin ambigüedad, testeables tal cual (salvo los huecos de comportamiento ya señalados en 2 y 3, que son de **contrato de casos límite**, no de firma).
+- `compute_valuation_scenarios(...)`: la firma exacta queda implícita, no escrita como código — la sección 2 dice que "recibe los mismos datos ya resueltos que hoy recibe `compute_valuation`" y que "`per_promedio_peers` → min/prom/max", pero `compute_valuation` hoy solo recibe un único `per_promedio_peers: Optional[float]` (ver `valuation.py:249`), no un trío min/prom/max. La función nueva necesita recibir de alguna forma los 3 valores (¿tres parámetros sueltos `per_minimo_peers`/`per_promedio_peers`/`per_maximo_peers`, o el `PeerAverageResult` completo?) — el patch no lo fija explícitamente como sí hizo Iter-2 con la estructura de `ValuationResult`. **No es bloqueante**: no cambia ningún resultado esperado ni impide escribir el test (el test llama a la función con los datos de peers como sea que `implementer` la nombre, y verifica la tabla de la sección 1 de este mismo documento) — se deja como nota de implementación, no como criterio que requiera volver a `architect`.
+
+---
+
+### 5. Cobertura — bucket de `market_context.py` (nuevo) y de `peers.py`
+
+La spec de Iter-3 no dice en qué bucket de cobertura (95% "corazón matemático" vs 70% "resto") cae `market_context.py`. Decisión de `qa` (dentro de su rol, no requiere `architect`):
+
+- **`market_context.py` → bucket de 70% ("resto"), no el de 95%.** Aunque el patch describe `market_context.py` como "mismo estándar de pureza que `valuation.py`/`rules.py`", el criterio de 95% en Iter-1 se reservó específicamente para el **motor de Valor Justo** (los 3 modelos + el puntaje de perfil de riesgo) — el ejemplo ya establecido es que `rules.py` (igual de puro, igual de crítico para los pilares) **ya está en el bucket de 70%**, no en el de 95%. `market_context.py` (momentum + comparación con peers) es información complementaria/contextual, no el cálculo del Valor Justo en sí — mismo nivel de riesgo de negocio que `rules.py`, no el de `valuation.py`. Se mantiene el criterio ya fijado en Iter-1 sin necesidad de ampliarlo.
+- **`peers.py` → recomendación de moverlo explícitamente al bucket de 95%** (hueco preexistente de Iter-1: la lista de "resto" del Iter-1 nunca nombró a `peers.py`, y tampoco quedó en la lista de 95%). Esto ya era una omisión antes de Iter-3, pero se vuelve más relevante ahora: con `per_minimo`/`per_maximo` nuevos, `peers.py` deja de alimentar un solo input (`per_promedio`) a un solo modelo, y pasa a determinar directamente 2 de los 3 valores del escenario de Múltiplos (pesimista y optimista) — es tan "corazón matemático" del Valor Justo como `valuation.py` mismo. Se agrega como criterio de esta sección (no requiere `architect`, es ajuste de umbral de cobertura, potestad de `qa`).
+- **Sin cambios** en el umbral total (≥75% líneas del proyecto) ni en la lista ya fijada de módulos del bucket de 70% (Iter-1).
+
+**Criterio de aceptación nuevo (cobertura):**
+- [ ] `src/investbot/market_context.py`: ≥ 70% líneas (bucket "resto", mismo criterio que `rules.py`).
+- [ ] `src/investbot/peers.py`: ≥ 95% líneas / 100% de las ramas del caso degenerado (<2 peers válidos) — se suma explícitamente al bucket de 95% junto con `valuation.py` y el cálculo de puntaje de riesgo.
+
+---
+
+### Bloqueantes para `architect` — antes de scope freeze de Iter-3
+
+Mismo criterio que Iter-2 (B1-B5): estos son huecos de **comportamiento no definido** para casos límite reales, no de seguridad ni de stack. Se numeran **C1-C3** para no confundirlos con los B1-B5 ya cerrados de Iter-2.
+
+**C1 — Interacción entre "0 de 3 modelos" (Iter-2, exclusión total en el escenario conservador) y la clasificación barata/cara por escenario (Iter-3).**
+Cuando el conservador ya tiene los 3 modelos excluidos a nivel 1 (mismo caso que `test_valuation_0_de_3_modelos` de Iter-2), la regla de la sección 2 de este patch implica que **los 3 escenarios** quedan con `valor_justo_total=None` simultáneamente — un caso distinto del ya cubierto `test_combinar_clasificacion_con_none` (un solo escenario en `None`). `architect` debe definir: ¿se omite la sección de clasificación barata/cara por completo en ese caso (recomendación de `qa`, ver punto 2 arriba), o se muestra igual un desglose de 3 líneas "no se pudo determinar"?
+
+**C2 — `calculate_momentum` con exactamente un promedio móvil ausente (no los dos).**
+La guarda `etiqueta="no_disponible"` está definida solo para "faltan los dos" (`priceAvg50` y `priceAvg200`). Falta definir el caso real de un solo dato ausente (empresa con 50-199 días de historial de cotización). Recomendación de `qa` (ver punto 3a arriba): extender la guarda a "falta cualquiera de los dos".
+
+**C3 — `compare_to_peers` con exactamente 1 peer válido (caso degenerado no replicado del ya resuelto en la sección 1 para Múltiplos).**
+Falta un sexto valor/motivo de `posicion` (o una aclaración explícita) para el caso `per_minimo_peers == per_promedio_peers == per_maximo_peers` con un solo comparable — mostrar `"en_linea"`/`"mas_barata"`/`"mas_cara"` sin aclaración contradice el estándar de transparencia que la sección 1 de este mismo patch ya fijó para el mismo tipo de dato. Recomendación de `qa` (ver punto 3b arriba): tratarlo como `"no_comparable"` con motivo adicional.
+
+**Impacto en el pipeline:** siguiendo el mismo criterio que Iter-2, esto es un bloqueante acotado — vuelve a `architect` como un spec patch corto limitado a C1-C3 (no reabre las secciones 1-5 de este mismo patch, que quedan confirmadas sin ambigüedad — ver puntos 1 y 2 arriba, con evidencia numérica para el punto 1). No requiere volver a pasar por `security` (C1-C3 son puramente de lógica de presentación/clasificación sobre datos ya validados, mismo tipo de cambio que B1-B5 de Iter-2, que tampoco requirió volver a `security`).
+
+---
+
+### Veredicto de `qa`
+
+**La spec NO queda lista para scope freeze todavía — pero el alcance pendiente es pequeño (C1-C3), no una reapertura del patch completo.**
+
+Lo que **sí** queda confirmado, sin necesidad de más trabajo de `architect`:
+- El caso de regresión Adobe (`test_valuation_adobe_regression`) no cambia — confirmado, sin tocar código.
+- `test_valuation_adobe_scenarios`: verificado con los datos reales del fixture que `DELTA_G=0.03`/`DELTA_WACC=0.01` **no** disparan ninguna exclusión de nivel 2 para Adobe — el test es escribible y pasará tal como lo especifica el patch (ver punto 1, tabla con los 9 valores + evidencia de por qué las guardas no se activan).
+- `classify_scenario` y los 6 tests de clasificación/combinación que **sí** tienen contrato completo (barata/cara/none, consolidada/desglosada, un escenario en `None`) están listos para implementarse tal cual.
+- Estructura de datos (`ValuationScenarios`, `ScenarioValuationResult`, `MomentumResult`, `PeerComparisonResult`) es suficiente en todos los casos salvo la firma exacta de `compute_valuation_scenarios` (no bloqueante, nota de implementación).
+- Cobertura: `market_context.py` → 70%, `peers.py` → 95% (decisión de `qa`, sin volver a `architect`).
+
+Lo que **falta** antes de scope freeze: **C1, C2, C3** — 3 casos límite reales (interacción de clasificación con "0 de 3 modelos", un solo promedio móvil ausente en momentum, 1 peer válido en comparación) sin comportamiento definido, cada uno con una recomendación no vinculante de `qa` ya propuesta para que `architect` solo tenga que confirmar o ajustar por escrito (mismo patrón que B5 en Iter-2).
+
+**Siguiente paso:** `architect` emite un spec patch corto acotado a C1-C3 (mismo patrón que el patch B1-B5 de Iter-2). No necesita volver a pasar por `security` (cambios de lógica de presentación pura, sin I/O, sin secretos, sin input externo nuevo). Con el patch resuelto, `qa` confirma en una pasada corta (mismo patrón que su confirmación de Iter-2) y el pipeline va directo a `implementer`.
+
+**Todo lo demás de este Spec Patch [Iter-3] (secciones 1-6, criterios de `security` Iter-3, y los puntos 1-2-4-5 de esta sección de `qa`) queda congelado y no se reabre** — el patch de `architect` debe limitar su alcance exactamente a C1-C3, igual que Iter-2 se limitó a B1-B5.
+
+---
+
+## Handoff → architect (Iter-4, acotado a C1-C3)
+
+### Specs producidas
+- Esta sección de `qa` sobre el Spec Patch [Iter-3], agregada al final de `SDD_investbot_mvp.md`.
+
+### Criterio que falló
+`qa` no pudo convertir en tests deterministas 3 casos límite (C1-C3, ver sección "Bloqueantes para `architect`" arriba) porque el Spec Patch Iter-3 no define un resultado esperado para ellos. El resto del patch (secciones 1-6 de `architect`, `security` Iter-3, y los puntos 1/2/4/5 de esta sección de `qa`) queda confirmado y congelado.
+
+### Foco esperado para `architect`
+- Definir C1: comportamiento de la sección de clasificación barata/cara cuando el escenario conservador ya tiene `valor_justo_total=None` por exclusión total de nivel 1 (interacción con el caso "0 de 3 modelos" de Iter-2).
+- Definir C2: etiqueta de `calculate_momentum` cuando falta exactamente uno de los dos promedios móviles (no los dos).
+- Definir C3: valor/motivo de `posicion` en `compare_to_peers` cuando hay exactamente 1 peer válido (caso degenerado análogo al ya resuelto para Múltiplos en la sección 1).
+- Las 3 recomendaciones no vinculantes de `qa` (puntos 2, 3a, 3b arriba) están disponibles para adoptar tal cual, ajustar, o reemplazar — `architect` decide, `qa` no fuerza la decisión.
+
+### Si `architect` resuelve C1-C3
+El pipeline no necesita volver a `security` (mismo criterio que Iter-2: son cambios de lógica de presentación/clasificación pura, sin I/O nuevo, sin secretos nuevos, sin vector de input externo nuevo). `qa` confirma en una pasada corta y el pipeline va directo a `implementer`.
