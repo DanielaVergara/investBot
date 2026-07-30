@@ -45,14 +45,14 @@ verificada). Tampoco de `/key-metrics-ttm`: verificado con una key real que
 es un endpoint **de pago** en el plan gratuito actual de FMP (`402 Payment
 Required`), a pesar de que la documentación pública no lo deja claro. En su
 lugar:
-- El PER promedio "de sector" se aproxima con un **set fijo de 3-5 peers
-  hardcodeados por sector** (`src/investbot/peers.py`), documentado en cada
-  respuesta como "PER promedio de un set fijo de comparables, no del sector
-  completo". La API stable ya no expone un campo `pe` directo en `/quote`
-  (deprecado junto con la API legacy) — el PER de cada peer se deriva como
-  `1 / earningsYield` desde `/key-metrics` **anual** (la variante TTM da un
-  PER más "en vivo" pero es de pago — ver arriba). Mismo presupuesto de
-  requests que la versión anterior (1 llamada por peer).
+- El PER promedio "de sector" se aproxima con un set de **3-5 peers**
+  (`src/investbot/peers.py`), documentado en cada respuesta según de dónde
+  salió la lista de candidatos esta consulta — ver "Fuente de peers
+  dinámicos (Finnhub)" más abajo. La API stable ya no expone un campo `pe`
+  directo en `/quote` (deprecado junto con la API legacy) — el PER de cada
+  peer se deriva como `1 / earningsYield` desde `/key-metrics` **anual** (la
+  variante TTM da un PER más "en vivo" pero es de pago — ver arriba). Mismo
+  presupuesto de requests que la versión anterior (1 llamada por peer).
 - El DCF se calcula internamente (proyección de FCF + WACC simplificado +
   valor terminal por perpetuidad de Gordon Growth), sin llamar a `/dcf`.
 - La tasa libre de riesgo (Y) **no viene de FMP** — ver siguiente sección.
@@ -63,7 +63,7 @@ lugar:
 |---|---|---|
 | Datos propios del ticker | 6 | `/quote`, `/profile`, `/income-statement`, `/balance-sheet-statement`, `/cash-flow-statement`, `/key-metrics` |
 | Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | `/search` |
-| Peers para el modelo de Múltiplos | 3-5 | `/key-metrics` (anual) por peer |
+| Peers para el modelo de Múltiplos | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector |
 | Contexto de mercado (VIX, no depende del ticker consultado) | 1 | `/quote (symbol=^VIX)` |
 | **Total por consulta completa** | **10-13** | |
 
@@ -72,6 +72,11 @@ empresa por día** — muy por encima del uso esperado de un solo usuario con
 consultas esporádicas. No hay caché ni rate-limit adicional a nivel de
 aplicación más allá de un límite defensivo de 10 consultas/minuto (protección
 contra bugs propios, no un límite de negocio).
+
+**Peers dinámicos (Finnhub) y eventos corporativos (SEC EDGAR) son
+proveedores completamente aparte** — ninguna de las 2 features nuevas
+consume el presupuesto de 250 req/día de FMP, mismo principio que FRED/
+Treasury.gov (ver secciones dedicadas más abajo).
 
 ## Fuente de Y (tasa libre de riesgo, bono del tesoro EEUU 20 años)
 
@@ -86,6 +91,65 @@ de Treasury.gov (Daily Treasury Par Yield Curve Rates, CSV, sin API key).
 Si ninguna de las dos fuentes responde, el bot lo reporta explícitamente —
 nunca usa un valor hardcodeado en silencio. Esta llamada **no consume el
 cupo de 250 req/día de FMP** (proveedor distinto).
+
+## Fuente de peers dinámicos (Finnhub)
+
+**Opcional — el bot funciona igual sin configurarla.** Fuente primaria de la
+lista de peers candidatos por ticker: **Finnhub** (`GET /stock/peers`,
+`grouping=subIndustry`), proveedor gratuito distinto de FMP, sin tarjeta
+(free tier: 60 llamadas/minuto). Requiere `FINNHUB_API_KEY` (registro
+gratuito en https://finnhub.io).
+
+**Fallback automático y silencioso** — nunca un error visible en el chat —
+a la lista fija por sector ya existente (`src/investbot/peers.py::
+PEERS_BY_SECTOR`, mantenimiento manual, sigue existiendo tal cual) en
+cualquiera de estos casos: `FINNHUB_API_KEY` no configurada, la llamada
+falla (402/403/429/timeout/red/JSON inesperado), o Finnhub devuelve menos
+de 3 peers válidos tras excluir el propio ticker (`MIN_PEERS_DINAMICOS_PARA_USAR`).
+Nunca se combinan ambas fuentes en la misma consulta — es una u otra. Tope
+de candidatos dinámicos consultados contra FMP: 5 (`MAX_PEERS_DINAMICOS`).
+
+Cada respuesta indica explícitamente, en la nota de transparencia, cuál de
+las 2 fuentes se usó esta consulta — el PER individual de cada peer lo sigue
+calculando FMP exactamente igual sea cual sea la fuente de la lista
+(`1 / earningsYield` vía `/key-metrics` anual, ver arriba).
+
+Finnhub tiene antecedente documentado (GitHub issue
+`finnhubio/Finnhub-API#271`) de mover endpoints de gratis a pago sin
+aviso — ese issue nombra "Dividends"/"Major Developments", no "Company
+Peers", pero el bot trata cualquier fallo de Finnhub exactamente igual
+(fallback silencioso), sin distinguir "todavía gratis" de "ya no lo es".
+
+## Fuente de eventos corporativos (SEC EDGAR)
+
+**Opcional — el bot funciona igual sin configurarla.** Cuando una empresa
+tiene un evento material (cambio de directivos/ejecutivos, contrato
+importante, litigio relevante, posible bancarrota), está obligada por ley a
+presentar un formulario **8-K** ante la SEC. El bot lista, por consulta,
+hasta 5 eventos de 8-K de los últimos 180 días con al menos un Item
+relevante (`1.01`, `1.02`, `1.03`, `5.02`, `8.01`).
+
+**Endpoints usados, ambos gratis, sin API key, sin login:**
+- `https://www.sec.gov/files/company_tickers.json` — mapeo ticker → CIK,
+  cacheado en memoria 24h (archivo estático de cientos de KB).
+- `https://data.sec.gov/submissions/CIK{cik10}.json` — historial de filings
+  de una empresa, incluye 8-K con fecha y códigos de Item.
+
+**Rate limit: 10 req/seg por IP, sin límite diario.** Requiere el header
+`User-Agent` con contacto identificable (`SEC_EDGAR_USER_AGENT`, formato
+`"<nombre/app> <email de contacto>"`) — no es opcional, es un requisito de
+acceso justo de la SEC. Si `SEC_EDGAR_USER_AGENT` no está configurada, la
+feature completa se omite (nunca se manda una request sin el header).
+
+**El bot NO resume el contenido legal del 8-K con NLP/LLM** — decisión
+explícita: un resumen incorrecto de un litigio o un cambio de gerencia es
+peor que no mostrar nada, y este proyecto no tiene ningún componente de
+NLP/LLM hoy. Se muestra fecha + tipo de evento (Item) + link directo al
+filing público en `sec.gov` para leerlo vos misma si te interesa.
+
+Ninguna de las 2 features nuevas de esta sección consume el cupo de 250
+req/día de FMP — proveedores distintos, mismo principio que FRED/
+Treasury.gov.
 
 ---
 
@@ -102,6 +166,8 @@ cupo de 250 req/día de FMP** (proveedor distinto).
 ```
 Daniela (Telegram) <--long polling--> investbot-bot (Docker) --HTTPS--> FMP
                                                           `----HTTPS--> FRED / Treasury.gov
+                                                          `----HTTPS--> Finnhub (opcional, peers dinámicos)
+                                                          `----HTTPS--> SEC EDGAR (opcional, eventos corporativos)
                                                           `----lectura/escritura--> SQLite (volumen)
 ```
 
@@ -116,6 +182,8 @@ pip install -r requirements-dev.txt
 
 cp .env.example .env
 # completar TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_ID, FMP_API_KEY, FRED_API_KEY
+# FINNHUB_API_KEY y SEC_EDGAR_USER_AGENT son opcionales — sin ellas el bot
+# arranca igual, solo se omiten peers dinámicos / eventos corporativos.
 
 python -m investbot.bot
 ```
@@ -155,7 +223,8 @@ docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 - **No expone ningún puerto público ni ruta en Traefik** — el contenedor solo
-  hace conexiones salientes (a Telegram, FMP, FRED/Treasury.gov).
+  hace conexiones salientes (a Telegram, FMP, FRED/Treasury.gov, y
+  opcionalmente Finnhub/SEC EDGAR).
 - El perfil de riesgo persiste tras `docker compose restart` (volumen Docker
   `investbot_data`).
 - Límites de memoria (`mem_limit: 256m`) y CPU (`cpus: 0.5`) fijados en
@@ -174,12 +243,16 @@ docker compose -f docker-compose.prod.yml up -d --build
   y que además valida que el chat sea privado. Si la variable no está
   seteada o no es un entero válido, **el proceso falla al arrancar**
   (fail-closed) — nunca arranca en modo permisivo.
-- **Secretos:** `TELEGRAM_BOT_TOKEN`, `FMP_API_KEY`, `FRED_API_KEY` se leen
-  solo de variables de entorno (`.env`, `chmod 600`, nunca en git). Los
-  loggers de `httpx`/`httpcore`/`telegram` se fijan a `WARNING` en
-  producción — nunca `DEBUG`, porque el token de Telegram viaja en el path
-  de la URL y las API keys de FMP/FRED como query param; un log en `DEBUG`
-  los filtraría en texto plano.
+- **Secretos:** `TELEGRAM_BOT_TOKEN`, `FMP_API_KEY`, `FRED_API_KEY`,
+  `FINNHUB_API_KEY` se leen solo de variables de entorno (`.env`, `chmod
+  600`, nunca en git). `SEC_EDGAR_USER_AGENT` no es un secreto para la SEC
+  en sí (es un identificador de contacto, no una credencial), pero sigue el
+  mismo tratamiento que el resto de las variables — vacía en `.env.example`
+  (repo público), solo el valor real en el `.env` local. Los loggers de
+  `httpx`/`httpcore`/`telegram` se fijan a `WARNING` en producción — nunca
+  `DEBUG`, porque el token de Telegram viaja en el path de la URL y las API
+  keys de FMP/FRED/Finnhub como query param; un log en `DEBUG` los filtraría
+  en texto plano.
 - **Manejo de errores:** ninguna excepción cruda de `httpx` (que puede
   incluir la URL completa con la API key) se propaga hacia los logs ni hacia
   Telegram — se traduce siempre a un mensaje sanitizado.
@@ -214,13 +287,17 @@ src/investbot/
   onboarding.py       ConversationHandler de 8 preguntas + scoring de perfil
   query_handler.py    handler de texto libre, orquesta todo el análisis
   fmp_client.py        wrapper HTTP a FMP stable (solo endpoints gratuitos)
-  peers.py             set fijo de peers por sector + promedio de PER (vía key-metrics anual)
+  peers.py             peers por sector (dinámicos vía Finnhub, respaldo fijo) + promedio de PER (vía key-metrics anual)
+  finnhub_client.py     wrapper HTTP a Finnhub (peers dinámicos, opcional)
   treasury_client.py   FRED (DGS20) + fallback Treasury.gov
+  sec_edgar_client.py   wrapper HTTP a SEC EDGAR (mapeo ticker→CIK cacheado + submissions, opcional)
+  corporate_events.py   extracción pura de eventos 8-K relevantes desde submissions
   rules.py              ratios financieros + pilares de buena empresa
   valuation.py           motor propio de valoración (3 modelos + promedio parcial)
   risk_fit.py            encaje beta vs perfil de riesgo
-  summary.py              texto dummy-friendly con las analogías de Daniela
-  db.py                    SQLite (tabla risk_profile, fila única)
+  market_context.py       momentum de precio + comparación con peers + VIX
+  summary.py               texto dummy-friendly con las analogías de Daniela
+  db.py                     SQLite (tabla risk_profile, fila única)
 tests/
   fixtures/adobe/     caso de regresión (ver tests/fixtures/adobe/README.md)
   fixtures/fmp/       fixtures genéricos de FMP (quote, search)

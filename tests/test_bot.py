@@ -74,3 +74,75 @@ async def test_on_error_excepcion_generica_se_loguea(caplog):
     with caplog.at_level(logging.ERROR):
         await bot._on_error(update=None, context=context)
     assert "Error no manejado" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# SDD_peers_dinamicos_y_eventos_corporativos — FINNHUB_API_KEY/
+# SEC_EDGAR_USER_AGENT opcionales, main() arranca sin ellas (mismo patrón
+# que FRED_API_KEY).
+# ---------------------------------------------------------------------------
+
+
+def test_build_application_acepta_finnhub_y_sec_edgar_opcionales(tmp_path):
+    """Regresión (criterio 1.1 de la spec): build_application con los 2
+    parámetros nuevos con default no rompe la construcción existente."""
+    db_path = str(tmp_path / "bot_test2.db")
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_id=12345,
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+        finnhub_api_key="test-finnhub-key",
+        sec_edgar_user_agent="InvestBot test@example.com",
+    )
+    assert application is not None
+
+
+def test_main_arranca_sin_finnhub_ni_sec_edgar_configuradas(monkeypatch, tmp_path):
+    """FINNHUB_API_KEY/SEC_EDGAR_USER_AGENT son opcionales — main() llega
+    hasta run_polling sin ellas configuradas (mismo patrón que FRED_API_KEY,
+    ninguna aborta el arranque)."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.delenv("SEC_EDGAR_USER_AGENT", raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_test.db"))
+
+    from telegram.ext import Application
+
+    run_polling_calls = {"n": 0}
+
+    def fake_run_polling(self, **kwargs):
+        run_polling_calls["n"] += 1
+
+    monkeypatch.setattr(Application, "run_polling", fake_run_polling)
+
+    bot.main()
+    assert run_polling_calls["n"] == 1
+
+
+def test_main_arranca_con_finnhub_y_sec_edgar_configuradas(monkeypatch, tmp_path):
+    """Caso feliz: con ambas variables configuradas, main() también llega
+    hasta run_polling sin abortar."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.setenv("FRED_API_KEY", "test-fred-key")
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-finnhub-key")
+    monkeypatch.setenv("SEC_EDGAR_USER_AGENT", "InvestBot test@example.com")
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_test2.db"))
+
+    from telegram.ext import Application
+
+    run_polling_calls = {"n": 0}
+
+    def fake_run_polling(self, **kwargs):
+        run_polling_calls["n"] += 1
+
+    monkeypatch.setattr(Application, "run_polling", fake_run_polling)
+
+    bot.main()
+    assert run_polling_calls["n"] == 1

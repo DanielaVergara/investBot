@@ -8,7 +8,7 @@ clasificación barata/cara por escenario + sección "Contexto de mercado") +
 
 from __future__ import annotations
 
-from investbot import summary
+from investbot import peers, summary
 
 
 def _base_ratios():
@@ -386,6 +386,249 @@ def test_market_context_section_peer_comparison_un_solo_peer_valido():
 def test_summary_incluye_seccion_contexto_de_mercado():
     text = _build_summary()
     assert "Contexto de mercado" in text
+
+
+# ---------------------------------------------------------------------------
+# SDD_procedencia_peers_individuales — helpers aislados
+# _join_con_y / _agrupar_peers_por_motivo / _build_peer_pe_breakdown_line
+# ---------------------------------------------------------------------------
+
+
+def test_join_con_y_lista_vacia():
+    assert summary._join_con_y([]) == ""
+
+
+def test_join_con_y_un_elemento():
+    assert summary._join_con_y(["A"]) == "A"
+
+
+def test_join_con_y_dos_elementos():
+    assert summary._join_con_y(["A", "B"]) == "A y B"
+
+
+def test_join_con_y_tres_elementos():
+    assert summary._join_con_y(["A", "B", "C"]) == "A, B y C"
+
+
+def test_agrupar_peers_por_motivo_vacio():
+    assert summary._agrupar_peers_por_motivo({}) == {}
+
+
+def test_agrupar_peers_por_motivo_agrupa_preservando_orden_de_primera_aparicion():
+    resultado = summary._agrupar_peers_por_motivo(
+        {"MSFT": "sin_dato", "CRM": "earnings_yield_no_positivo", "ORCL": "sin_dato"}
+    )
+    assert resultado == {
+        "sin_dato": ["MSFT", "ORCL"],
+        "earnings_yield_no_positivo": ["CRM"],
+    }
+    # Orden de los grupos = orden de primera aparición del motivo.
+    assert list(resultado.keys()) == ["sin_dato", "earnings_yield_no_positivo"]
+
+
+def test_build_peer_pe_breakdown_line_sin_datos_retorna_none():
+    assert summary._build_peer_pe_breakdown_line({}, {}) is None
+
+
+def test_build_peer_pe_breakdown_line_feliz_con_fallidos_mismo_motivo_plural():
+    line = summary._build_peer_pe_breakdown_line(
+        {"ORCL": 24.3}, {"MSFT": "sin_dato", "CRM": "sin_dato"}
+    )
+    assert "PER de tus comparables: ORCL 24.3" in line
+    assert "MSFT y CRM" in line
+    assert "no devolvieron un dato de FMP esta consulta" in line
+    assert "1 / earningsYield" in line
+
+
+def test_build_peer_pe_breakdown_line_motivo_mixto_dos_clausulas_separadas():
+    line = summary._build_peer_pe_breakdown_line(
+        {"ORCL": 24.3}, {"MSFT": "sin_dato", "CRM": "earnings_yield_no_positivo"}
+    )
+    assert "MSFT no devolvió un dato de FMP esta consulta" in line
+    assert "CRM tiene pérdidas esta consulta" in line
+    # Orden: la cláusula de "sin_dato" aparece antes que la de
+    # "earnings_yield_no_positivo" (orden de primera aparición en el input).
+    assert line.index("MSFT no devolvió") < line.index("CRM tiene pérdidas")
+
+
+def test_build_peer_pe_breakdown_line_un_solo_fallido_singular():
+    line = summary._build_peer_pe_breakdown_line({"ORCL": 24.3}, {"MSFT": "sin_dato"})
+    assert "MSFT no devolvió un dato de FMP esta consulta" in line
+    assert "no devolvieron" not in line
+
+
+def test_build_peer_pe_breakdown_line_feliz_completo_sin_clausula_de_fallidos():
+    line = summary._build_peer_pe_breakdown_line(
+        {"ORCL": 24.3, "MSFT": 22.1, "CRM": 20.5}, {}
+    )
+    assert "ORCL 24.3" in line
+    assert "MSFT 22.1" in line
+    assert "CRM 20.5" in line
+    assert ".." not in line
+    assert "no devolvió" not in line
+    assert "no devolvieron" not in line
+    assert "tiene pérdidas" not in line
+    assert "tienen pérdidas" not in line
+
+
+def test_build_peer_pe_breakdown_line_cero_validos_motivo_mixto_sin_prefijo():
+    line = summary._build_peer_pe_breakdown_line(
+        {}, {"MSFT": "sin_dato", "ORCL": "earnings_yield_no_positivo", "CRM": "sin_dato"}
+    )
+    assert "PER de tus comparables:" not in line
+    assert "MSFT y CRM" in line
+    assert "no devolvieron un dato de FMP esta consulta" in line
+    assert "ORCL tiene pérdidas esta consulta" in line
+
+
+# ---------------------------------------------------------------------------
+# SDD_procedencia_peers_individuales — build_market_context_section
+# (integración: PER individual + motivo por peer, en todas las ramas)
+# ---------------------------------------------------------------------------
+
+
+def test_market_context_section_un_solo_peer_valido_muestra_desglose_completo():
+    """Caso NVIDIA — máxima prioridad de esta spec (Gap D): la rama
+    `un_solo_peer_valido` hoy no mostraba ningún número de peers; ahora debe
+    mostrar el PER del único peer válido + el motivo de los otros 2."""
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["posicion"] = "no_comparable"
+    peer_comparison["motivo_no_comparable"] = "un_solo_peer_valido"
+    peer_comparison["peers_usados"] = ["ORCL"]
+    peer_comparison["peers_pe"] = {"ORCL": 24.3}
+    peer_comparison["peers_no_usados"] = {"MSFT": "sin_dato", "CRM": "earnings_yield_no_positivo"}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "Solo 1 comparable con PER válido en tu set de peers" in text
+    assert "PER de tus comparables: ORCL 24.3" in text
+    assert "MSFT no devolvió un dato de FMP esta consulta" in text
+    assert "CRM tiene pérdidas esta consulta" in text
+
+
+def test_market_context_section_no_comparable_eps_no_positivo_muestra_desglose():
+    """Gap D no es exclusivo de un_solo_peer_valido — las 3 ramas de
+    no_comparable estaban ciegas a peers_pe/peers_no_usados."""
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["posicion"] = "no_comparable"
+    peer_comparison["motivo_no_comparable"] = "eps_no_positivo"
+    peer_comparison["per_propio"] = None
+    peer_comparison["peers_pe"] = {"ORCL": 24.3, "MSFT": 22.1, "CRM": 20.5}
+    peer_comparison["peers_no_usados"] = {}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "PER de tus comparables: ORCL 24.3" in text
+
+
+def test_market_context_section_no_comparable_sin_peers_validos_muestra_solo_fallidos():
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["posicion"] = "no_comparable"
+    peer_comparison["motivo_no_comparable"] = "sin_peers_validos"
+    peer_comparison["peers_usados"] = []
+    peer_comparison["peers_pe"] = {}
+    peer_comparison["peers_no_usados"] = {"MSFT": "sin_dato", "ORCL": "sin_dato", "CRM": "sin_dato"}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "PER de tus comparables:" not in text
+    assert "MSFT, ORCL y CRM" in text
+    assert "no devolvieron un dato de FMP esta consulta" in text
+
+
+def test_market_context_section_en_linea_bullet_existente_mas_desglose_nuevo():
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["peers_pe"] = {"MSFT": 30.0, "ORCL": 34.0, "CRM": 32.0}
+    peer_comparison["peers_no_usados"] = {}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "en línea" in text
+    assert "PER de tus comparables: MSFT 30.0" in text
+
+
+def test_market_context_section_feliz_completo_tres_per_individuales():
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["peers_pe"] = {"MSFT": 30.0, "ORCL": 34.0, "CRM": 32.0}
+    peer_comparison["peers_no_usados"] = {}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "MSFT 30.0" in text
+    assert "ORCL 34.0" in text
+    assert "CRM 32.0" in text
+
+
+def test_market_context_section_sin_datos_de_peers_no_agrega_linea_de_desglose():
+    """peers_pe={} y peers_no_usados={} juntos (ej. sector sin peers
+    configurados) -> no se agrega ninguna línea de breakdown."""
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["peers_pe"] = {}
+    peer_comparison["peers_no_usados"] = {}
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "PER de tus comparables:" not in text
+    assert "PER individual calculado por el bot" not in text
+
+
+def test_market_context_section_orden_desglose_entre_bullet_peers_y_vix():
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["peers_pe"] = {"MSFT": 30.0}
+    peer_comparison["peers_no_usados"] = {}
+
+    text_con_vix = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=peer_comparison,
+        vix={"valor": 18.42, "disponible": True},
+    )
+    idx_bullet = text_con_vix.index("Comparada con sus comparables del sector")
+    idx_desglose = text_con_vix.index("PER de tus comparables:")
+    idx_vix = text_con_vix.index("VIX (CBOE Volatility Index)")
+    assert idx_bullet < idx_desglose < idx_vix
+
+    text_sin_vix = summary.build_market_context_section(
+        precio_actual=187.0,
+        momentum=_base_momentum(),
+        peer_comparison=peer_comparison,
+        vix=None,
+    )
+    idx_bullet_sv = text_sin_vix.index("Comparada con sus comparables del sector")
+    idx_desglose_sv = text_sin_vix.index("PER de tus comparables:")
+    assert idx_bullet_sv < idx_desglose_sv
+
+
+# ---------------------------------------------------------------------------
+# SDD_procedencia_peers_individuales — peers_note / _MODELO_FORMULAS /
+# regresión de build_valuation_scenarios_section (Pregunta 1: no se duplica)
+# ---------------------------------------------------------------------------
+
+
+def test_peers_note_default_menciona_eleccion_manual_y_no_fmp():
+    text = _build_summary()
+    assert "elegida a mano" in text
+    assert "no la arma FMP" in text
+
+
+def test_modelo_formulas_multiplos_aclara_calculo_del_bot():
+    formula = summary._MODELO_FORMULAS["multiplos"]
+    assert "cálculo del bot" in formula
+    assert "no un campo directo de FMP" in formula
+
+
+def test_valuation_scenarios_section_no_agrega_desglose_por_peer():
+    """Resolución Pregunta 1: el desglose por peer no se duplica en Valor
+    Justo — build_valuation_scenarios_section no cambia de comportamiento
+    más allá del texto de _MODELO_FORMULAS."""
+    for n_peers_validos in (0, 1, 3):
+        text = summary.build_valuation_scenarios_section(
+            _base_scenarios(), precio_actual=333.0, n_peers_validos=n_peers_validos
+        )
+        assert "PER de tus comparables" not in text
+        assert "ORCL" not in text
+        assert "MSFT" not in text
+        assert "CRM" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -862,3 +1105,150 @@ def test_orden_completo_de_build_summary_sin_extras():
         text.index("Datos financieros"),
     ]
     assert indices == sorted(indices)
+
+
+# ---------------------------------------------------------------------------
+# SDD_peers_dinamicos_y_eventos_corporativos — Parte 1: _build_peers_note.
+# Matriz S1-S3.
+# ---------------------------------------------------------------------------
+
+
+def test_build_peers_note_none_y_fijo_mismo_texto():
+    """S1: _build_peers_note(None) y _build_peers_note(PEERS_FUENTE_FIJO)
+    devuelven el mismo texto, ambos con "elegida a mano" y "no la arma FMP"
+    — no rompe test_peers_note_default_menciona_eleccion_manual_y_no_fmp."""
+    texto_none = summary._build_peers_note(None)
+    texto_fijo = summary._build_peers_note(peers.PEERS_FUENTE_FIJO)
+    assert texto_none == texto_fijo
+    assert "elegida a mano" in texto_none
+    assert "no la arma FMP" in texto_none
+
+
+def test_build_peers_note_finnhub_menciona_finnhub_y_sub_industria():
+    """S2: _build_peers_note(PEERS_FUENTE_FINNHUB) menciona "Finnhub" y
+    "sub-industria", NO contiene "elegida a mano"."""
+    texto = summary._build_peers_note(peers.PEERS_FUENTE_FINNHUB)
+    assert "Finnhub" in texto
+    assert "sub-industria" in texto
+    assert "elegida a mano" not in texto
+
+
+def test_peers_note_explicito_tiene_prioridad_sobre_fuente_peers():
+    """S3: peers_note pasado explícito por el llamador tiene prioridad total
+    sobre el cálculo automático a partir de fuente_peers."""
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["fuente_peers"] = peers.PEERS_FUENTE_FINNHUB
+    text = _build_summary(peer_comparison=peer_comparison, peers_note="texto custom")
+    assert "Nota de transparencia: texto custom" in text
+    assert summary._PEERS_NOTE_FINNHUB not in text
+
+
+# ---------------------------------------------------------------------------
+# SDD_peers_dinamicos_y_eventos_corporativos — Parte 2: build_corporate_
+# events_section + orden + disclaimer ajustado. Matriz S4-S11.
+# ---------------------------------------------------------------------------
+
+
+def _un_evento():
+    return [
+        {
+            "filing_date": "2026-06-15",
+            "labels": ["Cambio de directivos o ejecutivos"],
+            "filing_url": "https://www.sec.gov/Archives/edgar/data/796343/000079634324000123/doc.htm",
+        }
+    ]
+
+
+def _dos_eventos():
+    return [
+        {
+            "filing_date": "2026-06-15",
+            "labels": ["Cambio de directivos o ejecutivos"],
+            "filing_url": "https://www.sec.gov/Archives/edgar/data/796343/000079634324000123/doc1.htm",
+        },
+        {
+            "filing_date": "2026-05-01",
+            "labels": ["Nuevo contrato importante", "Terminación de un contrato importante"],
+            "filing_url": "https://www.sec.gov/Archives/edgar/data/796343/000079634324000456/doc2.htm",
+        },
+    ]
+
+
+def test_build_corporate_events_section_lista_vacia_none():
+    """S4."""
+    assert summary.build_corporate_events_section([]) is None
+
+
+def test_build_corporate_events_section_none_none():
+    """S5: el llamador real (build_summary_parts) puede pasar None por
+    default -- if not events cubre ambos, no solo []."""
+    assert summary.build_corporate_events_section(None) is None
+
+
+def test_build_corporate_events_section_un_evento_contenido_completo():
+    """S6."""
+    text = summary.build_corporate_events_section(_un_evento())
+    assert "2026-06-15" in text
+    assert "Cambio de directivos o ejecutivos" in text
+    assert "[ver el filing](https://www.sec.gov/Archives/edgar/data/796343/000079634324000123/doc.htm)" in text
+    assert "SEC EDGAR" in text
+    assert "NO resume" in text
+
+
+def test_build_corporate_events_section_dos_eventos_dos_bullets():
+    """S7."""
+    text = summary.build_corporate_events_section(_dos_eventos())
+    assert "2026-06-15" in text
+    assert "2026-05-01" in text
+    assert "Nuevo contrato importante + Terminación de un contrato importante" in text
+    assert text.count("- 20") == 2  # 2 líneas de bullet, cada una con fecha propia
+
+
+def test_build_summary_parts_corporate_events_none_default_no_rompe():
+    """S8: corporate_events=None (default, llamador viejo) -> no incluye la
+    sección, ningún test existente se rompe."""
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts_sin_arg = summary.build_summary_parts(**kwargs)
+    parts_con_none = summary.build_summary_parts(**kwargs, corporate_events=None)
+    assert parts_sin_arg == parts_con_none
+    assert not any("Eventos corporativos" in p for p in parts_sin_arg)
+
+
+def test_orden_eventos_corporativos_entre_contexto_de_mercado_y_riesgo():
+    """S9: con corporate_events no vacío, la sección aparece después de
+    Contexto de mercado y antes de Encaje con tu perfil de riesgo."""
+    text = _build_summary(corporate_events=_un_evento())
+    idx_mercado = text.index("Contexto de mercado")
+    idx_eventos = text.index("Eventos corporativos")
+    idx_riesgo = text.index("Encaje con tu perfil de riesgo")
+    assert idx_mercado < idx_eventos < idx_riesgo
+
+
+def test_disclaimer_ya_no_dice_no_tiene_en_cuenta_eventos_recientes():
+    """S10: el disclaimer final ya no contiene la frase absoluta vieja, sí
+    contiene la mención a SEC EDGAR sin resumir."""
+    text = _build_summary()
+    assert "No tiene en cuenta noticias, eventos recientes, cambios de gestión" not in text
+    assert "sin resumir" in text
+    assert "SEC EDGAR" in text
+
+
+def test_disclaimer_sin_corporate_events_sigue_presente_con_apertura_sin_cambios():
+    """S11: con corporate_events=None (sin eventos), el disclaimer sigue
+    apareciendo con la frase de apertura sin cambios."""
+    text = _build_summary(corporate_events=None)
+    assert (
+        "no asesoramiento financiero profesional ni una recomendación de "
+        "inversión" in text
+    )

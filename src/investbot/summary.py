@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from investbot import peers
 from investbot.valuation import classify_scenario
 
 MODELO_LABELS = {
@@ -77,10 +78,81 @@ _MODELOS_ORDEN = [
 ]
 
 _MODELO_FORMULAS = {
-    "multiplos": "EPS (TTM) × PER promedio/mínimo/máximo de los peers del sector",
+    "multiplos": (
+        "EPS (TTM) × PER promedio/mínimo/máximo de los peers del sector "
+        "(el PER de cada peer es un cálculo del bot: 1 / earningsYield, no "
+        "un campo directo de FMP)"
+    ),
     "graham": "EPS (TTM) × (8.5 + 2×g) × 4.4 / Y, con g = CAGR histórico de EPS",
     "dcf": "proyección de Flujo de Caja Libre a 5 años + valor terminal, descontados al WACC",
 }
+
+_MOTIVO_PEER_LABELS = {
+    "sin_dato": {
+        "singular": "no devolvió un dato de FMP esta consulta",
+        "plural": "no devolvieron un dato de FMP esta consulta",
+    },
+    "earnings_yield_no_positivo": {
+        "singular": (
+            "tiene pérdidas esta consulta (earningsYield negativo o cero) "
+            "— no se puede calcular su PER"
+        ),
+        "plural": (
+            "tienen pérdidas esta consulta (earningsYield negativo o cero) "
+            "— no se puede calcular su PER"
+        ),
+    },
+}
+
+
+def _join_con_y(items: list[str]) -> str:
+    """'A' | 'A y B' | 'A, B y C' — lista en castellano con conjunción final."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} y {items[-1]}"
+
+
+def _agrupar_peers_por_motivo(peers_no_usados: dict[str, str]) -> dict[str, list[str]]:
+    """Agrupa ticker->motivo en motivo->[tickers], preservando el orden de
+    aparición (mismo orden que PEERS_BY_SECTOR, porque peers_no_usados se
+    construye en ese orden en peers.py)."""
+    grupos: dict[str, list[str]] = {}
+    for peer, motivo in peers_no_usados.items():
+        grupos.setdefault(motivo, []).append(peer)
+    return grupos
+
+
+def _build_peer_pe_breakdown_line(
+    peers_pe: dict[str, float], peers_no_usados: dict[str, str]
+) -> Optional[str]:
+    """Detalle de PER individual por peer + motivo específico por peer que no
+    aportó dato + procedencia explícita del cálculo. `None` si no hay
+    absolutamente ningún dato de peers que mostrar (sector sin peers
+    configurados en PEERS_BY_SECTOR)."""
+    if not peers_pe and not peers_no_usados:
+        return None
+
+    clausulas: list[str] = []
+    if peers_pe:
+        listado = ", ".join(
+            f"{nombre} {_fmt_ratio(valor)}" for nombre, valor in peers_pe.items()
+        )
+        clausulas.append(f"PER de tus comparables: {listado}")
+
+    for motivo, nombres in _agrupar_peers_por_motivo(peers_no_usados).items():
+        forma = "singular" if len(nombres) == 1 else "plural"
+        texto_motivo = _MOTIVO_PEER_LABELS.get(motivo, {}).get(
+            forma, "no tiene un PER válido esta consulta"
+        )
+        clausulas.append(f"{_join_con_y(nombres)} {texto_motivo}")
+
+    texto = " — ".join(clausulas) + "."
+    return (
+        f"  _{texto} (PER individual calculado por el bot como "
+        "1 / earningsYield — earningsYield sí es un dato de FMP, el PER no)._"
+    )
 
 
 def _fmt_money(value: float) -> str:
@@ -252,6 +324,9 @@ def build_market_context_section(
     # no se muestra como ruido "impulso: no disponible".
 
     posicion = peer_comparison.get("posicion")
+    peers_pe = peer_comparison.get("peers_pe") or {}
+    peers_no_usados = peer_comparison.get("peers_no_usados") or {}
+
     if posicion == "no_comparable":
         motivo = peer_comparison.get("motivo_no_comparable")
         texto = MOTIVO_NO_COMPARABLE_LABELS.get(motivo, "no se pudo comparar con tus peers.")
@@ -270,6 +345,10 @@ def build_market_context_section(
             f"máximo {_fmt_ratio(per_max)})."
         )
 
+    peer_breakdown_line = _build_peer_pe_breakdown_line(peers_pe, peers_no_usados)
+    if peer_breakdown_line:
+        lines.append(peer_breakdown_line)
+
     if vix and vix.get("disponible"):
         lines.append(f"- VIX (CBOE Volatility Index): {vix['valor']:.2f}")
         lines.append(
@@ -287,6 +366,28 @@ def build_market_context_section(
         "aparece más arriba) es una aproximación de la volatilidad "
         "esperada del mercado en general, no del ticker — tampoco es "
         "un índice de sentimiento compuesto._"
+    )
+    return "\n".join(lines)
+
+
+def build_corporate_events_section(events: Optional[list[dict]]) -> Optional[str]:
+    """Sección "Eventos corporativos recientes (SEC EDGAR)" (Parte 2,
+    `SDD_peers_dinamicos_y_eventos_corporativos.md`). Se omite por completo
+    (retorna `None`) si `events` está vacía o es `None` -- mismo criterio de
+    "degradar con gracia sin ruido" que build_extras_section/bullet de VIX.
+    """
+    if not events:
+        return None
+    lines = ["*Eventos corporativos recientes (SEC EDGAR):*"]
+    for ev in events:
+        etiquetas = " + ".join(ev["labels"])
+        lines.append(f"- {ev['filing_date']}: {etiquetas} — [ver el filing]({ev['filing_url']})")
+    lines.append(
+        "  _Fuente: SEC EDGAR (oficial, gratis, sin API key) — formularios "
+        "8-K que la empresa está obligada a presentar por ley ante eventos "
+        "materiales. El bot NO resume el contenido legal del filing (fuera "
+        "de alcance, riesgo de alucinación sobre texto legal) — mostramos "
+        "fecha + tipo de evento + link para que lo leas vos si te interesa._"
     )
     return "\n".join(lines)
 
@@ -438,6 +539,43 @@ def build_veredicto_section(*, pillars: dict, risk_fit: dict) -> str:
     )
 
 
+_PEERS_NOTE_FIJO = (
+    "PER promedio de un set fijo de comparables, no del sector completo. "
+    "Esta lista de comparables (peers) por sector es fija y fue elegida a "
+    "mano por quien construyó el bot (ver peers.py, diccionario "
+    "PEERS_BY_SECTOR) — no la arma FMP, ni la elige ningún algoritmo "
+    "dinámico, ni se actualiza sola; si una empresa deja de ser un buen "
+    "comparable, hay que cambiarla manualmente en el código. (Si Finnhub "
+    "está configurado y respondió, esta consulta usa sus peers dinámicos "
+    "en su lugar — ver arriba si corresponde.)"
+)
+
+_PEERS_NOTE_FINNHUB = (
+    "Esta consulta, la lista de comparables (peers) se obtuvo "
+    "dinámicamente de Finnhub (agrupados por sub-industria, no por "
+    "el sector completo) — no es la lista fija de peers.py. Si "
+    "Finnhub no responde o no está configurado, el bot usa "
+    "automáticamente un respaldo fijo elegido a mano por quien "
+    "construyó el bot."
+)
+
+
+def _build_peers_note(fuente_peers: Optional[str]) -> str:
+    """Texto de transparencia sobre la fuente de peers usada esta consulta
+    (Parte 1, `SDD_peers_dinamicos_y_eventos_corporativos.md`, Decisión #6).
+
+    El texto de la rama `else` (fuente fija/respaldo, o `None` para
+    compatibilidad con llamadores viejos) sigue siendo literalmente cierto
+    cuando `fuente_peers` es `peers.PEERS_FUENTE_FIJO` o no viene informado
+    — la lista fija sigue siendo elegida a mano, solo que ahora es el
+    respaldo en vez de la única fuente. Solo cuando `fuente_peers ==
+    peers.PEERS_FUENTE_FINNHUB` el texto cambia.
+    """
+    if fuente_peers == peers.PEERS_FUENTE_FINNHUB:
+        return _PEERS_NOTE_FINNHUB
+    return _PEERS_NOTE_FIJO
+
+
 def build_summary_parts(
     *,
     ticker: str,
@@ -451,9 +589,10 @@ def build_summary_parts(
     peer_comparison: dict,
     risk_fit: dict,
     treasury_source: str | None = None,
-    peers_note: str = "PER promedio de un set fijo de comparables, no del sector completo.",
+    peers_note: Optional[str] = None,
     extras: Optional[dict] = None,
     vix: Optional[dict] = None,
+    corporate_events: Optional[list[dict]] = None,
 ) -> list[str]:
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
     y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
@@ -521,12 +660,16 @@ def build_summary_parts(
         peer_comparison=peer_comparison,
         vix=vix,
     )
+    corporate_events_section = build_corporate_events_section(corporate_events)
     risk_section = build_risk_fit_section(risk_fit)
 
+    peers_note_final = peers_note if peers_note is not None else _build_peers_note(
+        peer_comparison.get("fuente_peers")
+    )
     transparency_lines = [
         "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
         "obtenidos de Financial Modeling Prep (FMP)._",
-        f"_Nota de transparencia: {peers_note}_",
+        f"_Nota de transparencia: {peers_note_final}_",
     ]
     if treasury_source:
         transparency_lines.append(
@@ -544,9 +687,11 @@ def build_summary_parts(
     transparency_lines.append(
         "_Esto es una síntesis de datos financieros históricos, no "
         "asesoramiento financiero profesional ni una recomendación de "
-        "inversión. No tiene en cuenta noticias, eventos recientes, "
-        "cambios de gestión ni el contexto cualitativo del negocio — "
-        "revisá eso vos antes de decidir._"
+        "inversión. No incluye análisis de noticias ni del contexto "
+        "cualitativo del negocio más allá de los eventos corporativos "
+        "oficiales de SEC EDGAR listados arriba (si los hay) — y esos se "
+        "muestran sin resumir, no reemplazan leer el filing completo. "
+        "Revisá vos el resto del contexto cualitativo antes de decidir._"
     )
 
     parts = [
@@ -558,6 +703,7 @@ def build_summary_parts(
         valuation_section,
         pillars_section,
         market_context_section,
+        corporate_events_section,
         risk_section,
         "\n".join(transparency_lines),
     ]
@@ -577,9 +723,10 @@ def build_summary(
     peer_comparison: dict,
     risk_fit: dict,
     treasury_source: str | None = None,
-    peers_note: str = "PER promedio de un set fijo de comparables, no del sector completo.",
+    peers_note: Optional[str] = None,
     extras: Optional[dict] = None,
     vix: Optional[dict] = None,
+    corporate_events: Optional[list[dict]] = None,
 ) -> str:
     """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
     puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
@@ -600,5 +747,6 @@ def build_summary(
             peers_note=peers_note,
             extras=extras,
             vix=vix,
+            corporate_events=corporate_events,
         )
     )

@@ -160,6 +160,119 @@ def test_compare_to_peers_no_comparable_un_solo_peer_valido(per_propio):
 
 
 # ---------------------------------------------------------------------------
+# compare_to_peers — peers_pe / peers_no_usados (SDD_procedencia_peers_individuales)
+# ---------------------------------------------------------------------------
+
+_PEERS_PE_FIXTURE = {"ORCL": 24.3}
+_PEERS_NO_USADOS_FIXTURE = {"MSFT": "sin_dato", "CRM": "earnings_yield_no_positivo"}
+
+
+@pytest.mark.parametrize(
+    "kwargs, posicion_esperada",
+    [
+        (
+            dict(
+                per_propio=None,
+                per_minimo_peers=22.1,
+                per_promedio_peers=27.9,
+                per_maximo_peers=33.5,
+                peers_usados=["MSFT", "ORCL", "CRM"],
+            ),
+            "no_comparable",  # eps_no_positivo
+        ),
+        (
+            dict(
+                per_propio=20.0,
+                per_minimo_peers=None,
+                per_promedio_peers=None,
+                per_maximo_peers=None,
+                peers_usados=[],
+            ),
+            "no_comparable",  # sin_peers_validos
+        ),
+        (
+            dict(
+                per_propio=20.0,
+                per_minimo_peers=27.9,
+                per_promedio_peers=27.9,
+                per_maximo_peers=27.9,
+                peers_usados=["MSFT"],
+            ),
+            "no_comparable",  # un_solo_peer_valido
+        ),
+        (
+            dict(
+                per_propio=28.4,
+                per_minimo_peers=22.1,
+                per_promedio_peers=27.9,
+                per_maximo_peers=33.5,
+                peers_usados=["MSFT", "ORCL", "CRM"],
+            ),
+            "en_linea",  # comparable
+        ),
+    ],
+)
+def test_compare_to_peers_propaga_peers_pe_y_no_usados_en_las_4_ramas(kwargs, posicion_esperada):
+    """M1: las 4 ramas de retorno propagan peers_pe/peers_no_usados idénticos
+    a los recibidos, incluyendo el motivo por peer, no solo nombres."""
+    result = market_context.compare_to_peers(
+        peers_pe=_PEERS_PE_FIXTURE,
+        peers_no_usados=_PEERS_NO_USADOS_FIXTURE,
+        **kwargs,
+    )
+    assert result.posicion == posicion_esperada
+    assert result.peers_pe == _PEERS_PE_FIXTURE
+    assert result.peers_no_usados == _PEERS_NO_USADOS_FIXTURE
+
+
+def test_compare_to_peers_backward_compat_sin_pasar_peers_pe_ni_no_usados():
+    """M2: no se pasan peers_pe/peers_no_usados (call site preexistente) ->
+    ambos coercionan a {}."""
+    result = market_context.compare_to_peers(
+        per_propio=28.4,
+        per_minimo_peers=22.1,
+        per_promedio_peers=27.9,
+        per_maximo_peers=33.5,
+        peers_usados=["MSFT", "ORCL", "CRM"],
+    )
+    assert result.peers_pe == {}
+    assert result.peers_no_usados == {}
+
+
+def test_compare_to_peers_none_explicito_coerciona_a_dict_vacio():
+    """M3: se pasa peers_pe=None/peers_no_usados=None explícitamente (no
+    solo omitido) -> coerciona a {} igual que M2."""
+    result = market_context.compare_to_peers(
+        per_propio=28.4,
+        per_minimo_peers=22.1,
+        per_promedio_peers=27.9,
+        per_maximo_peers=33.5,
+        peers_usados=["MSFT", "ORCL", "CRM"],
+        peers_pe=None,
+        peers_no_usados=None,
+    )
+    assert result.peers_pe == {}
+    assert result.peers_no_usados == {}
+
+
+def test_compare_to_peers_campos_nuevos_no_condicionan_clasificacion():
+    """M4: pasar peers_pe/peers_no_usados poblados en la rama
+    sin_peers_validos no cambia posicion/motivo_no_comparable — son
+    puramente informativos."""
+    result = market_context.compare_to_peers(
+        per_propio=20.0,
+        per_minimo_peers=None,
+        per_promedio_peers=None,
+        per_maximo_peers=None,
+        peers_usados=[],
+        peers_pe={},
+        peers_no_usados={"MSFT": "sin_dato", "ORCL": "sin_dato", "CRM": "sin_dato"},
+    )
+    assert result.posicion == "no_comparable"
+    assert result.motivo_no_comparable == "sin_peers_validos"
+
+
+# ---------------------------------------------------------------------------
 # extract_vix_context (SDD_contenido_financiero_explicado.md, Decisión #8)
 # ---------------------------------------------------------------------------
 
@@ -197,3 +310,75 @@ def test_vix_result_no_expone_clasificacion_cualitativa():
     "alta"/"baja"/"moderada" volatilidad (Decisión #8, sin umbral nuevo)."""
     campos = {f.name for f in dataclasses.fields(market_context.VixResult)}
     assert campos == {"valor", "disponible"}
+
+
+# ---------------------------------------------------------------------------
+# compare_to_peers — fuente_peers (SDD_peers_dinamicos_y_eventos_corporativos,
+# Parte 1). Matriz M1-M2.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs, posicion_esperada",
+    [
+        (
+            dict(
+                per_propio=None,
+                per_minimo_peers=22.1,
+                per_promedio_peers=27.9,
+                per_maximo_peers=33.5,
+                peers_usados=["MSFT", "ORCL", "CRM"],
+            ),
+            "no_comparable",  # eps_no_positivo
+        ),
+        (
+            dict(
+                per_propio=20.0,
+                per_minimo_peers=None,
+                per_promedio_peers=None,
+                per_maximo_peers=None,
+                peers_usados=[],
+            ),
+            "no_comparable",  # sin_peers_validos
+        ),
+        (
+            dict(
+                per_propio=20.0,
+                per_minimo_peers=27.9,
+                per_promedio_peers=27.9,
+                per_maximo_peers=27.9,
+                peers_usados=["MSFT"],
+            ),
+            "no_comparable",  # un_solo_peer_valido
+        ),
+        (
+            dict(
+                per_propio=28.4,
+                per_minimo_peers=22.1,
+                per_promedio_peers=27.9,
+                per_maximo_peers=33.5,
+                peers_usados=["MSFT", "ORCL", "CRM"],
+            ),
+            "en_linea",  # comparable
+        ),
+    ],
+)
+def test_compare_to_peers_propaga_fuente_peers_finnhub_en_las_4_ramas(kwargs, posicion_esperada):
+    """M1: fuente_peers="finnhub" se propaga en las 4 ramas de retorno."""
+    result = market_context.compare_to_peers(fuente_peers="finnhub", **kwargs)
+    assert result.posicion == posicion_esperada
+    assert result.fuente_peers == "finnhub"
+
+
+def test_compare_to_peers_fuente_peers_default_es_fijo_respaldo():
+    """M2: sin pasar fuente_peers -> default "fijo_respaldo" (regresión de
+    compatibilidad hacia atrás, mismo patrón que
+    test_compare_to_peers_backward_compat_sin_pasar_peers_pe_ni_no_usados)."""
+    result = market_context.compare_to_peers(
+        per_propio=28.4,
+        per_minimo_peers=22.1,
+        per_promedio_peers=27.9,
+        per_maximo_peers=33.5,
+        peers_usados=["MSFT", "ORCL", "CRM"],
+    )
+    assert result.fuente_peers == "fijo_respaldo"

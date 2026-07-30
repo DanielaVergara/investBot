@@ -51,6 +51,8 @@ def build_application(
     db_path: str,
     fmp_api_key: str,
     fred_api_key: str | None,
+    finnhub_api_key: str | None = None,
+    sec_edgar_user_agent: str | None = None,
 ) -> Application:
     application = Application.builder().token(telegram_token).build()
 
@@ -69,12 +71,18 @@ def build_application(
     fmp_http = httpx.AsyncClient()
     fred_http = httpx.AsyncClient()
     treasury_gov_http = httpx.AsyncClient()
+    finnhub_http = httpx.AsyncClient()
+    sec_edgar_http = httpx.AsyncClient()
     clients = query_handler.Clients(
         fmp_http=fmp_http,
         fred_http=fred_http,
         treasury_gov_http=treasury_gov_http,
         fmp_api_key=fmp_api_key,
         fred_api_key=fred_api_key,
+        finnhub_http=finnhub_http,
+        finnhub_api_key=finnhub_api_key,
+        sec_edgar_http=sec_edgar_http,
+        sec_edgar_user_agent=sec_edgar_user_agent,
     )
     rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
     for handler in query_handler.build_query_handlers(get_conn, clients, rate_limiter):
@@ -102,6 +110,12 @@ def main() -> None:
         sys.exit(1)
 
     fred_api_key = os.environ.get("FRED_API_KEY")
+    # Opcionales — ninguna de las 2 aborta el arranque si falta (mismo
+    # patrón que FRED_API_KEY): sin ellas, el bot funciona igual, solo se
+    # omite la feature correspondiente (peers dinámicos / eventos
+    # corporativos), nunca un crash.
+    finnhub_api_key = os.environ.get("FINNHUB_API_KEY")
+    sec_edgar_user_agent = os.environ.get("SEC_EDGAR_USER_AGENT")
     db_path = os.environ.get("INVESTBOT_DB_PATH", "/data/investbot.db")
 
     conn = db.get_connection(db_path)
@@ -114,6 +128,8 @@ def main() -> None:
         db_path=db_path,
         fmp_api_key=fmp_api_key,
         fred_api_key=fred_api_key,
+        finnhub_api_key=finnhub_api_key,
+        sec_edgar_user_agent=sec_edgar_user_agent,
     )
 
     logger.info("InvestBot arrancando en modo long polling (chat_id=%s)", allowed_chat_id)

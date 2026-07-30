@@ -24,12 +24,15 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from investbot import (
+    corporate_events,
     db,
+    finnhub_client,
     fmp_client,
     market_context,
     peers,
     risk_fit,
     rules,
+    sec_edgar_client,
     summary,
     treasury_client,
     valuation,
@@ -77,6 +80,16 @@ class Clients:
     treasury_gov_http: httpx.AsyncClient
     fmp_api_key: str
     fred_api_key: Optional[str]
+    # NUEVO (SDD_peers_dinamicos_y_eventos_corporativos.md) — con default
+    # `None` explícito: un campo de dataclass sin `= valor` es
+    # posicional/keyword obligatorio aunque su tipo sea `Optional[...]`, y
+    # eso rompería con `TypeError` los ~14 call sites existentes de
+    # `Clients(...)` en tests que no conocen estos 2 proveedores nuevos
+    # (criterio obligatorio de `qa`, sección 1.1 de la spec).
+    finnhub_http: Optional[httpx.AsyncClient] = None
+    finnhub_api_key: Optional[str] = None
+    sec_edgar_http: Optional[httpx.AsyncClient] = None
+    sec_edgar_user_agent: Optional[str] = None
 
 
 def _annual_series(statements: list[dict], field: str) -> list[float]:
@@ -161,8 +174,24 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
             return None
         return data[0] if data else None
 
+    # Peers dinámicos vía Finnhub (Parte 1, SDD_peers_dinamicos_y_eventos_
+    # corporativos.md) — best-effort: si `clients.finnhub_api_key` no está
+    # configurada, ni siquiera se intenta la llamada (mismo patrón que
+    # treasury_client.get_treasury_yield con fred_api_key).
+    async def _get_finnhub_peers(peer_ticker_query: str) -> list[str]:
+        try:
+            return await finnhub_client.get_peers(
+                clients.finnhub_http, clients.finnhub_api_key, peer_ticker_query,
+                grouping="subIndustry",
+            )
+        except finnhub_client.FinnhubError:
+            return []
+
     peer_result = await peers.get_peer_pe_average(
-        get_peer_metrics_fn=_get_metrics_for_peer, sector=sector, own_ticker=ticker
+        get_peer_metrics_fn=_get_metrics_for_peer,
+        sector=sector,
+        own_ticker=ticker,
+        get_dynamic_peers_fn=_get_finnhub_peers if clients.finnhub_api_key else None,
     )
 
     # Y (Decisión #7 revisada)
@@ -244,7 +273,34 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         per_promedio_peers=peer_result.per_promedio,
         per_maximo_peers=peer_result.per_maximo,
         peers_usados=peer_result.peers_usados,
+        peers_pe=peer_result.peers_pe,
+        peers_no_usados=peer_result.peers_no_usados,
+        fuente_peers=peer_result.fuente_peers,
     )
+
+    # Eventos corporativos vía SEC EDGAR (Parte 2, SDD_peers_dinamicos_y_
+    # eventos_corporativos.md) — best-effort, deliberadamente no participa
+    # del abort-check de arriba (mismo principio que own_metrics/VIX): si
+    # SEC EDGAR falla, no responde, o el ticker no tiene CIK, el resto del
+    # análisis sigue exactamente igual, la sección se omite sin ruido. Si
+    # `sec_edgar_user_agent` no está configurada, cero llamadas de red.
+    corporate_events_list: list[dict] = []
+    if clients.sec_edgar_user_agent:
+        cik10 = await sec_edgar_client.get_cik_for_ticker(
+            clients.sec_edgar_http, clients.sec_edgar_user_agent, ticker
+        )
+        submissions = (
+            await sec_edgar_client.get_submissions(
+                clients.sec_edgar_http, clients.sec_edgar_user_agent, cik10
+            )
+            if cik10
+            else None
+        )
+        events = corporate_events.extract_relevant_8k_events(submissions, cik10)
+        corporate_events_list = [
+            {"filing_date": e.filing_date, "labels": e.labels, "filing_url": e.filing_url}
+            for e in events
+        ]
 
     ratios_dict = {
         "ratio_liquidez": liquidity.ratio_liquidez,
@@ -281,6 +337,9 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         "peers_usados": peer_comparison_result.peers_usados,
         "posicion": peer_comparison_result.posicion,
         "motivo_no_comparable": peer_comparison_result.motivo_no_comparable,
+        "peers_pe": peer_comparison_result.peers_pe,
+        "peers_no_usados": peer_comparison_result.peers_no_usados,
+        "fuente_peers": peer_comparison_result.fuente_peers,
     }
 
     extras_result = rules.extract_key_metrics_extras(own_metrics)
@@ -308,6 +367,7 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         treasury_source=treasury_source,
         extras=extras_dict,
         vix=vix_dict,
+        corporate_events=corporate_events_list,
     )
 
 

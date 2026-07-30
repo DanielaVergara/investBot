@@ -24,9 +24,10 @@ momentum/peers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+from investbot.peers import PEERS_FUENTE_FIJO
 
 VIX_SYMBOL = "^VIX"
 
@@ -138,6 +139,11 @@ class PeerComparisonResult:
     motivo_no_comparable: Optional[str] = None
     # "eps_no_positivo" | "sin_peers_validos" | "un_solo_peer_valido"
     # (Spec Patch Iter-4, C3). `None` cuando `posicion != "no_comparable"`.
+    peers_pe: dict[str, float] = field(default_factory=dict)
+    peers_no_usados: dict[str, str] = field(default_factory=dict)  # ticker -> motivo
+    fuente_peers: str = PEERS_FUENTE_FIJO  # NUEVO (Parte 1, peers dinámicos vía
+    # Finnhub) — "finnhub" | "fijo_respaldo", default preserva el
+    # comportamiento de cualquier llamador/test que no pase este campo.
 
 
 def compare_to_peers(
@@ -147,6 +153,9 @@ def compare_to_peers(
     per_promedio_peers: Optional[float],
     per_maximo_peers: Optional[float],
     peers_usados: list[str],
+    peers_pe: dict[str, float] | None = None,
+    peers_no_usados: dict[str, str] | None = None,
+    fuente_peers: str = PEERS_FUENTE_FIJO,
 ) -> PeerComparisonResult:
     """Función pura, sin I/O.
 
@@ -160,8 +169,15 @@ def compare_to_peers(
         `"mas_barata"`/`"en_linea"`/`"mas_cara"`, que sugerirían un rango
         real inexistente.
 
+    `fuente_peers` (Parte 1 de `SDD_peers_dinamicos_y_eventos_corporativos.md`)
+    se propaga sin cambios en las 4 ramas de retorno — puramente informativo,
+    nunca condiciona la clasificación.
+
     Nunca inventa una posición cuando no hay dato suficiente.
     """
+    peers_pe = peers_pe or {}
+    peers_no_usados = peers_no_usados or {}
+
     if per_propio is None:
         return PeerComparisonResult(
             per_propio=per_propio,
@@ -171,6 +187,9 @@ def compare_to_peers(
             peers_usados=peers_usados,
             posicion="no_comparable",
             motivo_no_comparable="eps_no_positivo",
+            peers_pe=peers_pe,
+            peers_no_usados=peers_no_usados,
+            fuente_peers=fuente_peers,
         )
     if len(peers_usados) == 0:
         return PeerComparisonResult(
@@ -181,6 +200,9 @@ def compare_to_peers(
             peers_usados=peers_usados,
             posicion="no_comparable",
             motivo_no_comparable="sin_peers_validos",
+            peers_pe=peers_pe,
+            peers_no_usados=peers_no_usados,
+            fuente_peers=fuente_peers,
         )
     if len(peers_usados) == 1:
         return PeerComparisonResult(
@@ -191,6 +213,9 @@ def compare_to_peers(
             peers_usados=peers_usados,
             posicion="no_comparable",
             motivo_no_comparable="un_solo_peer_valido",
+            peers_pe=peers_pe,
+            peers_no_usados=peers_no_usados,
+            fuente_peers=fuente_peers,
         )
 
     if per_propio < per_minimo_peers:
@@ -208,4 +233,7 @@ def compare_to_peers(
         peers_usados=peers_usados,
         posicion=posicion,
         motivo_no_comparable=None,
+        peers_pe=peers_pe,
+        peers_no_usados=peers_no_usados,
+        fuente_peers=fuente_peers,
     )

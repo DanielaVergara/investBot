@@ -6,8 +6,10 @@ por path a los fixtures de `tests/fixtures/adobe/`.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,10 +17,24 @@ import httpx
 import pytest
 from telegram.error import TelegramError
 
-from investbot import db, query_handler
+from investbot import db, query_handler, sec_edgar_client
 from investbot.fmp_client import FMPError
 
 ALLOWED_CHAT_ID = 555
+
+
+@pytest.fixture(autouse=True)
+def _reset_sec_edgar_cache():
+    """Gap 5.2 de la spec `SDD_peers_dinamicos_y_eventos_corporativos.md`:
+    el caché ticker->CIK de `sec_edgar_client.py` es estado mutable de
+    módulo, compartido por todo el proceso de pytest — sin este reset, un
+    test que puebla el caché puede contaminar cualquier otro test que corra
+    después en el mismo proceso (no-determinismo dependiente del orden)."""
+    sec_edgar_client._ticker_cik_cache.clear()
+    sec_edgar_client._cache_loaded_at = None
+    yield
+    sec_edgar_client._ticker_cik_cache.clear()
+    sec_edgar_client._cache_loaded_at = None
 
 
 def _adobe_router(adobe_fixtures):
@@ -955,3 +971,285 @@ async def test_run_analysis_multichunk_cero_llamadas_http_nuevas(conn_factory, m
     await handle_text(update, context=SimpleNamespace())
 
     assert call_count["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# SDD_procedencia_peers_individuales — wiring de peers_pe/peers_no_usados
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_and_analyze_propaga_per_individual_y_motivo_end_to_end(adobe_fixtures):
+    """Q1: peer_comparison_dict (vía compare_to_peers) propaga peers_pe/
+    peers_no_usados con motivo por peer, visible en el texto final —
+    extiende el fixture de Adobe para que 1 peer tenga earningsYield<=0
+    (ORCL) y 1 no devuelva dato (CRM), dejando MSFT como único válido."""
+    fixtures = dict(adobe_fixtures)
+    fixtures["peers_metrics"] = {
+        "MSFT": [{"symbol": "MSFT", "earningsYield": 1 / 30.0}],
+        "ORCL": [{"symbol": "ORCL", "earningsYield": -0.01}],
+        # CRM deliberadamente ausente del fixture -> peer_data falsy en
+        # _adobe_router -> respuesta [] -> "sin_dato".
+    }
+    clients = query_handler.Clients(
+        fmp_http=httpx.AsyncClient(transport=httpx.MockTransport(_adobe_router(fixtures))),
+        fred_http=httpx.AsyncClient(transport=httpx.MockTransport(_fred_handler(fixtures))),
+        treasury_gov_http=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(500))
+        ),
+        fmp_api_key="test-key",
+        fred_api_key="test-fred-key",
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "MSFT 30.0" in text
+    assert "ORCL tiene pérdidas esta consulta" in text
+    assert "CRM no devolvió un dato de FMP esta consulta" in text
+
+
+def test_fetch_and_analyze_firma_publica_sin_cambios():
+    """Q2: fetch_and_analyze/fetch_and_analyze_parts no cambian de firma
+    pública — esta spec es interna a cómo se arma peer_comparison_dict."""
+    import inspect
+
+    sig_wrapper = inspect.signature(query_handler.fetch_and_analyze)
+    assert list(sig_wrapper.parameters) == ["ticker", "clients", "perfil"]
+
+    sig_parts = inspect.signature(query_handler.fetch_and_analyze_parts)
+    assert list(sig_parts.parameters) == ["ticker", "clients", "perfil"]
+
+
+async def test_fetch_and_analyze_cero_llamadas_http_nuevas(adobe_fixtures):
+    """Q3: mismo número de llamadas a /stable/key-metrics que antes de esta
+    spec (1 por ticker propio + 1 por cada peer del sector, 3 para
+    Technology) y ninguna ruta nueva golpeada — peers_pe/peers_no_usados se
+    derivan del mismo dato ya recibido, no de una llamada adicional."""
+    llamadas: list[str] = []
+    base_handler = _adobe_router(adobe_fixtures)
+
+    def counting_handler(request: httpx.Request) -> httpx.Response:
+        llamadas.append(request.url.path)
+        return base_handler(request)
+
+    clients = query_handler.Clients(
+        fmp_http=httpx.AsyncClient(transport=httpx.MockTransport(counting_handler)),
+        fred_http=httpx.AsyncClient(transport=httpx.MockTransport(_fred_handler(adobe_fixtures))),
+        treasury_gov_http=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(500))
+        ),
+        fmp_api_key="test-key",
+        fred_api_key="test-fred-key",
+    )
+    await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+
+    rutas_conocidas = {
+        "/stable/quote",
+        "/stable/key-metrics",
+        "/stable/profile",
+        "/stable/income-statement",
+        "/stable/balance-sheet-statement",
+        "/stable/cash-flow-statement",
+    }
+    assert set(llamadas) <= rutas_conocidas
+    assert llamadas.count("/stable/key-metrics") == 4
+
+
+# ---------------------------------------------------------------------------
+# SDD_peers_dinamicos_y_eventos_corporativos — Parte 1 (Finnhub). Matriz Q1-Q5.
+# ---------------------------------------------------------------------------
+
+
+def _no_call_handler(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"no debería llamarse a este mock: {request.url}")
+
+
+async def test_finnhub_api_key_none_cero_llamadas_a_finnhub(adobe_fixtures):
+    """Q1: clients.finnhub_api_key=None -> 0 llamadas al mock de Finnhub."""
+    base_clients = _make_clients(adobe_fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        finnhub_http=httpx.AsyncClient(transport=httpx.MockTransport(_no_call_handler)),
+        finnhub_api_key=None,
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "Adobe" in text
+
+
+async def test_finnhub_configurado_responde_3_peers_validos_fuente_finnhub(adobe_fixtures):
+    """Q2: Finnhub configurado, responde con 3+ peers válidos ->
+    peer_comparison_dict["fuente_peers"] == "finnhub", y los tickers
+    consultados contra /key-metrics son los de Finnhub, no los de
+    PEERS_BY_SECTOR."""
+    fixtures = dict(adobe_fixtures)
+    fixtures["peers_metrics"] = {
+        "NVDA": [{"symbol": "NVDA", "earningsYield": 1 / 40.0}],
+        "AMD": [{"symbol": "AMD", "earningsYield": 1 / 45.0}],
+        "QCOM": [{"symbol": "QCOM", "earningsYield": 1 / 20.0}],
+    }
+
+    fmp_symbols_hit: list[str] = []
+    base_fmp_handler = _adobe_router(fixtures)
+
+    def fmp_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stable/key-metrics":
+            fmp_symbols_hit.append(request.url.params.get("symbol"))
+        return base_fmp_handler(request)
+
+    def finnhub_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["NVDA", "AMD", "QCOM"])
+
+    base_clients = _make_clients(fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        fmp_http=httpx.AsyncClient(transport=httpx.MockTransport(fmp_handler)),
+        finnhub_http=httpx.AsyncClient(transport=httpx.MockTransport(finnhub_handler)),
+        finnhub_api_key="finnhub-test-key",
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+
+    peer_symbols_hit = {s for s in fmp_symbols_hit if s != "ADBE"}
+    assert peer_symbols_hit == {"NVDA", "AMD", "QCOM"}
+    assert "MSFT" not in fmp_symbols_hit
+    assert "Finnhub" in text
+
+
+async def test_finnhub_error_cae_a_fallback_sin_propagar_excepcion(adobe_fixtures):
+    """Q3: Finnhub responde con un error -> el closure _get_finnhub_peers lo
+    captura y devuelve [] -> cae al fallback fijo, sin que la excepción
+    llegue a fetch_and_analyze_parts."""
+
+    def finnhub_failing_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    base_clients = _make_clients(adobe_fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        finnhub_http=httpx.AsyncClient(transport=httpx.MockTransport(finnhub_failing_handler)),
+        finnhub_api_key="finnhub-test-key",
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "Adobe" in text
+    assert "MSFT" in text  # cayó al respaldo fijo (Technology)
+
+
+# Q4 y Q5 (regresión: test_fetch_and_analyze_cero_llamadas_http_nuevas y
+# test_fetch_and_analyze_firma_publica_sin_cambios) ya están cubiertos por
+# los tests existentes de más arriba en este archivo, sin modificarlos — ver
+# sección 1.5 de la spec `SDD_peers_dinamicos_y_eventos_corporativos.md`.
+
+
+# ---------------------------------------------------------------------------
+# SDD_peers_dinamicos_y_eventos_corporativos — Parte 2 (SEC EDGAR). Q6-Q10.
+# ---------------------------------------------------------------------------
+
+_SEC_TICKERS_PAYLOAD = {"0": {"ticker": "ADBE", "cik_str": 796343}}
+
+
+def _sec_edgar_router(events_payload=None):
+    """`events_payload`, si se pasa, es el dict de `filings.recent` a servir
+    en `/submissions/CIK...` — si es `None`, la ruta de submissions devuelve
+    un historial sin eventos relevantes (todos 10-K)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "company_tickers.json" in str(request.url):
+            return httpx.Response(200, json=_SEC_TICKERS_PAYLOAD)
+        if "submissions" in str(request.url):
+            if events_payload is None:
+                return httpx.Response(
+                    200,
+                    json={"filings": {"recent": {"form": ["10-K"], "filingDate": ["2026-01-01"], "accessionNumber": ["a-1"], "primaryDocument": ["d.htm"], "items": [""]}}},
+                )
+            return httpx.Response(200, json={"filings": {"recent": events_payload}})
+        return httpx.Response(404)
+
+    return handler
+
+
+async def test_sec_edgar_user_agent_none_cero_llamadas(adobe_fixtures):
+    """Q6: sec_edgar_user_agent=None/vacío -> 0 llamadas HTTP a un mock de
+    SEC EDGAR."""
+    base_clients = _make_clients(adobe_fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        sec_edgar_http=httpx.AsyncClient(transport=httpx.MockTransport(_no_call_handler)),
+        sec_edgar_user_agent=None,
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "Adobe" in text
+    assert "Eventos corporativos" not in text
+
+
+async def test_sec_edgar_ticker_sin_cik_corporate_events_vacio(adobe_fixtures):
+    """Q7: sec_edgar_user_agent configurado pero get_cik_for_ticker devuelve
+    None (ticker no encontrado en el mapeo) -> corporate_events_list == [],
+    resto del análisis idéntico a una consulta sin SEC EDGAR."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})  # mapeo vacío -> ADBE no encontrado
+
+    base_clients = _make_clients(adobe_fixtures)
+    clients_con_sec = dataclasses.replace(
+        base_clients,
+        sec_edgar_http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        sec_edgar_user_agent="InvestBot test@example.com",
+    )
+    clients_sin_sec = dataclasses.replace(
+        _make_clients(adobe_fixtures),
+        sec_edgar_http=httpx.AsyncClient(transport=httpx.MockTransport(_no_call_handler)),
+        sec_edgar_user_agent=None,
+    )
+    text_con_sec = await query_handler.fetch_and_analyze("ADBE", clients_con_sec, perfil="moderado")
+    text_sin_sec = await query_handler.fetch_and_analyze("ADBE", clients_sin_sec, perfil="moderado")
+    assert text_con_sec == text_sin_sec
+    assert "Eventos corporativos" not in text_con_sec
+
+
+async def test_sec_edgar_cik_y_submissions_exitosos_evento_relevante(adobe_fixtures):
+    """Q8: sec_edgar_user_agent configurado, CIK+submissions exitosos con al
+    menos 1 evento relevante -> corporate_events_list poblada, el texto
+    final contiene la sección "Eventos corporativos"."""
+    fecha_reciente = (date.today() - timedelta(days=10)).isoformat()
+    events_payload = {
+        "form": ["8-K"],
+        "filingDate": [fecha_reciente],
+        "accessionNumber": ["0000796343-26-000123"],
+        "primaryDocument": ["doc.htm"],
+        "items": ["5.02"],
+    }
+    base_clients = _make_clients(adobe_fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        sec_edgar_http=httpx.AsyncClient(
+            transport=httpx.MockTransport(_sec_edgar_router(events_payload))
+        ),
+        sec_edgar_user_agent="InvestBot test@example.com",
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "Eventos corporativos" in text
+    assert fecha_reciente in text
+    assert "Cambio de directivos o ejecutivos" in text
+
+
+async def test_sec_edgar_submissions_falla_tras_cik_exitoso_corporate_events_vacio(adobe_fixtures):
+    """Q9: get_submissions falla (500) tras un CIK exitoso ->
+    corporate_events_list == [], resto del análisis sin cambios, sin
+    excepción propagada."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "company_tickers.json" in str(request.url):
+            return httpx.Response(200, json=_SEC_TICKERS_PAYLOAD)
+        if "submissions" in str(request.url):
+            return httpx.Response(500)
+        return httpx.Response(404)
+
+    base_clients = _make_clients(adobe_fixtures)
+    clients = dataclasses.replace(
+        base_clients,
+        sec_edgar_http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        sec_edgar_user_agent="InvestBot test@example.com",
+    )
+    text = await query_handler.fetch_and_analyze("ADBE", clients, perfil="moderado")
+    assert "Adobe" in text
+    assert "Eventos corporativos" not in text
+
+
+# Q10 (regresión: test_fetch_and_analyze_firma_publica_sin_cambios, ya
+# cubierto sin modificarlo — ver sección 1.5 de la spec).
