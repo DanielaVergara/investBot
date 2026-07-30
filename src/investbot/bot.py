@@ -1,8 +1,8 @@
 """Entrypoint — `Application` en modo long polling (Decisión de diseño #1).
 
 Sin webhook, sin puerto expuesto, sin ruta en Traefik. El proceso falla al
-arrancar (fail-closed) si `TELEGRAM_ALLOWED_CHAT_ID` no está seteada o no es
-un entero válido — ver `security.get_allowed_chat_id()`.
+arrancar (fail-closed) si `TELEGRAM_ALLOWED_CHAT_ID` no está seteada o
+contiene algún elemento inválido — ver `security.get_allowed_chat_id()`.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ async def _on_error(update: object, context) -> None:
 def build_application(
     *,
     telegram_token: str,
-    allowed_chat_id: int,
+    allowed_chat_ids: frozenset[int],
     db_path: str,
     fmp_api_key: str,
     fred_api_key: str | None,
@@ -63,7 +63,7 @@ def build_application(
     # (mensajes, callback_query, etc.) antes de que lleguen a cualquier otro
     # handler (criterio de `security`, sección 1).
     application.add_handler(
-        TypeHandler(Update, security.build_chat_id_gate(allowed_chat_id)), group=-1
+        TypeHandler(Update, security.build_chat_id_gate(allowed_chat_ids)), group=-1
     )
 
     application.add_handler(onboarding.build_onboarding_handler(get_conn))
@@ -97,7 +97,7 @@ def main() -> None:
     configure_logging()
 
     # Fail-closed: si esto lanza, el proceso termina con traceback + exit != 0.
-    allowed_chat_id = security.get_allowed_chat_id()
+    allowed_chat_ids = security.get_allowed_chat_id()
 
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not telegram_token:
@@ -124,7 +124,7 @@ def main() -> None:
 
     application = build_application(
         telegram_token=telegram_token,
-        allowed_chat_id=allowed_chat_id,
+        allowed_chat_ids=allowed_chat_ids,
         db_path=db_path,
         fmp_api_key=fmp_api_key,
         fred_api_key=fred_api_key,
@@ -132,7 +132,10 @@ def main() -> None:
         sec_edgar_user_agent=sec_edgar_user_agent,
     )
 
-    logger.info("InvestBot arrancando en modo long polling (chat_id=%s)", allowed_chat_id)
+    allowed_chat_ids_repr = ",".join(str(chat_id) for chat_id in sorted(allowed_chat_ids))
+    logger.info(
+        "InvestBot arrancando en modo long polling (chat_id=%s)", allowed_chat_ids_repr
+    )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

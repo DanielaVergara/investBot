@@ -126,13 +126,18 @@ class PillarsResult:
 
 
 def _es_creciente(historial: list[float]) -> bool:
-    """True si la serie (ordenada de más antiguo a más reciente) es no decreciente
-    y el valor más reciente supera al más antiguo — crecimiento año a año."""
+    """True si el valor más reciente de la serie supera al más antiguo —
+    crecimiento de punta a punta de la ventana disponible (hasta 5 años
+    anuales de FMP), sin exigir que cada paso intermedio sea no decreciente.
+    Mismo criterio de "extremos" que valuation.calculate_cagr() usa para
+    Graham/DCF (Pregunta 1, RESUELTA por Daniela: Opción A) — sin heredar
+    la guarda de signo en la base de calculate_cagr() (acá no importa que
+    historial[0] sea <= 0, a diferencia de calculate_cagr, para no excluir
+    a empresas en turnaround del pilar de crecimiento).
+    """
     if not historial or len(historial) < 2:
         return False
-    return all(
-        historial[i] <= historial[i + 1] for i in range(len(historial) - 1)
-    ) and historial[-1] > historial[0]
+    return historial[-1] > historial[0]
 
 
 def evaluate_pillars(

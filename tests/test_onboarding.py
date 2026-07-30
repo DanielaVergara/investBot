@@ -219,7 +219,7 @@ async def test_flujo_abandono_no_deja_fila_parcial(handler):
 
 async def test_chat_id_no_autorizado_no_avanza_ni_escribe_en_db(handler):
     conv_handler, get_conn = handler
-    gate = build_chat_id_gate(ALLOWED_CHAT_ID)
+    gate = build_chat_id_gate(frozenset({ALLOWED_CHAT_ID}))
 
     unauthorized_update = SimpleNamespace()
     unauthorized_update.effective_chat = SimpleNamespace(id=99999, type="private")
@@ -241,7 +241,7 @@ async def test_chat_id_no_autorizado_no_avanza_ni_escribe_en_db(handler):
 
 
 async def test_chat_id_no_autorizado_callback_query_rechazado():
-    gate = build_chat_id_gate(ALLOWED_CHAT_ID)
+    gate = build_chat_id_gate(frozenset({ALLOWED_CHAT_ID}))
     update, query = _fake_update_callback("onb:0:10")
     update.effective_chat = SimpleNamespace(id=99999, type="private")
 

@@ -47,13 +47,31 @@ def test_build_application_registra_handlers(tmp_path):
     db_path = str(tmp_path / "bot_test.db")
     application = bot.build_application(
         telegram_token="123456:dummy-token-for-tests",
-        allowed_chat_id=12345,
+        allowed_chat_ids=frozenset({12345}),
         db_path=db_path,
         fmp_api_key="test-fmp-key",
         fred_api_key="test-fred-key",
     )
     assert application is not None
     # El gate de chat_id debe estar en group=-1
+    assert -1 in application.handlers
+    assert len(application.handlers[-1]) == 1
+
+
+def test_build_application_acepta_multiples_chat_ids(tmp_path):
+    """Caso multi-usuario (SDD_multiusuario_chat_id.md): build_application
+    acepta un frozenset de 3 elementos, no solo 1, y construye la Application
+    sin error — ejercita el caso de integración bot.py <-> security.py con
+    más de un chat_id autorizado."""
+    db_path = str(tmp_path / "bot_test3.db")
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({111, 222, 333}),
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+    )
+    assert application is not None
     assert -1 in application.handlers
     assert len(application.handlers[-1]) == 1
 
@@ -89,7 +107,7 @@ def test_build_application_acepta_finnhub_y_sec_edgar_opcionales(tmp_path):
     db_path = str(tmp_path / "bot_test2.db")
     application = bot.build_application(
         telegram_token="123456:dummy-token-for-tests",
-        allowed_chat_id=12345,
+        allowed_chat_ids=frozenset({12345}),
         db_path=db_path,
         fmp_api_key="test-fmp-key",
         fred_api_key="test-fred-key",

@@ -9,6 +9,10 @@ from __future__ import annotations
 import pytest
 
 from investbot import rules
+from tests.fixtures.crecimiento_estilizado import (
+    HISTORIAL_INGRESOS_CASO_ESTILIZADO,
+    HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
+)
 
 
 def test_calculate_eps():
@@ -138,6 +142,70 @@ def test_pilar_utilidades_crecientes_pero_negativas_al_final_false():
         barata=True,
     )
     assert pillars.utilidades_crecientes is False
+
+
+# ---------------------------------------------------------------------------
+# _es_creciente — Opción A confirmada (SDD_fix_crecimiento_y_redaccion.md,
+# Parte 1): solo compara extremos, ya no exige monotonía año a año.
+# ---------------------------------------------------------------------------
+
+
+def test_es_creciente_dip_temprano_explosion_final():
+    assert rules._es_creciente([100, 90, 80, 70, 200]) is True
+
+
+def test_es_creciente_caso_nvidia_estilizado():
+    assert rules._es_creciente([100, 200, 150, 300, 500]) is True
+
+
+def test_es_creciente_caida_sostenida_sin_repunte_false():
+    assert rules._es_creciente([100, 90, 80, 70, 60]) is False
+
+
+def test_es_creciente_lista_vacia_false():
+    assert rules._es_creciente([]) is False
+
+
+def test_es_creciente_un_solo_elemento_false():
+    assert rules._es_creciente([100]) is False
+
+
+def test_es_creciente_extremos_iguales_false():
+    assert rules._es_creciente([100, 100]) is False
+
+
+def test_es_creciente_dos_elementos_creciente_true():
+    assert rules._es_creciente([100, 200]) is True
+
+
+def test_pilar_utilidades_crecientes_caso_nvidia_dip_intermedio():
+    """End-to-end: reproduce el bug real reportado por Daniela con NVIDIA —
+    una caída intermedia de utilidades rodeada de crecimiento fuerte ya no
+    marca ❌ en el pilar."""
+    liquidity = rules.calculate_liquidity_ratio(100, 50)
+    pillars = rules.evaluate_pillars(
+        revenue_historial=HISTORIAL_INGRESOS_CASO_ESTILIZADO,
+        net_income_historial=HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
+        liquidity=liquidity,
+        barata=True,
+    )
+    assert pillars.utilidades_crecientes is True
+    assert pillars.ingresos_crecientes is True
+
+
+def test_evaluate_pillars_deuda_precio_ventaja_no_cambian_con_dip():
+    """El fix de _es_creciente no cambia ninguna otra lógica de
+    evaluate_pillars (deuda_controlada, precio_razonable, ventaja_competitiva)."""
+    liquidity = rules.calculate_liquidity_ratio(100, 50)
+    pillars = rules.evaluate_pillars(
+        revenue_historial=HISTORIAL_INGRESOS_CASO_ESTILIZADO,
+        net_income_historial=HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
+        liquidity=liquidity,
+        barata=False,
+    )
+    assert pillars.deuda_controlada is True
+    assert pillars.precio_razonable is False
+    assert pillars.ventaja_competitiva == "revisar_manualmente"
 
 
 def test_pilar_ventaja_competitiva_siempre_revisar_manualmente():

@@ -295,34 +295,43 @@ def build_market_context_section(
 ) -> str:
     """Sección "Contexto de mercado" (Spec Patch Iter-3, sección 6): momentum
     de precio + comparación explícita con peers. Se ubica entre "Pilares de
-    buena empresa" y "Encaje con tu perfil de riesgo"."""
-    lines = ["*Contexto de mercado:*"]
+    buena empresa" y "Encaje con tu perfil de riesgo".
+
+    Parte 3 (`SDD_fix_crecimiento_y_redaccion.md`, Hallazgo 4): los 3
+    sub-temas (momentum/precio, comparación con peers + desglose individual,
+    VIX) se agrupan en sub-bloques separados por línea en blanco (`"\\n\\n"`)
+    entre sí, preservando `"\\n"` simple dentro de cada sub-bloque — mismo
+    tratamiento que ya usa `build_valuation_scenarios_section` para separar
+    Rango de Valor Justo de Valor Justo Total.
+    """
+    bloque_momentum = ["*Contexto de mercado:*"]
 
     pct_high = momentum.get("pct_vs_year_high")
     pct_low = momentum.get("pct_vs_year_low")
     if pct_high is not None and pct_low is not None:
-        lines.append(
+        bloque_momentum.append(
             f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_high):.1f}% por "
             f"debajo de su máximo de 52 semanas y un {abs(pct_low):.1f}% por "
             "encima de su mínimo de 52 semanas."
         )
     elif pct_high is not None:
-        lines.append(
+        bloque_momentum.append(
             f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_high):.1f}% por "
             "debajo de su máximo de 52 semanas."
         )
     elif pct_low is not None:
-        lines.append(
+        bloque_momentum.append(
             f"- Cotiza a {_fmt_money(precio_actual)}, un {abs(pct_low):.1f}% por "
             "encima de su mínimo de 52 semanas."
         )
 
     etiqueta = momentum.get("etiqueta")
     if etiqueta in ETIQUETA_MOMENTUM_LABELS:
-        lines.append(f"- {ETIQUETA_MOMENTUM_LABELS[etiqueta]}")
+        bloque_momentum.append(f"- {ETIQUETA_MOMENTUM_LABELS[etiqueta]}")
     # etiqueta == "no_disponible" -> se omite (criterio explícito Iter-3/6.3),
     # no se muestra como ruido "impulso: no disponible".
 
+    bloque_peers: list[str] = []
     posicion = peer_comparison.get("posicion")
     peers_pe = peer_comparison.get("peers_pe") or {}
     peers_no_usados = peer_comparison.get("peers_no_usados") or {}
@@ -330,7 +339,7 @@ def build_market_context_section(
     if posicion == "no_comparable":
         motivo = peer_comparison.get("motivo_no_comparable")
         texto = MOTIVO_NO_COMPARABLE_LABELS.get(motivo, "no se pudo comparar con tus peers.")
-        lines.append(f"- Comparada con sus comparables del sector: {texto}")
+        bloque_peers.append(f"- Comparada con sus comparables del sector: {texto}")
     else:
         peers_str = ", ".join(peer_comparison.get("peers_usados") or [])
         posicion_txt = POSICION_LABELS.get(posicion, posicion)
@@ -338,7 +347,7 @@ def build_market_context_section(
         per_min = peer_comparison.get("per_minimo_peers")
         per_prom = peer_comparison.get("per_promedio_peers")
         per_max = peer_comparison.get("per_maximo_peers")
-        lines.append(
+        bloque_peers.append(
             f"- Comparada con sus comparables del sector ({peers_str}): tu PER "
             f"({_fmt_ratio(per_propio)}) está {posicion_txt} con el rango de tus "
             f"peers (mínimo {_fmt_ratio(per_min)}, promedio {_fmt_ratio(per_prom)}, "
@@ -347,11 +356,12 @@ def build_market_context_section(
 
     peer_breakdown_line = _build_peer_pe_breakdown_line(peers_pe, peers_no_usados)
     if peer_breakdown_line:
-        lines.append(peer_breakdown_line)
+        bloque_peers.append(peer_breakdown_line)
 
+    bloque_vix: list[str] = []
     if vix and vix.get("disponible"):
-        lines.append(f"- VIX (CBOE Volatility Index): {vix['valor']:.2f}")
-        lines.append(
+        bloque_vix.append(f"- VIX (CBOE Volatility Index): {vix['valor']:.2f}")
+        bloque_vix.append(
             "  _Estimado/aproximado — mide la volatilidad implícita "
             "esperada de opciones sobre el S&P 500 (el mercado en "
             "general), no del ticker que consultaste. NO es lo mismo "
@@ -360,14 +370,16 @@ def build_market_context_section(
             "solo mide volatilidad). Dato de FMP (símbolo ^VIX)._"
         )
 
-    lines.append(
+    nota_final = [
         "\n_Nota: el momentum de arriba es un proxy simple de precio "
         "del ticker consultado, no del mercado en general. El VIX (si "
         "aparece más arriba) es una aproximación de la volatilidad "
         "esperada del mercado en general, no del ticker — tampoco es "
         "un índice de sentimiento compuesto._"
-    )
-    return "\n".join(lines)
+    ]
+
+    bloques = [b for b in (bloque_momentum, bloque_peers, bloque_vix, nota_final) if b]
+    return "\n\n".join("\n".join(b) for b in bloques)
 
 
 def build_corporate_events_section(events: Optional[list[dict]]) -> Optional[str]:
@@ -387,7 +399,9 @@ def build_corporate_events_section(events: Optional[list[dict]]) -> Optional[str
         "8-K que la empresa está obligada a presentar por ley ante eventos "
         "materiales. El bot NO resume el contenido legal del filing (fuera "
         "de alcance, riesgo de alucinación sobre texto legal) — mostramos "
-        "fecha + tipo de evento + link para que lo leas vos si te interesa._"
+        "fecha + tipo de evento (la etiqueta es una traducción del bot del "
+        "código oficial de Item de la SEC, no una cita textual) + link para "
+        "que lo leas vos si te interesa._"
     )
     return "\n".join(lines)
 
@@ -414,7 +428,8 @@ def build_pillars_section(pillars: dict) -> str:
 def build_risk_fit_section(risk_fit: dict) -> str:
     encaje_txt = "SÍ encaja" if risk_fit["encaja"] else "NO encaja"
     return (
-        f"*Encaje con tu perfil de riesgo ({risk_fit['perfil']}):* {encaje_txt} — "
+        f"*Encaje con tu perfil de riesgo ({risk_fit['perfil']}):*\n"
+        f"{encaje_txt} — "
         f"es {risk_fit['etiqueta_activo']} con beta de {risk_fit['beta']:.2f}.\n"
         "_Renta variable = sos dueño de una parte de la empresa (una "
         "acción). A diferencia de la renta fija (bonos, plazo fijo), acá "
@@ -520,8 +535,6 @@ def build_veredicto_section(*, pillars: dict, risk_fit: dict) -> str:
     solidos = sum(1 for k in claves if pillars.get(k) is True)
     debiles = [k for k in claves if pillars.get(k) is False]
 
-    encaje_txt = "SÍ encaja" if risk_fit.get("encaja") else "NO encaja"
-
     cuidado_txt = ""
     if debiles:
         etiquetas = {
@@ -532,11 +545,14 @@ def build_veredicto_section(*, pillars: dict, risk_fit: dict) -> str:
         }
         cuidado_txt = f" Mirá con cuidado: {', '.join(etiquetas[k] for k in debiles)}."
 
-    return (
-        f"*En una frase:* {precio_txt}, con {solidos}/4 pilares sólidos, "
-        f"y {encaje_txt} con tu perfil de riesgo ({risk_fit.get('perfil')})."
-        f"{cuidado_txt}"
-    )
+    lineas = [
+        "*Veredicto:*",
+        f"{precio_txt.capitalize()}, con {solidos}/4 pilares sólidos.",
+        f"Encaje de riesgo: {'SÍ' if risk_fit.get('encaja') else 'NO'} (detalle más abajo).",
+    ]
+    if cuidado_txt:
+        lineas.append(cuidado_txt.strip())
+    return "\n".join(lineas)
 
 
 _PEERS_NOTE_FIJO = (
@@ -551,12 +567,11 @@ _PEERS_NOTE_FIJO = (
 )
 
 _PEERS_NOTE_FINNHUB = (
-    "Esta consulta, la lista de comparables (peers) se obtuvo "
-    "dinámicamente de Finnhub (agrupados por sub-industria, no por "
-    "el sector completo) — no es la lista fija de peers.py. Si "
-    "Finnhub no responde o no está configurado, el bot usa "
-    "automáticamente un respaldo fijo elegido a mano por quien "
-    "construyó el bot."
+    "En esta consulta, la lista de comparables (peers) vino de "
+    "Finnhub (agrupados por sub-industria, no por el sector completo) "
+    "— no es la lista fija de peers.py. Si Finnhub no responde o no "
+    "está configurado, el bot usa automáticamente un respaldo fijo "
+    "elegido a mano por quien construyó el bot."
 )
 
 
@@ -613,6 +628,7 @@ def build_summary_parts(
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
 
     intro = (
+        "*Cómo leer este análisis:*\n"
         "Pensá en una empresa como una Tienda de Limonada: el *boletín* "
         "(Estado de Resultados) te dice cuánto vendió y ganó, *la foto* "
         "(Balance General) te dice qué tiene y qué debe en un momento dado, "
@@ -620,7 +636,11 @@ def build_summary_parts(
         "entró y salió de la caja."
     )
 
-    ratios_lines = ["*Ratios clave:*"]
+    ratios_lines = [
+        "*Ratios clave:*",
+        "_(calculados por el bot a partir de datos de FMP — no son campos "
+        "directos de la API)_",
+    ]
     if ratios.get("ratio_liquidez") is not None:
         ratios_lines.append(
             f"- Liquidez: {ratios['ratio_liquidez']:.2f} (según la foto)"
@@ -667,6 +687,7 @@ def build_summary_parts(
         peer_comparison.get("fuente_peers")
     )
     transparency_lines = [
+        "*Notas de transparencia:*",
         "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
         "obtenidos de Financial Modeling Prep (FMP)._",
         f"_Nota de transparencia: {peers_note_final}_",
@@ -680,9 +701,10 @@ def build_summary_parts(
         "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
         "la empresa financiarse con capital propio (accionistas) y con "
         "deuda (bancos/bonistas), ponderado por cuánto usa de cada uno. Es "
-        "un cálculo propio del bot (no viene de FMP), simplificado — no "
-        "reemplaza el WACC que armaría un analista con datos de mercado "
-        "más completos._"
+        "un cálculo propio del bot (no viene de FMP), simplificado — "
+        "es una aproximación más simple, no un sustituto completo del "
+        "WACC que armaría un analista con datos de mercado más "
+        "completos._"
     )
     transparency_lines.append(
         "_Esto es una síntesis de datos financieros históricos, no "
@@ -705,7 +727,7 @@ def build_summary_parts(
         market_context_section,
         corporate_events_section,
         risk_section,
-        "\n".join(transparency_lines),
+        "\n\n".join(transparency_lines),
     ]
     return [part for part in parts if part is not None]
 

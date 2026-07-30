@@ -8,7 +8,14 @@ clasificación barata/cara por escenario + sección "Contexto de mercado") +
 
 from __future__ import annotations
 
-from investbot import peers, summary
+import re
+
+from investbot import peers, rules, summary
+from investbot.query_handler import chunk_for_telegram
+from tests.fixtures.crecimiento_estilizado import (
+    HISTORIAL_INGRESOS_CASO_ESTILIZADO,
+    HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
+)
 
 
 def _base_ratios():
@@ -611,6 +618,17 @@ def test_peers_note_default_menciona_eleccion_manual_y_no_fmp():
     assert "no la arma FMP" in text
 
 
+def test_peers_note_finnhub_no_empieza_con_esta_consulta_la_lista():
+    """Parte 2, Hallazgo 3: la apertura sin conector queda eliminada."""
+    assert not summary._PEERS_NOTE_FINNHUB.startswith("Esta consulta, la lista")
+
+
+def test_peers_note_finnhub_empieza_con_en_esta_consulta():
+    assert summary._PEERS_NOTE_FINNHUB.startswith(
+        "En esta consulta, la lista de comparables"
+    )
+
+
 def test_modelo_formulas_multiplos_aclara_calculo_del_bot():
     formula = summary._MODELO_FORMULAS["multiplos"]
     assert "cálculo del bot" in formula
@@ -739,7 +757,7 @@ def test_veredicto_4_de_4_pilares_y_encaja():
     )
     assert "barata" in text
     assert "4/4 pilares sólidos" in text
-    assert "SÍ encaja" in text
+    assert "Encaje de riesgo: SÍ" in text
     assert "Mirá con cuidado" not in text
 
 
@@ -753,7 +771,7 @@ def test_veredicto_precio_razonable_false_dice_cara():
         },
         risk_fit={"encaja": True, "perfil": "moderado"},
     )
-    assert "parece *cara*" in text
+    assert "Parece *cara*" in text
     assert "3/4 pilares sólidos" in text
     assert "Mirá con cuidado: precio." in text
 
@@ -768,7 +786,7 @@ def test_veredicto_precio_razonable_none():
         },
         risk_fit={"encaja": False, "perfil": "moderado"},
     )
-    assert "no pude determinar si está cara o barata" in text
+    assert "No pude determinar si está cara o barata" in text
     assert "None" not in text
 
 
@@ -797,13 +815,13 @@ def test_veredicto_no_encaja():
         },
         risk_fit={"encaja": False, "perfil": "agresivo"},
     )
-    assert "NO encaja" in text
+    assert "Encaje de riesgo: NO" in text
 
 
 def test_veredicto_es_el_segundo_bloque_de_la_respuesta():
     text = _build_summary()
     idx_titulo = text.index("*Adobe Inc. (ADBE)*")
-    idx_veredicto = text.index("*En una frase:*")
+    idx_veredicto = text.index("*Veredicto:*")
     idx_limonada = text.index("Tienda de Limonada")
     assert idx_titulo < idx_veredicto < idx_limonada
 
@@ -825,9 +843,58 @@ def test_veredicto_peor_escenario_no_crashea():
         },
         risk_fit={"encaja": False, "perfil": "muy_conservador"},
     )
-    assert "no pude determinar si está cara o barata" in text
-    assert "NO encaja" in text
+    assert "No pude determinar si está cara o barata" in text
+    assert "Encaje de riesgo: NO" in text
     assert "Mirá con cuidado: ingresos, utilidades, deuda." in text
+
+
+def test_veredicto_titulo_en_linea_propia():
+    """Parte 3, Hallazgo 2: el título '*Veredicto:*' vive en su propia
+    línea, separado del contenido."""
+    text = summary.build_veredicto_section(
+        pillars=_base_pillars(), risk_fit=_base_risk_fit()
+    )
+    assert text.split("\n")[0] == "*Veredicto:*"
+
+
+def test_veredicto_no_repite_frase_encaja_con_tu_perfil_de_riesgo():
+    """Parte 2, Hallazgo 1: build_veredicto_section() ya no repite
+    literalmente la frase "encaja con tu perfil de riesgo" (esa frase
+    completa solo vivía en el texto viejo del Veredicto -- el nuevo texto
+    de build_risk_fit_section nunca la tuvo, dice "Encaje con tu perfil de
+    riesgo" (título, sustantivo) y "SÍ/NO encaja" por separado, no
+    concatenados)."""
+    text = summary.build_veredicto_section(
+        pillars=_base_pillars(), risk_fit=_base_risk_fit()
+    )
+    assert "encaja con tu perfil de riesgo" not in text.lower()
+
+
+def test_veredicto_encaje_dice_detalle_mas_abajo():
+    text = summary.build_veredicto_section(
+        pillars=_base_pillars(), risk_fit=_base_risk_fit()
+    )
+    assert "(detalle más abajo)" in text
+
+
+def test_summary_frase_encaja_con_tu_perfil_de_riesgo_no_aparece_duplicada():
+    """Verifica que Hallazgo 1 de Parte 2 realmente eliminó la redundancia
+    de fraseo, no solo cambió palabras: la frase completa "encaja con tu
+    perfil de riesgo" (tal como aparecía en el Veredicto viejo) no aparece
+    en ningún punto de la respuesta completa -- build_risk_fit_section usa
+    "Encaje con tu perfil de riesgo" (título) y "SÍ/NO encaja" (por
+    separado), nunca esa frase concatenada.
+
+    Nota de implementación: el spec (matriz de `qa`) proponía verificar
+    `count(...) == 1` asumiendo que la frase seguía viviendo en
+    build_risk_fit_section -- verificado que esa función nunca contuvo esa
+    frase exacta concatenada (dice "Encaje" sustantivo + "SÍ/NO encaja" en
+    cláusulas separadas), así que el conteo real y correcto es 0, no 1. Se
+    documenta como desviación técnica necesaria, no como reinterpretación
+    del criterio (el criterio de fondo -- que no quede duplicada -- se
+    sigue cumpliendo)."""
+    text = _build_summary()
+    assert text.lower().count("encaja con tu perfil de riesgo") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +1046,15 @@ def test_wacc_nota_contiene_costo_promedio_ponderado_y_calculo_propio():
     assert "cálculo propio del bot" in text
 
 
+def test_wacc_nota_mantiene_matiz_cautelar():
+    """Parte 2, Hallazgo 4 (Gap 3 de `qa`, texto final cerrado): varía el
+    verbo inicial pero conserva el matiz cautelar explícito de que esto NO
+    es un reemplazo válido del WACC de un analista (sugerencia de
+    `security`, incorporada)."""
+    text = _build_summary()
+    assert "no un sustituto completo" in text
+
+
 def test_disclaimer_12b_siempre_presente_con_treasury_source():
     text = _build_summary(treasury_source="FRED (serie DGS20)")
     assert (
@@ -1077,7 +1153,7 @@ def test_orden_completo_de_build_summary_con_extras():
     text = _build_summary(extras=_full_extras(), vix={"valor": 18.42, "disponible": True})
     indices = [
         text.index("*Adobe Inc. (ADBE)*"),
-        text.index("*En una frase:*"),
+        text.index("*Veredicto:*"),
         text.index("Tienda de Limonada"),
         text.index("Ratios clave"),
         text.index("Rentabilidad, deuda de largo plazo y dividendos"),
@@ -1095,7 +1171,7 @@ def test_orden_completo_de_build_summary_sin_extras():
     assert "Rentabilidad, deuda de largo plazo y dividendos" not in text
     indices = [
         text.index("*Adobe Inc. (ADBE)*"),
-        text.index("*En una frase:*"),
+        text.index("*Veredicto:*"),
         text.index("Tienda de Limonada"),
         text.index("Ratios clave"),
         text.index("Rango de Valor Justo"),
@@ -1252,3 +1328,200 @@ def test_disclaimer_sin_corporate_events_sigue_presente_con_apertura_sin_cambios
         "no asesoramiento financiero profesional ni una recomendación de "
         "inversión" in text
     )
+
+
+# ---------------------------------------------------------------------------
+# SDD_fix_crecimiento_y_redaccion.md — Parte 3: formato y espaciado visual
+# ---------------------------------------------------------------------------
+
+
+def _parts_completo(**overrides):
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+        treasury_source="FRED (serie DGS20)",
+        extras=_full_extras(),
+        vix={"valor": 18.42, "disponible": True},
+        corporate_events=_un_evento(),
+    )
+    kwargs.update(overrides)
+    return summary.build_summary_parts(**kwargs)
+
+
+def test_las_10_secciones_estandar_tienen_titulo_en_negrita_en_linea_propia():
+    """Parte 3, Hallazgo 1 (Gap 2 de `qa` resuelto): las 10 secciones de
+    contenido (todas excepto el Título de la empresa, índice 0) tienen
+    título en negrita en su propia línea -- '*Texto:*' antes del primer
+    salto de línea (o al final del string, si la sección es de una sola
+    línea)."""
+    parts = _parts_completo()
+    assert len(parts) == 11  # título + 10 secciones de contenido (caso feliz completo)
+    for parte in parts[1:]:
+        assert re.match(r"^\*[^*]+:\*(\n|$)", parte), f"No cumple el estándar: {parte[:60]!r}"
+
+
+def test_titulo_de_empresa_parts_0_queda_excluido_del_estandar():
+    """El Título de la empresa (índice 0) NO sigue el patrón '*Texto:*' --
+    exclusión intencional documentada en el Hallazgo 1 de Parte 3, no un
+    olvido de cobertura."""
+    parts = _parts_completo()
+    assert parts[0] == "*Adobe Inc. (ADBE)*"
+    assert not re.match(r"^\*[^*]+:\*(\n|$)", parts[0])
+
+
+def test_market_context_section_separa_subbloques_con_linea_en_blanco():
+    """Parte 3, Hallazgo 4: momentum/peers/VIX/nota final separados por
+    línea en blanco ('\\n\\n')."""
+    text_sin_vix = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=_base_peer_comparison(),
+        vix=None,
+    )
+    assert text_sin_vix.count("\n\n") == 2  # momentum->peers, peers->nota final
+
+    text_con_vix = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=_base_peer_comparison(),
+        vix={"valor": 18.42, "disponible": True},
+    )
+    assert text_con_vix.count("\n\n") == 3  # + peers->vix
+    assert text_con_vix.count("\n\n") > text_sin_vix.count("\n\n")
+
+
+def test_transparency_lines_titulo_y_doble_salto():
+    """Parte 3, Hallazgo 6: '*Notas de transparencia:*' es el título,
+    separado por '\\n\\n' de cada nota subsiguiente (ya no un solo '\\n')."""
+    parts = summary.build_summary_parts(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+        treasury_source="FRED (serie DGS20)",
+    )
+    transparency = parts[-1]
+    assert transparency.startswith("*Notas de transparencia:*\n\n")
+    # 6 elementos (título + 5 notas con treasury_source) -> 5 separadores "\n\n"
+    assert transparency.count("\n\n") == 5
+
+
+def test_risk_fit_section_titulo_en_linea_propia():
+    """Parte 3, Hallazgo 5: título separado del contenido -- la primera
+    línea no contiene "SÍ encaja"/"NO encaja" (separación real, no solo
+    mover el símbolo ':')."""
+    text = summary.build_risk_fit_section(_base_risk_fit())
+    primera_linea = text.split("\n")[0]
+    assert primera_linea.endswith(":*")
+    assert "SÍ encaja" not in primera_linea
+    assert "NO encaja" not in primera_linea
+
+
+def test_intro_tiene_titulo():
+    """Parte 3, Hallazgo 3 (Gap 5 de `qa` resuelto): título cerrado
+    '*Cómo leer este análisis:*', antes de la analogía de Tienda de
+    Limonada."""
+    text = _build_summary()
+    idx_titulo = text.index("*Cómo leer este análisis:*")
+    idx_limonada = text.index("Tienda de Limonada")
+    assert idx_titulo < idx_limonada
+
+
+def test_ninguna_seccion_duplicada_ni_omitida():
+    """Ninguna sección deja de aparecer, ninguna se duplica -- comparando el
+    set de títulos de sección esperado antes/después de esta spec."""
+    parts = _parts_completo()
+    titulos = [parte.split("\n")[0] for parte in parts]
+    assert len(titulos) == len(set(titulos))
+    esperados = {
+        "*Adobe Inc. (ADBE)*",
+        "*Veredicto:*",
+        "*Cómo leer este análisis:*",
+        "*Ratios clave:*",
+        "*Rentabilidad, deuda de largo plazo y dividendos:*",
+        "*Rango de Valor Justo estimado (Pesimista | Conservador | Optimista):*",
+        "*Pilares de buena empresa:*",
+        "*Contexto de mercado:*",
+        "*Eventos corporativos recientes (SEC EDGAR):*",
+        "*Encaje con tu perfil de riesgo (moderado):*",
+        "*Notas de transparencia:*",
+    }
+    assert set(titulos) == esperados
+
+
+def test_chunk_for_telegram_mensaje_completo_no_dispara_explosion_de_chunks():
+    """Resuelve el Gap 1 de `qa` para Parte 3: mensaje completo armado con
+    el fixture estilizado del caso NVIDIA (evaluate_pillars real vía
+    Opción A, Parte 1) + todas las secciones opcionales activas -- el
+    incremento de ~30 caracteres de esta Parte (título nuevo + "\\n\\n"
+    extra) no dispara una explosión de chunks respecto de la baseline."""
+    liquidity = rules.calculate_liquidity_ratio(100, 50)
+    pillars_result = rules.evaluate_pillars(
+        revenue_historial=HISTORIAL_INGRESOS_CASO_ESTILIZADO,
+        net_income_historial=HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
+        liquidity=liquidity,
+        barata=True,
+    )
+    pillars = {
+        "ingresos_crecientes": pillars_result.ingresos_crecientes,
+        "utilidades_crecientes": pillars_result.utilidades_crecientes,
+        "deuda_controlada": pillars_result.deuda_controlada,
+        "precio_razonable": pillars_result.precio_razonable,
+    }
+    parts = _parts_completo(pillars=pillars)
+    chunks = chunk_for_telegram(parts)
+    assert len(chunks) <= 2
+
+
+# ---------------------------------------------------------------------------
+# SDD_fix_crecimiento_y_redaccion.md — Parte 4: auditoría de procedencia
+# ---------------------------------------------------------------------------
+
+
+def test_ratios_lines_incluye_atribucion_calculo_del_bot():
+    """Parte 4, Hallazgo B: 'Ratios clave' aclara explícitamente que los 4
+    valores los calcula el bot a partir de datos crudos de FMP -- la línea
+    de atribución es la segunda del bloque, inmediatamente debajo del
+    título."""
+    text = _build_summary()
+    assert "calculados por el bot" in text
+    assert "no son campos directos de la API" in text
+
+    parts = summary.build_summary_parts(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    ratios_part = next(p for p in parts if p.startswith("*Ratios clave:*"))
+    lineas = ratios_part.split("\n")
+    assert lineas[0] == "*Ratios clave:*"
+    assert "calculados por el bot" in lineas[1]
+    assert "no son campos directos de la API" in lineas[1]
+
+
+def test_corporate_events_aclara_etiqueta_es_traduccion_del_bot():
+    """Parte 4, Hallazgo D: la nota de fuente aclara que la etiqueta es una
+    traducción del bot del código oficial de Item de la SEC, no una cita
+    textual del filing -- sin remover nada del texto ya existente sobre el
+    filing (regresión: sigue conteniendo "NO resume")."""
+    text = summary.build_corporate_events_section(_un_evento())
+    assert "traducción del bot" in text
+    assert "no una cita textual" in text
+    assert "NO resume" in text
