@@ -12,7 +12,7 @@ import re
 
 import pytest
 
-from investbot import peers, rules, summary
+from investbot import peers, rules, summary, valuation
 from investbot.query_handler import chunk_for_telegram
 from tests.fixtures.crecimiento_estilizado import (
     HISTORIAL_INGRESOS_CASO_ESTILIZADO,
@@ -187,14 +187,30 @@ def test_build_valuation_scenarios_section_nd_puntual_por_exclusion_nivel2():
     assert "Graham EPS Model no disponible en el escenario Optimista" in text
 
 
-def test_build_valuation_scenarios_section_degenerado_menos_de_2_peers():
+def test_build_valuation_scenarios_section_peers_validos_insuficientes_excluye_multiplos():
+    """SDD_calidad_peers_multiplos.md, Decisión #4 — reemplaza
+    `test_build_valuation_scenarios_section_degenerado_menos_de_2_peers`
+    (comportamiento intencionalmente distinto, no una regresión: antes, con
+    1 peer válido, Múltiplos se mostraba con su valor numérico + una nota al
+    pie; ahora `valuation.py` excluye el modelo de nivel 1 directamente, así
+    que la fila con valores no aparece en absoluto, y en su lugar aparece la
+    línea de `excluidos_base` con el detalle cuantitativo)."""
     scenarios = _base_scenarios()
-    scenarios["pesimista"] = _scenario(600.0, 435.64, 225.64, 420.43)
-    scenarios["conservador"] = _scenario(600.0, 555.64, 288.82, 481.49)
-    scenarios["optimista"] = _scenario(600.0, 675.64, 376.50, 550.71)
+    scenarios["modelos_excluidos_base"] = [
+        {"modelo": "multiplos", "motivo": "peers_validos_insuficientes"}
+    ]
     text = summary.build_valuation_scenarios_section(scenarios, precio_actual=333.0, n_peers_validos=1)
-    assert "no hay rango disponible para Múltiplos" in text
-    assert "1 comparable" in text
+    # (a) la fila de Múltiplos con valores numéricos por escenario está ausente.
+    assert "- Múltiplos:" not in text
+    # (b) aparece la línea de exclusión con el detalle cuantitativo real
+    # (constante real, no hardcodeada como "2" en el test).
+    assert (
+        f"el modelo de Múltiplos no se pudo calcular: no hay suficientes "
+        f"comparables con PER válido esta consulta (mínimo "
+        f"{valuation.MIN_PEERS_VALIDOS_PARA_MULTIPLOS}, hubo 1)."
+    ) in text
+    # El texto viejo ya no existe en ningún caso (bloque obsoleto eliminado).
+    assert "no hay rango disponible para Múltiplos" not in text
 
 
 def test_build_valuation_scenarios_section_0_de_3_modelos_no_fue_posible_valorar():
@@ -1674,3 +1690,85 @@ def test_build_summary_parts_con_escenario_elegido_resalta_en_la_seccion_correct
     parts = summary.build_summary_parts(escenario_elegido="optimista", **kwargs)
     valuation_part = next(p for p in parts if p.startswith("*Rango de Valor Justo"))
     assert "*Optimista* ✅" in valuation_part
+
+
+# ---------------------------------------------------------------------------
+# SDD_eps_ttm_real.md, Pregunta abierta H (implementada) — nota de
+# transparencia sobre la fuente del balance sheet (trimestral/anual-fallback).
+# ---------------------------------------------------------------------------
+
+
+def test_build_balance_sheet_note_trimestral():
+    texto = summary._build_balance_sheet_note(rules.DATOS_FUENTE_TRIMESTRAL)
+    assert "trimestre más reciente" in texto
+
+
+def test_build_balance_sheet_note_anual_fallback():
+    texto = summary._build_balance_sheet_note(rules.DATOS_FUENTE_ANUAL_FALLBACK)
+    assert "año fiscal más reciente" in texto
+
+
+def test_build_balance_sheet_note_none_no_agrega_nada():
+    assert summary._build_balance_sheet_note(None) is None
+
+
+def test_build_balance_sheet_note_valor_desconocido_no_agrega_nada_ni_crashea():
+    assert summary._build_balance_sheet_note("algo_inesperado") is None
+
+
+def test_build_summary_parts_sin_balance_sheet_fuente_regresion_byte_a_byte():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    sin_parametro = summary.build_summary_parts(**kwargs)
+    con_none_explicito = summary.build_summary_parts(balance_sheet_fuente=None, **kwargs)
+    assert sin_parametro == con_none_explicito
+
+
+def test_build_summary_parts_con_balance_sheet_fuente_trimestral_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        balance_sheet_fuente=rules.DATOS_FUENTE_TRIMESTRAL, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "trimestre más reciente" in transparency_part
+
+
+def test_build_summary_parts_con_balance_sheet_fuente_anual_fallback_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        balance_sheet_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "año fiscal más reciente" in transparency_part

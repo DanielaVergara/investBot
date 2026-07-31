@@ -48,6 +48,14 @@ CAGR_MIN_N_AÑOS = 2  # piso B2: al menos 3 registros anuales (n_años = registr
 DELTA_G = 0.03  # ±3pp — Graham (g) y g_fcf del DCF
 DELTA_WACC = 0.01  # ±1pp — WACC del DCF
 
+# SDD_calidad_peers_multiplos.md, Decisión #1 — confirmado por Daniela
+# 2026-07-31: con menos de este mínimo de peers con PER válido, el modelo de
+# Múltiplos se excluye del promedio de Valor Justo Total (mismo tratamiento
+# que eps_ttm_no_positivo/per_peers_no_disponible) — evita que 1 solo peer
+# con PER extremo/no representativo (ej. caso real ADBE/PLTR, PER 259x)
+# infle valor_justo_total con el mismo peso que Graham/DCF.
+MIN_PEERS_VALIDOS_PARA_MULTIPLOS = 2
+
 
 def calculate_cagr(
     valor_reciente: float, valor_antiguo: float, n_años: int
@@ -297,6 +305,7 @@ def compute_valuation(
     periodos_por_anio_eps: int = 1,
     periodos_por_anio_fcf: int = 1,
     fcf_base: Optional[float] = None,
+    n_peers_validos: Optional[int] = None,
 ) -> ValuationResult:
     """Orquesta los 3 modelos y arma la estructura de retorno del Spec Patch Iter-2.
 
@@ -316,6 +325,16 @@ def compute_valuation(
     períodos por año) en vez de anual (1). `fcf_base` es el FCF TTM (si está
     disponible) usado como ancla de nivel de la proyección del DCF — ver
     `calculate_dcf_fair_value`.
+
+    `n_peers_validos` (`SDD_calidad_peers_multiplos.md`, Decisión #2):
+    opcional, default `None` (comportamiento idéntico al de antes de esta
+    spec — nadie llama a esta función en producción, ver `compute_valuation_
+    scenarios` para el camino real). Si se pasa un entero por debajo de
+    `MIN_PEERS_VALIDOS_PARA_MULTIPLOS`, Múltiplos se excluye del promedio con
+    motivo `"peers_validos_insuficientes"` — mismo criterio que la versión
+    de escenarios, para preservar el invariante ya testeado de paridad
+    campo a campo entre `compute_valuation(...)` y
+    `compute_valuation_scenarios(...).conservador`.
     """
     result = ValuationResult()
 
@@ -325,6 +344,10 @@ def compute_valuation(
     if eps_no_positivo:
         result.modelos_excluidos.append(
             ModeloExcluido("multiplos", "eps_ttm_no_positivo")
+        )
+    elif n_peers_validos is not None and n_peers_validos < MIN_PEERS_VALIDOS_PARA_MULTIPLOS:
+        result.modelos_excluidos.append(
+            ModeloExcluido("multiplos", "peers_validos_insuficientes")
         )
     else:
         result.valor_justo_multiplos = calculate_multiplos_fair_value(
@@ -484,8 +507,10 @@ def compute_valuation_scenarios(
     Dos niveles de exclusión (sección 2 del patch):
     - Nivel 1 (`modelos_excluidos_base`): dato de entrada inválido
       independientemente del escenario (EPS TTM<=0, historial insuficiente,
-      Y no disponible, market_cap<=0, 0 peers con PER válido) — igual en los
-      3 escenarios, reportado una sola vez.
+      Y no disponible, market_cap<=0, 0 peers con PER válido, o menos de
+      `MIN_PEERS_VALIDOS_PARA_MULTIPLOS` peers con PER válido —
+      `SDD_calidad_peers_multiplos.md`) — igual en los 3 escenarios,
+      reportado una sola vez.
     - Nivel 2 (dentro de `ScenarioValuationResult.modelos_excluidos` de cada
       escenario): el dato de base es válido, pero el desplazamiento
       pesimista/optimista empuja un valor intermedio fuera de rango
@@ -503,6 +528,11 @@ def compute_valuation_scenarios(
         nivel1_multiplos = ModeloExcluido("multiplos", "eps_ttm_no_positivo")
     elif peer_average.per_promedio is None:
         nivel1_multiplos = ModeloExcluido("multiplos", "per_peers_no_disponible")
+    elif len(peer_average.peers_usados) < MIN_PEERS_VALIDOS_PARA_MULTIPLOS:
+        # SDD_calidad_peers_multiplos.md, Decisión #1 — 1 solo peer válido
+        # (per_promedio ya no-None) no es muestra suficiente para un
+        # promedio confiable; distinto del caso de 0 peers de arriba.
+        nivel1_multiplos = ModeloExcluido("multiplos", "peers_validos_insuficientes")
     else:
         nivel1_multiplos = None
     multiplos_valido = nivel1_multiplos is None

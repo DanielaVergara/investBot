@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from investbot import peers
-from investbot.valuation import classify_scenario
+from investbot import peers, rules
+from investbot.valuation import MIN_PEERS_VALIDOS_PARA_MULTIPLOS, classify_scenario
 
 MODELO_LABELS = {
     "multiplos": "el modelo de Múltiplos",
@@ -50,6 +50,15 @@ MOTIVO_LABELS = {
     "dcf_no_calculable": "no se pudo proyectar el flujo de caja con los datos disponibles",
     "per_peers_no_disponible": "no pude obtener el PER de los comparables del sector",
     "graham_multiplicador_no_positivo": "en este escenario el crecimiento estimado haría el múltiplo de Graham cero o negativo",
+    # SDD_calidad_peers_multiplos.md, Decisión #4 — fallback estático (el
+    # mensaje real que se muestra es el dinámico armado en el loop de
+    # excluidos_base, con el detalle cuantitativo "mínimo X, hubo N"; esta
+    # entrada solo cubre el caso defensivo de que ese caso especial no
+    # aplique por algún motivo, mismo patrón que el resto del diccionario).
+    "peers_validos_insuficientes": (
+        "no hay suficientes comparables (peers) con PER válido esta consulta "
+        "para un promedio confiable"
+    ),
 }
 
 MOTIVO_NO_COMPARABLE_LABELS = {
@@ -240,15 +249,20 @@ def build_valuation_scenarios_section(
         ):
             if escenario.get(campo) is None:
                 modelos_nivel2_nd.append((modelo_label, escenario_nombre))
-        if modelo_key == "multiplos" and n_peers_validos < 2:
-            lines.append(
-                f"  _(no hay rango disponible para Múltiplos: solo {n_peers_validos} "
-                "comparable(s) válido(s))_"
-            )
 
     for item in excluidos_base:
         modelo_label = MODELO_LABELS.get(item["modelo"], item["modelo"])
-        motivo_label = MOTIVO_LABELS.get(item["motivo"], item["motivo"])
+        if item["motivo"] == "peers_validos_insuficientes":
+            # SDD_calidad_peers_multiplos.md, Decisión #4 — mensaje dinámico
+            # que preserva el detalle cuantitativo que antes se mostraba como
+            # nota al pie de la fila con valores (ahora la fila ni se
+            # muestra, ver eliminación del bloque de arriba).
+            motivo_label = (
+                "no hay suficientes comparables con PER válido esta consulta "
+                f"(mínimo {MIN_PEERS_VALIDOS_PARA_MULTIPLOS}, hubo {n_peers_validos})"
+            )
+        else:
+            motivo_label = MOTIVO_LABELS.get(item["motivo"], item["motivo"])
         lines.append(f"- {modelo_label} no se pudo calcular: {motivo_label}.")
 
     total_pes = pesimista.get("valor_justo_total")
@@ -608,6 +622,29 @@ _PEERS_NOTE_FINNHUB = (
 )
 
 
+def _build_balance_sheet_note(balance_sheet_fuente: Optional[str]) -> Optional[str]:
+    """Texto de transparencia sobre si el balance general (la foto) mostrado
+    esta consulta es del trimestre más reciente o del año fiscal más
+    reciente (fallback) — `SDD_eps_ttm_real.md`, Pregunta abierta H.
+
+    `None` (sin fuente informada, comportamiento de llamadores viejos o
+    consultas donde el dato no aplicó) -> no se agrega ninguna línea, mismo
+    criterio de "degradar con gracia sin ruido" que el resto de notas
+    opcionales de este módulo."""
+    if balance_sheet_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        return (
+            "El balance general (la foto) usado en este análisis es del "
+            "trimestre más reciente disponible."
+        )
+    if balance_sheet_fuente == rules.DATOS_FUENTE_ANUAL_FALLBACK:
+        return (
+            "El balance general (la foto) usado en este análisis es del "
+            "año fiscal más reciente disponible (no se pudo obtener uno "
+            "trimestral más reciente en esta consulta)."
+        )
+    return None
+
+
 def _build_peers_note(fuente_peers: Optional[str]) -> str:
     """Texto de transparencia sobre la fuente de peers usada esta consulta
     (Parte 1, `SDD_peers_dinamicos_y_eventos_corporativos.md`, Decisión #6).
@@ -642,6 +679,7 @@ def build_summary_parts(
     vix: Optional[dict] = None,
     corporate_events: Optional[list[dict]] = None,
     escenario_elegido: Optional[str] = None,
+    balance_sheet_fuente: Optional[str] = None,
 ) -> list[str]:
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
     y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
@@ -730,6 +768,9 @@ def build_summary_parts(
         transparency_lines.append(
             f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
         )
+    balance_sheet_note = _build_balance_sheet_note(balance_sheet_fuente)
+    if balance_sheet_note:
+        transparency_lines.append(f"_{balance_sheet_note}_")
     transparency_lines.append(
         "_El DCF es una aproximación con supuestos simplificados de WACC "
         "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
@@ -784,6 +825,7 @@ def build_summary(
     vix: Optional[dict] = None,
     corporate_events: Optional[list[dict]] = None,
     escenario_elegido: Optional[str] = None,
+    balance_sheet_fuente: Optional[str] = None,
 ) -> str:
     """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
     puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
@@ -806,5 +848,6 @@ def build_summary(
             vix=vix,
             corporate_events=corporate_events,
             escenario_elegido=escenario_elegido,
+            balance_sheet_fuente=balance_sheet_fuente,
         )
     )

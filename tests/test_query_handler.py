@@ -1484,6 +1484,26 @@ def _make_clients_nvda(adobe_fixtures, handler=None) -> query_handler.Clients:
     )
 
 
+async def test_fetch_and_analyze_propaga_balance_sheet_fuente_a_build_summary_parts(
+    adobe_fixtures, monkeypatch
+):
+    """`fetch_and_analyze_parts` pasa `balance_sheet_fuente=balance_fuente`
+    a `summary.build_summary_parts` (Pregunta H de la spec, implementada) —
+    trimestral con NVDA, anual-fallback con ADBE (el router no sirve
+    trimestral para símbolos que no sean NVDA)."""
+    captured_nvda = _capture_summary_call(monkeypatch)
+    await query_handler.fetch_and_analyze_parts(
+        "NVDA", _make_clients_nvda(adobe_fixtures), perfil="moderado"
+    )
+    assert captured_nvda["balance_sheet_fuente"] == rules.DATOS_FUENTE_TRIMESTRAL
+
+    captured_adbe = _capture_summary_call(monkeypatch)
+    await query_handler.fetch_and_analyze_parts(
+        "ADBE", _make_clients(adobe_fixtures), perfil="moderado"
+    )
+    assert captured_adbe["balance_sheet_fuente"] == rules.DATOS_FUENTE_ANUAL_FALLBACK
+
+
 async def test_fetch_and_analyze_nvda_camino_feliz_usa_ttm_no_un_solo_trimestre(
     adobe_fixtures, monkeypatch
 ):
@@ -1981,7 +2001,10 @@ async def test_rate_limit_via_cadena_esc_vent_real_no_solo_handler_vent(
 ):
     """El rate-limit está en el choke-point compartido (`_run_analysis`), no
     solo en el handler `vent:` -- se confirma llegando por `esc:`->`vent:`
-    real (no invocando `_run_analysis` directo)."""
+    real (no invocando `_run_analysis` directo). `esc:` también chequea el
+    rate-limiter (ampliación posterior, cierre completo del nice-to-have de
+    `security`) -- cada ciclo `esc:`->`vent:` consume 2 unidades del cupo
+    compartido, no 1."""
     invocaciones = {"n": 0}
 
     async def counting_fetch(ticker, clients_arg, perfil, **kwargs):
@@ -1990,14 +2013,16 @@ async def test_rate_limit_via_cadena_esc_vent_real_no_solo_handler_vent(
 
     monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", counting_fetch)
 
-    rate_limiter = CountingRateLimiter(max_requests=1)
+    rate_limiter = CountingRateLimiter(max_requests=2)
     clients = _empty_clients()
     handlers = query_handler.build_query_handlers(conn_factory, clients, rate_limiter)
 
-    # Primer ciclo esc->vent: consume el único cupo disponible.
+    # Primer ciclo esc->vent: consume las 2 unidades de cupo disponibles
+    # (1 en esc:, 1 en vent:) -- el análisis se dispara.
     query_esc1, query_vent1 = await _drive_esc_vent(handlers, "NVDA")
-    # Segundo ciclo esc->vent: el `esc:` no consume cupo (no llama al rate
-    # limiter), pero el `vent:` sí -- ya no queda cupo.
+    # Segundo ciclo esc->vent: ya no queda cupo -- tanto esc: como vent:
+    # reciben RATE_LIMITED_MSG, y `fetch_and_analyze_parts` no se vuelve a
+    # invocar.
     query_esc2, query_vent2 = await _drive_esc_vent(handlers, "NVDA")
 
     assert invocaciones["n"] == 1
@@ -2034,6 +2059,44 @@ async def test_rate_limit_compartido_entre_handle_text_y_vent(adobe_fixtures, co
 
     _, query_vent = await _drive_esc_vent(handlers, "ADBE")
     args, _ = query_vent.edit_message_text.call_args
+    assert args[0] == query_handler.RATE_LIMITED_MSG
+
+
+async def test_rate_limit_tk_repetido_11_veces_la_11_rechazada(conn_factory):
+    """Ampliación posterior (cierre completo del nice-to-have de `security`,
+    no bloqueante en la spec original pero implementado igual): tocar el
+    mismo botón `tk:` 11 veces en menos de 60 segundos -> las primeras 10
+    encadenan a la pregunta de escenario, la 11ª responde `RATE_LIMITED_MSG`
+    sin siquiera llegar a preguntar el escenario."""
+    rate_limiter = CountingRateLimiter(max_requests=10)
+    clients = _empty_clients()
+    handlers = query_handler.build_query_handlers(conn_factory, clients, rate_limiter)
+    handle_disambiguation = handlers[1].callback
+
+    last_query = None
+    for _ in range(11):
+        update, query = _fake_callback_update("tk:ADBE")
+        await handle_disambiguation(update, context=SimpleNamespace())
+        last_query = query
+
+    args, _ = last_query.edit_message_text.call_args
+    assert args[0] == query_handler.RATE_LIMITED_MSG
+
+
+async def test_rate_limit_esc_repetido_11_veces_la_11_rechazada(conn_factory):
+    """Mismo criterio que `tk:` arriba, ahora para `esc:`."""
+    rate_limiter = CountingRateLimiter(max_requests=10)
+    clients = _empty_clients()
+    handlers = query_handler.build_query_handlers(conn_factory, clients, rate_limiter)
+    handle_escenario = handlers[2].callback
+
+    last_query = None
+    for _ in range(11):
+        update, query = _fake_callback_update("esc:ADBE:conservador")
+        await handle_escenario(update, context=SimpleNamespace())
+        last_query = query
+
+    args, _ = last_query.edit_message_text.call_args
     assert args[0] == query_handler.RATE_LIMITED_MSG
 
 

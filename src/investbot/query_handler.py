@@ -541,6 +541,7 @@ async def fetch_and_analyze_parts(
         vix=vix_dict,
         corporate_events=corporate_events_list,
         escenario_elegido=escenario_elegido,
+        balance_sheet_fuente=balance_fuente,
     )
 
 
@@ -776,6 +777,16 @@ def build_query_handlers(
     async def handle_disambiguation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
+
+        # Nice-to-have de `security` (no bloqueante, implementado igual):
+        # mismo choke-point de rate-limit que `handle_text`/`_run_analysis`,
+        # cerrando el gap pre-existente de `tk:` (que antes de esto no
+        # chequeaba rate-limit en absoluto).
+        chat_key = str(update.effective_chat.id)
+        if not rate_limiter.allow(chat_key):
+            await query.edit_message_text(RATE_LIMITED_MSG)
+            return
+
         parts = query.data.split(":", 1)
         ticker_raw = parts[1] if len(parts) == 2 else ""
         ticker = _parse_ticker_from_callback(ticker_raw)
@@ -794,6 +805,15 @@ def build_query_handlers(
     async def handle_escenario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
+
+        # Mismo nice-to-have que `handle_disambiguation` arriba — no
+        # bloqueante según `security`, pero barato de cerrar del todo ahora
+        # que `tk:` ya lo tiene.
+        chat_key = str(update.effective_chat.id)
+        if not rate_limiter.allow(chat_key):
+            await query.edit_message_text(RATE_LIMITED_MSG)
+            return
+
         parts = query.data.split(":")
         if len(parts) != 3:
             logger.warning(

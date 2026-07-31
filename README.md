@@ -81,7 +81,7 @@ hasta 3 llamadas extra solo en el peor caso (las 3 fallan a la vez):
 |---|---|---|---|
 | Datos propios del ticker | **6** | **9** | `/quote`, `/profile`, `/income-statement` (trimestral, TTM + historial), `/balance-sheet-statement` (trimestral), `/cash-flow-statement` (trimestral, TTM + historial), `/key-metrics` |
 | Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | 0-1 | `/search` |
-| Peers para el modelo de Múltiplos | 3-5 | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector |
+| Peers para el modelo de Múltiplos | 3-5 | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector. **Nota:** si de esos candidatos consultados menos de `MIN_PEERS_VALIDOS_PARA_MULTIPLOS` (2) devuelven un PER válido esta consulta, el modelo de Múltiplos se excluye directamente del promedio de Valor Justo Total (mismo tratamiento que el resto de exclusiones de datos insuficientes) — no se muestra un número calculado con una muestra de 1 solo peer, que podría no ser representativo del negocio (`SDD_calidad_peers_multiplos.md`). No agrega ninguna llamada adicional: el chequeo es sobre datos ya obtenidos. |
 | Contexto de mercado (VIX, no depende del ticker consultado) | 1 | 1 | `/quote (symbol=^VIX)` |
 | **Total por consulta completa** | **10-13** | **13-16** | |
 

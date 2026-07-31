@@ -1108,3 +1108,230 @@ def test_compute_valuation_scenarios_fcf_base_no_afecta_el_g_fcf_medido():
     assert con_fcf_base.conservador.valor_justo_dcf == pytest.approx(
         sin_fcf_base.conservador.valor_justo_dcf * 3
     )
+
+
+# ---------------------------------------------------------------------------
+# SDD_calidad_peers_multiplos.md — MIN_PEERS_VALIDOS_PARA_MULTIPLOS: caso
+# real ADBE/PLTR (1 solo peer válido con PER extremo inflaba el promedio).
+# ---------------------------------------------------------------------------
+
+
+def _peer_average_n_peers(n: int, per: float = 20.0) -> peers.PeerAverageResult:
+    """`PeerAverageResult` sintético con `n` peers válidos, todos con el
+    mismo PER (para no introducir ruido de rango en tests que solo quieren
+    variar la cantidad de peers)."""
+    tickers = [f"PEER{i}" for i in range(n)]
+    return peers.PeerAverageResult(
+        per_promedio=per, per_minimo=per, per_maximo=per, peers_usados=tickers
+    )
+
+
+def test_valuation_scenarios_multiplos_excluido_con_un_peer_valido_min_menos_1():
+    """Caso real reportado (ADBE/PLTR): 1 solo peer válido (MIN-1, con
+    MIN=2) -> Múltiplos excluido con motivo "peers_validos_insuficientes",
+    `valor_justo_multiplos is None` en los 3 escenarios."""
+    peer_average = _peer_average_n_peers(1, per=259.2)  # PER extremo tipo PLTR
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert motivos_base.get("multiplos") == "peers_validos_insuficientes"
+    for escenario in (scenarios.pesimista, scenarios.conservador, scenarios.optimista):
+        assert escenario.valor_justo_multiplos is None
+        motivos = {m.modelo: m.motivo for m in escenario.modelos_excluidos}
+        assert motivos.get("multiplos") == "peers_validos_insuficientes"
+
+
+def test_valuation_scenarios_multiplos_incluido_con_exactamente_el_minimo():
+    """Borde exacto: `len(peers_usados) == MIN_PEERS_VALIDOS_PARA_MULTIPLOS`
+    (2) -> Múltiplos se calcula normalmente, no se excluye."""
+    peer_average = _peer_average_n_peers(valuation.MIN_PEERS_VALIDOS_PARA_MULTIPLOS)
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert "multiplos" not in motivos_base
+    assert scenarios.conservador.valor_justo_multiplos is not None
+
+
+def test_valuation_scenarios_multiplos_incluido_con_minimo_mas_uno():
+    """Un peer por encima del mínimo (3, con MIN=2) también incluye
+    Múltiplos normalmente — aislado del fixture de Adobe (que también tiene
+    3 peers, pero no aísla este borde específico)."""
+    peer_average = _peer_average_n_peers(valuation.MIN_PEERS_VALIDOS_PARA_MULTIPLOS + 1)
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert "multiplos" not in motivos_base
+    assert scenarios.conservador.valor_justo_multiplos is not None
+
+
+def test_valuation_scenarios_cero_peers_sigue_siendo_per_peers_no_disponible():
+    """0 peers válidos (`per_promedio is None`) sigue devolviendo
+    `"per_peers_no_disponible"`, NUNCA `"peers_validos_insuficientes"` — son
+    2 motivos distintos, ya comunicados distinto hoy. Regresión explícita
+    sobre `test_valuation_scenarios_multiplos_nivel1_sin_peers_validos`, que
+    no se modifica (ver test existente más arriba en este archivo) — este es
+    un test adicional que documenta la garantía de forma explícita e
+    independiente."""
+    peer_average = peers.PeerAverageResult(
+        per_promedio=None, per_minimo=None, per_maximo=None, peers_usados=[]
+    )
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert motivos_base.get("multiplos") == "per_peers_no_disponible"
+    assert motivos_base.get("multiplos") != "peers_validos_insuficientes"
+    # Invariante documentado (peers.py garantiza per_promedio is None si y
+    # solo si peers_usados == []) — el nuevo `elif` de MIN_PEERS_VALIDOS_
+    # PARA_MULTIPLOS nunca es alcanzable con 0 peers, porque el `elif`
+    # anterior (per_promedio is None) ya lo atrapa antes en el if/elif.
+    assert peer_average.per_promedio is None and peer_average.peers_usados == []
+
+
+def test_valuation_scenarios_precedencia_eps_no_positivo_sobre_peers_insuficientes():
+    """`eps_ttm<=0` tiene prioridad sobre "pocos peers" (1, por debajo del
+    mínimo) en el orden del if/elif — motivo sigue siendo
+    `"eps_ttm_no_positivo"`, nunca `"peers_validos_insuficientes"`. Test con
+    nombre propio, no delegado a un fixture escrito para otro propósito."""
+    peer_average = _peer_average_n_peers(1)
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=-1.0,  # invalida Múltiplos antes de llegar a evaluar peers
+        eps_historial=[-1.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert motivos_base.get("multiplos") == "eps_ttm_no_positivo"
+
+
+def test_valuation_scenarios_precedencia_eps_no_positivo_sobre_cero_peers():
+    """Mismo criterio que el test anterior, ahora con 0 peers válidos (no
+    "pocos-pero-no-cero") — combinación de mayor riesgo de que un reordenado
+    accidental del if/elif cambie cuál motivo gana, porque acá ni siquiera
+    se llega a evaluar `per_promedio is None`."""
+    peer_average = peers.PeerAverageResult(
+        per_promedio=None, per_minimo=None, per_maximo=None, peers_usados=[]
+    )
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=-1.0,
+        eps_historial=[-1.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    motivos_base = {m.modelo: m.motivo for m in scenarios.modelos_excluidos_base}
+    assert motivos_base.get("multiplos") == "eps_ttm_no_positivo"
+    assert motivos_base.get("multiplos") != "per_peers_no_disponible"
+    assert motivos_base.get("multiplos") != "peers_validos_insuficientes"
+
+
+def test_compute_valuation_n_peers_validos_default_none_regresion_byte_a_byte():
+    """Mismo patrón ya establecido en este archivo para `periodos_por_anio_*`/
+    `fcf_base` (SDD_eps_ttm_real.md, Decisión #13) — ahora para
+    `n_peers_validos`: con default `None` (nadie lo pasa), el resultado es
+    byte a byte idéntico al de antes de esta spec."""
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    sin_params_nuevos = valuation.compute_valuation(**kwargs)
+    con_none_explicito = valuation.compute_valuation(n_peers_validos=None, **kwargs)
+    assert sin_params_nuevos.as_dict() == con_none_explicito.as_dict()
+
+
+def test_compute_valuation_n_peers_validos_por_debajo_del_minimo_excluye_multiplos():
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=259.2,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    result = valuation.compute_valuation(
+        n_peers_validos=valuation.MIN_PEERS_VALIDOS_PARA_MULTIPLOS - 1, **kwargs
+    )
+    assert result.valor_justo_multiplos is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("multiplos") == "peers_validos_insuficientes"
+
+
+def test_compute_valuation_n_peers_validos_exactamente_el_minimo_incluye_multiplos():
+    """Borde superior propio de `compute_valuation` (no solo el de
+    `compute_valuation_scenarios`) — con `n_peers_validos` exactamente en el
+    mínimo, Múltiplos se calcula normalmente."""
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    result = valuation.compute_valuation(
+        n_peers_validos=valuation.MIN_PEERS_VALIDOS_PARA_MULTIPLOS, **kwargs
+    )
+    assert result.valor_justo_multiplos is not None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert "multiplos" not in motivos
+
+
+def test_compute_valuation_n_peers_validos_cero_explicito_excluye_sin_caso_especial():
+    """`n_peers_validos=0` explícito (no `None`) con `per_promedio_peers`
+    no-`None` — caso sintético imposible en producción (ver invariante de
+    `peers.py`: `per_promedio is None` si y solo si `peers_usados == []`),
+    pero la firma de la función lo permite construir a mano. Debe devolver
+    `"peers_validos_insuficientes"` igual que cualquier valor `< MIN`, sin
+    excepción ni comportamiento especial para `0`."""
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=15.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    result = valuation.compute_valuation(n_peers_validos=0, **kwargs)
+    assert result.valor_justo_multiplos is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("multiplos") == "peers_validos_insuficientes"
