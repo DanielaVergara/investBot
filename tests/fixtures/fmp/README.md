@@ -23,3 +23,22 @@ documentado en el reporte de cierre de `implementer`).
 - `402_generic_payment_required.json` — **Origen: sintético**, `{"error":
   "Payment Required"}` — representa un 402 genérico no reconocido (regresión
   explícita: no debe activar el mensaje de "símbolo premium").
+- `income_statement_quarterly_nvda_real.json` — **Origen: real**, capturado
+  con `curl` contra `/income-statement?symbol=NVDA&period=quarter&limit=4`
+  el 2026-07-31. Confirma que `period="quarter"` **sí está disponible en el
+  plan gratuito** (sin 402) y que los nombres de campo (`netIncome`, `eps`,
+  `epsDiluted`, `weightedAverageShsOut(Dil)`, `period`, `fiscalYear`) son
+  idénticos a los de la respuesta anual — usado para verificar los supuestos
+  de `SDD_eps_ttm_real.md`.
+- `balance_sheet_quarterly_nvda_real.json` — **Origen: real**, capturado con
+  `curl` contra `/balance-sheet-statement?symbol=NVDA&period=quarter&limit=4`
+  el 2026-07-31. Confirma `period="quarter"` disponible en el plan gratuito
+  para este endpoint también (sin 402); campos (`totalCurrentAssets`,
+  `totalCurrentLiabilities`, `shortTermDebt`, `longTermDebt`, etc.)
+  idénticos a la respuesta anual.
+- `cash_flow_quarterly_nvda_real.json` — **Origen: real**, capturado con
+  `curl` contra `/cash-flow-statement?symbol=NVDA&period=quarter&limit=4`
+  el 2026-07-31. Confirma `period="quarter"` disponible en el plan gratuito
+  para este endpoint también (sin 402); campos (`operatingCashFlow`,
+  `capitalExpenditure`, `freeCashFlow`, `netIncome`) idénticos a la
+  respuesta anual.

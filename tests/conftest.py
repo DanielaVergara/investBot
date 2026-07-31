@@ -34,6 +34,21 @@ def adobe_fixtures():
         "fred_dgs20": load_fixture("adobe", "fred_dgs20.json"),
         "key_metrics_own": load_fixture("adobe", "key_metrics_own.json"),
         "quote_vix": load_fixture("adobe", "quote_vix.json"),
+        # SDD_eps_ttm_real.md — fixtures reales de NVDA (4 trimestres,
+        # `period=quarter`), usadas por `_adobe_router` (tests/test_query_
+        # handler.py) para servir el camino feliz trimestral cuando
+        # `symbol=NVDA`. Origen: real (`curl` 2026-07-31, ver
+        # tests/fixtures/fmp/README.md) — no confundir con los demás valores
+        # de este fixture, que siguen siendo sintéticos calibrados para ADBE.
+        "income_statement_quarterly_nvda": load_fixture(
+            "fmp", "income_statement_quarterly_nvda_real.json"
+        ),
+        "balance_sheet_quarterly_nvda": load_fixture(
+            "fmp", "balance_sheet_quarterly_nvda_real.json"
+        ),
+        "cash_flow_quarterly_nvda": load_fixture(
+            "fmp", "cash_flow_quarterly_nvda_real.json"
+        ),
     }
 
 

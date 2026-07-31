@@ -33,11 +33,22 @@ requests, solo la forma de la URL.
 Endpoints de datos crudos usados (todos gratuitos):
 - `/quote`
 - `/profile` (sector, beta, market cap)
-- `/income-statement` (anual, ≥5 años ideal, mínimo 3 años para CAGR — ver B2)
-- `/balance-sheet-statement` (anual)
-- `/cash-flow-statement` (anual)
+- `/income-statement` — **trimestral primero** (`period=quarter`), con
+  fallback anual condicional si la trimestral falla o resulta insuficiente
+  (ver "EPS TTM real y datos trimestrales" más abajo).
+- `/balance-sheet-statement` — **trimestral primero** (snapshot del trimestre
+  más reciente, `limit=1`), con el mismo fallback anual condicional.
+- `/cash-flow-statement` — **trimestral primero**, con el mismo fallback
+  anual condicional.
 - `/key-metrics` (anual — usado también para el PER de peers, ver más abajo)
 - `/search-symbol` (resolución nombre → ticker)
+
+Los 3 endpoints trimestrales están **confirmados con `curl` real** contra el
+plan gratuito (`period=quarter`, sin 402) — ver
+`tests/fixtures/fmp/README.md`. El fallback anual (idéntico al
+comportamiento del bot antes de esta migración) sigue existiendo como red de
+seguridad ante un fallo puntual (rate limit, timeout, cambio de política de
+FMP), no porque haya quedado ninguna duda de disponibilidad.
 
 **Nunca se depende de** `/dcf`, `/sector-pe-ratio` ni `/treasury-rates`
 (endpoints precalculados del tier pago/premium, disponibilidad gratuita no
@@ -59,19 +70,79 @@ lugar:
 
 ### Presupuesto de requests por consulta
 
-| Llamada | Cantidad | Endpoint |
-|---|---|---|
-| Datos propios del ticker | 6 | `/quote`, `/profile`, `/income-statement`, `/balance-sheet-statement`, `/cash-flow-statement`, `/key-metrics` |
-| Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | `/search` |
-| Peers para el modelo de Múltiplos | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector |
-| Contexto de mercado (VIX, no depende del ticker consultado) | 1 | `/quote (symbol=^VIX)` |
-| **Total por consulta completa** | **10-13** | |
+`/income-statement`, `/balance-sheet-statement` y `/cash-flow-statement`
+pasaron de "1 llamada anual fija" a "1 llamada trimestral primaria, con
+fallback condicional a la llamada anual de siempre solo si la trimestral
+falla o resulta insuficiente" — el presupuesto **no aumenta en el camino
+feliz** (las 3 fuentes trimestrales responden con datos suficientes), y sube
+hasta 3 llamadas extra solo en el peor caso (las 3 fallan a la vez):
 
-Con 250 requests/día, el bot soporta **entre ~19 y ~25 consultas completas de
-empresa por día** — muy por encima del uso esperado de un solo usuario con
-consultas esporádicas. No hay caché ni rate-limit adicional a nivel de
-aplicación más allá de un límite defensivo de 10 consultas/minuto (protección
-contra bugs propios, no un límite de negocio).
+| Llamada | Cantidad (camino típico) | Cantidad (peor caso — las 3 fuentes trimestrales fallan) | Endpoint |
+|---|---|---|---|
+| Datos propios del ticker | **6** | **9** | `/quote`, `/profile`, `/income-statement` (trimestral, TTM + historial), `/balance-sheet-statement` (trimestral), `/cash-flow-statement` (trimestral, TTM + historial), `/key-metrics` |
+| Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | 0-1 | `/search` |
+| Peers para el modelo de Múltiplos | 3-5 | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector |
+| Contexto de mercado (VIX, no depende del ticker consultado) | 1 | 1 | `/quote (symbol=^VIX)` |
+| **Total por consulta completa** | **10-13** | **13-16** | |
+
+En el caso típico (las 3 fuentes trimestrales responden), el presupuesto de
+requests no cambia respecto a la versión anterior del bot: 10-13 por
+consulta, **~19 a ~25 consultas/día** con 250 requests/día. En el peor caso
+(FMP deja de servir `period=quarter` para alguno de los 3 endpoints propios
+del ticker de forma simultánea, algo no observado en producción hasta la
+fecha), sube a 13-16 por consulta, **~15 a ~19 consultas/día** — sigue muy
+por encima del uso esperado de un único usuario.
+
+No hay caché ni rate-limit adicional a nivel de aplicación más allá de un
+límite defensivo de 10 consultas/minuto (protección contra bugs propios, no
+un límite de negocio) — este límite ahora se chequea en el único
+choke-point real que dispara un análisis completo (`_run_analysis`,
+independientemente de si la consulta llegó por texto libre o por el botón
+final del flujo interactivo, ver más abajo).
+
+### EPS TTM real y datos trimestrales (income-statement/balance-sheet/cash-flow)
+
+El bot deriva `EPS (TTM)`, el ratio P/S, el margen bruto y los inputs del
+WACC de una suma de los **últimos 4 trimestres reales** (`period=quarter`)
+en vez de un solo reporte anual — un EPS/PER "desactualizado" según el año
+fiscal más reciente ya no es posible mientras la fuente trimestral esté
+disponible. Los pilares de crecimiento (ingresos/utilidades) y el CAGR de
+Graham/DCF también usan la serie trimestral cruda (no un TTM móvil) cuando
+está disponible, con la ventana de historial (12 o 20 trimestres) elegida
+por vos en cada consulta — ver el flujo de botones más abajo.
+
+Detalles técnicos (para quien audite el código, no necesarios para usar el
+bot):
+- **P/S y el costo de la deuda (Kd) del WACC siempre usan cifras TTM**, nunca
+  un solo trimestre suelto — de lo contrario saldrían ~4x distorsionados
+  (un stock de balance combinado con el flujo de un solo trimestre no
+  produce una tasa/ratio anual coherente).
+- El **FCF que ancla la proyección del DCF a 5 años es el FCF TTM** (suma de
+  los últimos 4 trimestres) — el CAGR que mide la *tendencia* del FCF sigue
+  midiéndose sobre el historial crudo (nivel y tendencia son 2 preguntas
+  distintas).
+- **Diseño atómico por endpoint**: si algún campo de los 4 trimestres más
+  recientes de un endpoint no es válido, ese endpoint completo cae al
+  fallback anual de siempre — nunca se mezclan campos trimestrales y
+  anuales dentro del mismo cálculo.
+- **Riesgo de estacionalidad aceptado**: comparar 2 trimestres crudos (en
+  vez de una serie de TTM móvil) puede heredar ruido estacional en los
+  pilares de crecimiento/CAGR — riesgo conocido y aceptado, no resuelto en
+  esta versión.
+
+### Escenario de Valor Justo y ventana de historial — elección por consulta
+
+Cada consulta de ticker pregunta, con botones inline, **qué escenario de
+Valor Justo mostrar resaltado** (Pesimista / Conservador / Optimista — los 3
+siempre se calculan y se muestran, la elección solo resalta uno) y **cuánto
+historial trimestral usar** (Corto plazo = 12 trimestres/3 años, Largo plazo
+= 20 trimestres/5 años) antes de correr el análisis completo. Es un flujo
+sin estado de servidor (todo viaja codificado en los botones) — elegir un
+escenario no cuesta ningún request adicional; elegir la ventana sí determina
+el `limit=` real de las 3 llamadas trimestrales de esa consulta puntual. El
+pilar "Precio razonable" del checklist de buena empresa siempre se evalúa
+contra el escenario Conservador, sin importar qué botón hayas apretado —
+es una vara estable entre consultas, no cambia según tu elección de esa vez.
 
 **Peers dinámicos (Finnhub) y eventos corporativos (SEC EDGAR) son
 proveedores completamente aparte** — ninguna de las 2 features nuevas

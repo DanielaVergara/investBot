@@ -816,3 +816,295 @@ def test_valuation_adobe_scenarios(adobe_fixtures):
     assert _within_tolerance(scenarios.pesimista.valor_justo_total, 420.43)
     assert _within_tolerance(scenarios.conservador.valor_justo_total, 500.82)
     assert _within_tolerance(scenarios.optimista.valor_justo_total, 588.71)
+
+
+# ---------------------------------------------------------------------------
+# SDD_eps_ttm_real.md — Decisión #13/#14: periodos_por_anio_eps/_fcf, fcf_base,
+# calculate_dcf_fair_value(fcf_base_override, periodos_por_anio).
+# ---------------------------------------------------------------------------
+
+
+def test_calculate_cagr_n_anios_float_no_entero():
+    """n_años fraccionario (ej. 11/4=2.75) produce el mismo resultado que
+    calcularlo a mano — no solo enteros disfrazados de float (8.0)."""
+    resultado = valuation.calculate_cagr(valor_reciente=8, valor_antiguo=5, n_años=2.75)
+    esperado = (8 / 5) ** (1 / 2.75) - 1
+    assert resultado == pytest.approx(esperado)
+
+
+def test_calculate_cagr_piso_con_float_2_75_pasa():
+    """2.75 >= CAGR_MIN_N_AÑOS (2) — el piso se compara correctamente con float."""
+    resultado = valuation.calculate_cagr(valor_reciente=8, valor_antiguo=5, n_años=2.75)
+    assert resultado is not None
+
+
+def test_calculate_cagr_piso_con_float_menor_a_2_none():
+    resultado = valuation.calculate_cagr(valor_reciente=8, valor_antiguo=5, n_años=1.75)
+    assert resultado is None
+
+
+def test_calculate_dcf_fair_value_periodos_por_anio_default_regresion_byte_a_byte():
+    """`periodos_por_anio=1` (default, nadie lo pasa) reproduce exactamente
+    el comportamiento de antes de esta spec."""
+    fcf_historial = [100.0, 108.0, 116.64, 125.9712, 136.048896]
+    wacc = 0.12
+    con_default_explicito = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+        periodos_por_anio=1,
+    )
+    sin_pasar_el_parametro = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+    )
+    assert con_default_explicito == sin_pasar_el_parametro
+
+
+def test_calculate_dcf_fair_value_fcf_base_override_none_regresion_byte_a_byte():
+    """`fcf_base_override=None` (default) — usa `fcf_historial[-1]` como
+    ancla de la proyección, comportamiento idéntico al de antes de esta spec."""
+    fcf_historial = [100.0, 108.0, 116.64, 125.9712, 136.048896]
+    wacc = 0.12
+    con_none_explicito = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+        fcf_base_override=None,
+    )
+    sin_pasar_el_parametro = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+    )
+    assert con_none_explicito == sin_pasar_el_parametro
+
+
+def test_calculate_dcf_fair_value_fcf_base_override_cambia_la_proyeccion():
+    """Un `fcf_base_override` distinto de `fcf_historial[-1]` hace arrancar
+    la proyección desde ese valor, no desde el último punto crudo — el
+    resultado cambia de forma predecible (proporcional al ancla, mismo g_fcf
+    y wacc)."""
+    fcf_historial = [100.0, 108.0, 116.64, 125.9712, 136.048896]
+    wacc = 0.12
+    sin_override = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+    )
+    fcf_base = fcf_historial[-1] * 2  # ancla del doble
+    con_override = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+        fcf_base_override=fcf_base,
+    )
+    assert con_override is not None and sin_override is not None
+    assert con_override == pytest.approx(sin_override * 2)
+
+
+def test_calculate_dcf_fair_value_g_fcf_se_mide_sobre_crudo_no_sobre_fcf_base():
+    """El CAGR (g_fcf) sigue calculándose sobre fcf_historial[0]/[-1]
+    (valores crudos), nunca sobre `fcf_base_override` — test que los
+    distingue: pasar un `fcf_base_override` absurdo no cambia el `g_fcf`
+    usado (verificable comparando contra `g_fcf_override` explícito calculado
+    a mano desde el historial crudo)."""
+    fcf_historial = [100.0, 108.0, 116.64, 125.9712, 136.048896]  # CAGR=8% exacto
+    wacc = 0.12
+    g_fcf_esperado = valuation.calculate_cagr(fcf_historial[-1], fcf_historial[0], 4)
+
+    con_fcf_base_absurdo = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+        fcf_base_override=1.0,  # ancla de nivel absurdamente chica
+    )
+    con_g_fcf_override_explicito = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
+        fcf_base_override=1.0, g_fcf_override=g_fcf_esperado,
+    )
+    # Si `g_fcf` se calculara sobre `fcf_base_override` (bug), estos 2
+    # resultados diferirían -- al medirse siempre sobre el historial crudo,
+    # son idénticos.
+    assert con_fcf_base_absurdo == pytest.approx(con_g_fcf_override_explicito)
+
+
+def test_calculate_dcf_fair_value_periodos_por_anio_4_piso_8_elementos_rechaza():
+    """Con `periodos_por_anio=4`, el piso mínimo de longitud pasa de 3 a
+    9 elementos ((CAGR_MIN_N_AÑOS * 4) + 1) — 8 elementos no alcanza."""
+    fcf_historial = [100.0 + i * 5 for i in range(8)]
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=0.12, shares_outstanding=1000,
+        periodos_por_anio=4,
+    )
+    assert resultado is None
+
+
+def test_calculate_dcf_fair_value_periodos_por_anio_4_piso_9_elementos_acepta():
+    fcf_historial = [100.0 + i * 5 for i in range(9)]
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=0.12, shares_outstanding=1000,
+        periodos_por_anio=4,
+    )
+    assert resultado is not None
+
+
+def test_compute_valuation_defaults_regresion_byte_a_byte():
+    """`periodos_por_anio_eps`/`periodos_por_anio_fcf`/`fcf_base` no pasados
+    (default `1`/`1`/`None`) → mismo resultado, byte a byte, que antes de
+    esta spec (comparado contra el mismo llamado con los defaults
+    explícitos)."""
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    sin_params_nuevos = valuation.compute_valuation(**kwargs)
+    con_defaults_explicitos = valuation.compute_valuation(
+        periodos_por_anio_eps=1, periodos_por_anio_fcf=1, fcf_base=None, **kwargs
+    )
+    assert sin_params_nuevos.as_dict() == con_defaults_explicitos.as_dict()
+
+
+def test_compute_valuation_periodos_por_anio_eps_4_nueve_elementos_n_anios_2():
+    """`periodos_por_anio_eps=4` con `eps_historial` de 9 elementos
+    trimestrales → CAGR de Graham calculado con `n_años=2.0`, no con
+    `n_años=8` — verificado comparando contra `calculate_cagr` invocado
+    directamente con `n_años=2.0`."""
+    eps_historial = [1.0 + i * 0.1 for i in range(9)]  # 9 trimestres
+    result = valuation.compute_valuation(
+        eps_ttm=eps_historial[-1] * 4,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    g_esperado = valuation.calculate_cagr(eps_historial[-1], eps_historial[0], 2.0)
+    esperado_graham = valuation.calculate_graham_fair_value(
+        eps_historial[-1] * 4, g_esperado, 0.044
+    )
+    assert result.valor_justo_graham == pytest.approx(esperado_graham)
+
+
+def test_compute_valuation_periodos_por_anio_eps_4_ocho_elementos_historial_insuficiente():
+    """8 elementos trimestrales -> n_años=7/4=1.75 < CAGR_MIN_N_AÑOS (2) ->
+    CAGR None, motivo historial_insuficiente — borde exacto complementario
+    al de 9 elementos."""
+    eps_historial = [1.0 + i * 0.1 for i in range(8)]
+    result = valuation.compute_valuation(
+        eps_ttm=eps_historial[-1] * 4,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    assert result.valor_justo_graham is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("graham") == "historial_insuficiente"
+
+
+def test_compute_valuation_menos_de_9_elementos_cagr_none_igual_que_menos_de_3_anuales():
+    """Menos de 9 elementos con `periodos_por_anio_eps=4` produce el mismo
+    tipo de exclusión (`historial_insuficiente`) que menos de 3 años con
+    datos anuales — mismo criterio, distinta cadencia."""
+    eps_historial = [1.0, 1.1, 1.2]  # 3 trimestres
+    result = valuation.compute_valuation(
+        eps_ttm=1.2 * 4,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    assert result.valor_justo_graham is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("graham") == "historial_insuficiente"
+
+
+def test_compute_valuation_fcf_base_distinto_de_ultimo_crudo_cambia_dcf():
+    """`fcf_base` (FCF TTM) distinto del último punto crudo de
+    `fcf_historial` cambia el `valor_justo_dcf` resultante de forma
+    predecible (mismo mecanismo que `calculate_dcf_fair_value` probado
+    arriba, ahora a través de `compute_valuation`)."""
+    fcf_historial = [80.0, 90.0, 100.0, 110.0, 120.0]
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=fcf_historial,
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    sin_fcf_base = valuation.compute_valuation(**kwargs)
+    con_fcf_base = valuation.compute_valuation(fcf_base=fcf_historial[-1] * 2, **kwargs)
+    assert sin_fcf_base.valor_justo_dcf is not None
+    assert con_fcf_base.valor_justo_dcf is not None
+    assert con_fcf_base.valor_justo_dcf == pytest.approx(sin_fcf_base.valor_justo_dcf * 2)
+
+
+def test_compute_valuation_scenarios_defaults_regresion_byte_a_byte():
+    peer_average = peers.PeerAverageResult(
+        per_promedio=15.0, per_minimo=13.0, per_maximo=17.0, peers_usados=["MSFT", "ORCL"]
+    )
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    sin_params_nuevos = valuation.compute_valuation_scenarios(**kwargs)
+    con_defaults_explicitos = valuation.compute_valuation_scenarios(
+        periodos_por_anio_eps=1, periodos_por_anio_fcf=1, fcf_base=None, **kwargs
+    )
+    assert sin_params_nuevos.as_dict() == con_defaults_explicitos.as_dict()
+
+
+def test_compute_valuation_scenarios_periodos_por_anio_eps_4_nueve_elementos():
+    """Mismo criterio que `compute_valuation`, ahora sobre
+    `compute_valuation_scenarios` — n_años=2.0 con 9 elementos trimestrales,
+    no n_años=8."""
+    eps_historial = [1.0 + i * 0.1 for i in range(9)]
+    peer_average = peers.PeerAverageResult(
+        per_promedio=15.0, per_minimo=13.0, per_maximo=17.0, peers_usados=["MSFT", "ORCL"]
+    )
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=eps_historial[-1] * 4,
+        eps_historial=eps_historial,
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    assert scenarios.modelos_excluidos_base == []
+    assert scenarios.conservador.valor_justo_graham is not None
+
+
+def test_compute_valuation_scenarios_fcf_base_no_afecta_el_g_fcf_medido():
+    """`fcf_base` cambia el nivel del DCF en los 3 escenarios sin alterar el
+    `g_fcf` medido sobre el historial crudo (mismo criterio que a nivel de
+    `calculate_dcf_fair_value`, ahora orquestado)."""
+    fcf_historial = [80.0, 90.0, 100.0, 110.0, 120.0]
+    peer_average = peers.PeerAverageResult(
+        per_promedio=15.0, per_minimo=13.0, per_maximo=17.0, peers_usados=["MSFT", "ORCL"]
+    )
+    kwargs = dict(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=fcf_historial,
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    sin_fcf_base = valuation.compute_valuation_scenarios(**kwargs)
+    con_fcf_base = valuation.compute_valuation_scenarios(
+        fcf_base=fcf_historial[-1] * 3, **kwargs
+    )
+    assert con_fcf_base.conservador.valor_justo_dcf == pytest.approx(
+        sin_fcf_base.conservador.valor_justo_dcf * 3
+    )

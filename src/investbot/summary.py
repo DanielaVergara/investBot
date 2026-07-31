@@ -36,11 +36,15 @@ MODELO_LABELS_CORTO = {
 
 MOTIVO_LABELS = {
     "eps_ttm_no_positivo": "la empresa tiene EPS (ganancia por acción) negativo o cero",
-    "eps_base_no_positivo": "hace unos años la empresa tenía pérdidas, así que no se puede calcular un crecimiento histórico confiable",
-    "eps_reciente_no_positivo": "el año más reciente la empresa tuvo pérdidas",
-    "fcf_base_no_positivo": "hace unos años el flujo de caja libre era negativo",
-    "fcf_reciente_no_positivo": "el flujo de caja libre más reciente es negativo",
-    "historial_insuficiente": "no hay suficiente historial financiero (menos de 3 años de datos)",
+    # Las 5 entradas de abajo (SDD_eps_ttm_real.md, Decisión #17) usan wording
+    # period-agnóstico: el historial que alimenta pilares/CAGR puede ser
+    # anual o trimestral según qué fuente respondió esta consulta — el texto
+    # ya no asume literalmente "años".
+    "eps_base_no_positivo": "al inicio del historial disponible la empresa tenía pérdidas, así que no se puede calcular un crecimiento histórico confiable",
+    "eps_reciente_no_positivo": "en el período más reciente disponible la empresa tuvo pérdidas",
+    "fcf_base_no_positivo": "al inicio del historial disponible el flujo de caja libre era negativo",
+    "fcf_reciente_no_positivo": "el flujo de caja libre del período más reciente disponible es negativo",
+    "historial_insuficiente": "no hay suficiente historial financiero (se necesitan al menos ~2 años de historia, sea en reportes anuales o trimestrales)",
     "y_no_disponible": "no pude obtener la tasa del bono del tesoro (FRED/Treasury.gov)",
     "wacc_no_calculable": "no se pudo estimar el costo de capital (WACC) con los datos disponibles",
     "dcf_no_calculable": "no se pudo proyectar el flujo de caja con los datos disponibles",
@@ -168,8 +172,26 @@ def _cell(escenario: dict, campo: str) -> str:
     return _fmt_money(value) if value is not None else "N/D"
 
 
+_ESCENARIOS_ORDEN = ("pesimista", "conservador", "optimista")
+_ESCENARIO_TITULOS = {"pesimista": "Pesimista", "conservador": "Conservador", "optimista": "Optimista"}
+
+
+def _escenario_header(nombre_clave: str, escenario_elegido: Optional[str]) -> str:
+    """Título de columna, resaltado si `nombre_clave == escenario_elegido`
+    (`SDD_eps_ttm_real.md`, Decisión #24, ronda 2 — botones inline). Puramente
+    de presentación: no cambia ningún valor calculado, solo qué columna se
+    ve resaltada en el encabezado del rango de Valor Justo."""
+    titulo = _ESCENARIO_TITULOS[nombre_clave]
+    if escenario_elegido == nombre_clave:
+        return f"*{titulo}* ✅"
+    return titulo
+
+
 def build_valuation_scenarios_section(
-    scenarios: dict, precio_actual: float, n_peers_validos: int
+    scenarios: dict,
+    precio_actual: float,
+    n_peers_validos: int,
+    escenario_elegido: Optional[str] = None,
 ) -> str:
     """Sección de "Valor Justo" con rango Pesimista | Conservador | Optimista
     por modelo + total, y clasificación barata/cara por escenario (Spec Patch
@@ -179,6 +201,14 @@ def build_valuation_scenarios_section(
     (`.as_dict()`): claves `pesimista`/`conservador`/`optimista` (cada una un
     dict con `valor_justo_multiplos/graham/dcf/total` + `modelos_excluidos`)
     y `modelos_excluidos_base` (nivel 1, reportado una sola vez).
+
+    `escenario_elegido` (`SDD_eps_ttm_real.md`, Decisión #24 — ronda 2,
+    botones inline): opcional, default `None` (comportamiento idéntico al de
+    antes de la ronda 2 — se muestran los 3 escenarios sin resaltar ninguno).
+    Si viene un valor del set `{"pesimista", "conservador", "optimista"}`,
+    solo resalta visualmente esa columna en el encabezado — nunca oculta los
+    otros 2, nunca cambia ningún valor numérico (los 3 escenarios siempre se
+    calculan los 3, sin importar cuál se resalta).
     """
     pesimista = scenarios["pesimista"]
     conservador = scenarios["conservador"]
@@ -186,7 +216,10 @@ def build_valuation_scenarios_section(
     excluidos_base = scenarios.get("modelos_excluidos_base") or []
     excluidos_base_modelos = {item["modelo"] for item in excluidos_base}
 
-    lines = ["*Rango de Valor Justo estimado (Pesimista | Conservador | Optimista):*"]
+    encabezado = " | ".join(
+        _escenario_header(k, escenario_elegido) for k in _ESCENARIOS_ORDEN
+    )
+    lines = [f"*Rango de Valor Justo estimado ({encabezado}):*"]
     modelos_nivel2_nd: list[tuple[str, str]] = []
 
     for modelo_key, campo in _MODELOS_ORDEN:
@@ -608,6 +641,7 @@ def build_summary_parts(
     extras: Optional[dict] = None,
     vix: Optional[dict] = None,
     corporate_events: Optional[list[dict]] = None,
+    escenario_elegido: Optional[str] = None,
 ) -> list[str]:
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
     y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
@@ -671,7 +705,7 @@ def build_summary_parts(
     extras_section = build_extras_section(extras)
 
     valuation_section = build_valuation_scenarios_section(
-        scenarios, precio_actual, n_peers_validos
+        scenarios, precio_actual, n_peers_validos, escenario_elegido=escenario_elegido
     )
     pillars_section = build_pillars_section(pillars)
     market_context_section = build_market_context_section(
@@ -749,6 +783,7 @@ def build_summary(
     extras: Optional[dict] = None,
     vix: Optional[dict] = None,
     corporate_events: Optional[list[dict]] = None,
+    escenario_elegido: Optional[str] = None,
 ) -> str:
     """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
     puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
@@ -770,5 +805,6 @@ def build_summary(
             extras=extras,
             vix=vix,
             corporate_events=corporate_events,
+            escenario_elegido=escenario_elegido,
         )
     )

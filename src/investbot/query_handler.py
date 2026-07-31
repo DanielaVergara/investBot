@@ -48,6 +48,41 @@ RATE_LIMITED_MSG = "Estás consultando muy rápido — esperá un minuto antes d
 GENERIC_ERROR_MSG = "No pude completar el análisis ahora mismo. Intenta más tarde."
 LOADING_MSG = "🔍 Analizando {ticker}, dame un toque..."
 
+# --- Ventana de trimestres (SDD_eps_ttm_real.md, ronda 1 Decisión #8/#10,
+# supersedida por ronda 2 Decisión #19-24): ya no es una constante de módulo
+# fija — se elige por consulta vía los botones de "¿Cuánto historial?"
+# (`_ask_ventana`). Estos 2 valores son el mismo par que la "Pregunta F" de
+# la ronda 1 ya barajaba (12 = 3 años, 20 = 5 años).
+VENTANA_TRIMESTRES_CORTO = 12
+VENTANA_TRIMESTRES_LARGO = 20
+
+# --- Flujo interactivo de botones inline esc:/vent: (SDD_eps_ttm_real.md,
+# ronda 2, Decisiones #19-24) ---
+ESCENARIOS_VALIDOS = ("pesimista", "conservador", "optimista")
+_ESCENARIO_BUTTON_LABELS = {
+    "pesimista": "Pesimista",
+    "conservador": "Conservador",
+    "optimista": "Optimista",
+}
+_VENTANA_BUTTON_LABELS = {
+    VENTANA_TRIMESTRES_CORTO: "Corto plazo (3 años)",
+    VENTANA_TRIMESTRES_LARGO: "Largo plazo (5 años)",
+}
+_VENTANAS_VALIDAS = {
+    str(VENTANA_TRIMESTRES_CORTO): VENTANA_TRIMESTRES_CORTO,
+    str(VENTANA_TRIMESTRES_LARGO): VENTANA_TRIMESTRES_LARGO,
+}
+
+ASK_ESCENARIO_MSG = "¿Qué escenario querés ver?"
+ASK_VENTANA_MSG = "¿Cuánto historial?"
+INVALID_BUTTON_MSG = "Ese botón ya no es válido, mandá el ticker de nuevo."
+
+# Formato de ticker aceptado dentro de callback_data (Hallazgo 2 de
+# `security`, BLOQUEANTE): mismo criterio de longitud/charset ya usado por
+# los tickers reales de NASDAQ/NYSE — nunca se usa un ticker crudo sin
+# validar embebido en tk:/esc:/vent:.
+_TICKER_CALLBACK_RE = re.compile(r"^[A-Za-z0-9.\-]{1,10}$")
+
 TELEGRAM_MESSAGE_LIMIT = 4096
 # Margen reservado en cada chunk para el prefijo de continuación
 # "_(cont. parte N/M)_\n\n" (Decisión 17.1) — conservador a propósito.
@@ -61,6 +96,18 @@ def sanitize_for_log(text: str) -> str:
     """Remueve saltos de línea/caracteres de control antes de loguear texto libre
     (CWE-117, criterio de `security` sección 4)."""
     return _CONTROL_CHARS_RE.sub(" ", text)
+
+
+def _parse_ticker_from_callback(ticker: str) -> Optional[str]:
+    """Valida el formato del ticker embebido en `tk:`/`esc:`/`vent:`
+    (`SDD_eps_ttm_real.md`, revisión de `security`, Hallazgo 2 — BLOQUEANTE).
+    `None` si no matchea `_TICKER_CALLBACK_RE` — mismo camino que un
+    `callback_data` malformado (el llamador debe responder con
+    `INVALID_BUTTON_MSG` y loguear con `sanitize_for_log`, nunca propagar el
+    valor crudo)."""
+    if not isinstance(ticker, str) or not _TICKER_CALLBACK_RE.fullmatch(ticker):
+        return None
+    return ticker
 
 
 def normalize_query(text: str) -> Optional[str]:
@@ -99,23 +146,102 @@ def _annual_series(statements: list[dict], field: str) -> list[float]:
     return list(reversed(values))
 
 
-async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) -> list[str]:
+async def fetch_and_analyze_parts(
+    ticker: str,
+    clients: Clients,
+    perfil: str,
+    *,
+    escenario_elegido: str = "conservador",
+    ventana_trimestres: int = VENTANA_TRIMESTRES_LARGO,
+) -> list[str]:
     """Trae los datos de un ticker resuelto y arma la respuesta completa,
     devuelta como lista de secciones sin unir (`summary.build_summary_parts`)
     — permite a `_run_analysis` particionar en varios mensajes de Telegram
-    sin cortar a mitad de sección (Decisión 16)."""
+    sin cortar a mitad de sección (Decisión 16).
+
+    `escenario_elegido`/`ventana_trimestres` (`SDD_eps_ttm_real.md`, ronda 2,
+    Decisión #24): keyword-only con default retrocompatible — ningún
+    llamador existente que use la firma posicional de 3 argumentos se rompe.
+    `ventana_trimestres` es el `limit=` real de las llamadas trimestrales de
+    income-statement/cash-flow-statement (Decisiones #8/#10); `escenario_elegido`
+    solo llega hasta `summary.build_summary_parts` para presentación (resalta,
+    no oculta, los 3 escenarios) — no cambia ningún cálculo.
+    """
     quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
     profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
-    income_statements = await fmp_client.get_income_statement(
-        clients.fmp_http, clients.fmp_api_key, ticker
-    )
-    balance_sheets = await fmp_client.get_balance_sheet_statement(
-        clients.fmp_http, clients.fmp_api_key, ticker
-    )
-    cash_flows = await fmp_client.get_cash_flow_statement(
-        clients.fmp_http, clients.fmp_api_key, ticker
-    )
 
+    # --- income-statement: trimestral primario, fallback anual condicional
+    # (Decisión #8/#10) — diseño atómico (rules.calculate_income_statement_ttm):
+    # si el paquete de 4 trimestres no es 100% válido, se cae al camino 100%
+    # anual de siempre, nunca se mezclan campos de fuentes distintas.
+    try:
+        quarterly_income = await fmp_client.get_income_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker,
+            period="quarter", limit=ventana_trimestres,
+        )
+    except fmp_client.FMPError:
+        quarterly_income = []
+
+    income_ttm = rules.calculate_income_statement_ttm(quarterly_income)
+    if income_ttm.disponible:
+        income_statements = quarterly_income
+        income_statements_fuente = rules.DATOS_FUENTE_TRIMESTRAL
+    else:
+        income_statements = await fmp_client.get_income_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker
+        )
+        income_statements_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
+
+    # --- cash-flow-statement: mismo patrón (Decisión #14). La fuente
+    # trimestral se acepta solo si alcanza para un FCF TTM real (>=4
+    # trimestres crudos válidos) — `rules.calculate_fcf_ttm` es la misma
+    # guarda que ya usa el resto de esta spec para "todo o nada por endpoint".
+    try:
+        quarterly_cash_flow = await fmp_client.get_cash_flow_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker,
+            period="quarter", limit=ventana_trimestres,
+        )
+    except fmp_client.FMPError:
+        quarterly_cash_flow = []
+
+    fcf_historial_trimestral = [
+        (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
+        for s in reversed(quarterly_cash_flow)
+    ]
+    fcf_ttm = rules.calculate_fcf_ttm(fcf_historial_trimestral)
+    if fcf_ttm is not None:
+        cash_flows = quarterly_cash_flow
+        cash_flow_fuente = rules.DATOS_FUENTE_TRIMESTRAL
+    else:
+        cash_flows = await fmp_client.get_cash_flow_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker
+        )
+        cash_flow_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
+
+    # --- balance-sheet-statement: snapshot del trimestre más reciente
+    # (Decisión #16) — `limit=1`, no `ventana_trimestres`: no alimenta
+    # ninguna serie de crecimiento ni CAGR, solo liquidez + total_debt del
+    # WACC, igual que hoy solo se usaba `balance_sheets[0]`.
+    try:
+        quarterly_balance = await fmp_client.get_balance_sheet_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker, period="quarter", limit=1
+        )
+    except fmp_client.FMPError:
+        quarterly_balance = []
+
+    if quarterly_balance:
+        balance_sheets = quarterly_balance
+        balance_fuente = rules.DATOS_FUENTE_TRIMESTRAL
+    else:
+        balance_sheets = await fmp_client.get_balance_sheet_statement(
+            clients.fmp_http, clients.fmp_api_key, ticker
+        )
+        balance_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
+
+    # Abort-check preservado en espíritu (Decisión #8): si tanto la
+    # trimestral como el fallback anual de un endpoint fallan/vienen vacíos,
+    # ese hueco de datos participa acá exactamente como participaba la
+    # llamada anual única de antes de esta spec.
     if not quote or not profile or not income_statements or not balance_sheets or not cash_flows:
         return [f"No pude obtener suficientes datos de {ticker} para analizarlo ahora mismo."]
 
@@ -143,20 +269,61 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
     precio_actual = quote.get("price") or profile.get("price")
     market_cap = quote.get("marketCap") or profile.get("marketCap")
 
-    latest_income = income_statements[0]
     latest_balance = balance_sheets[0]
-    net_income = latest_income.get("netIncome")
-    shares_outstanding = latest_income.get("weightedAverageShsOutDil") or latest_income.get(
-        "weightedAverageShsOut"
-    )
-    revenue = latest_income.get("revenue")
-    cost_of_revenue = latest_income.get("costOfRevenue")
     current_assets = latest_balance.get("totalCurrentAssets")
     current_liabilities = latest_balance.get("totalCurrentLiabilities")
 
-    eps_ttm = rules.calculate_eps(net_income, shares_outstanding)
-    if eps_ttm is None:
-        eps_ttm = latest_income.get("eps")
+    # eps_ttm/revenue/cost_of_revenue/shares_outstanding/wacc_inputs/
+    # historiales — TTM real cuando la fuente trimestral está disponible
+    # (Decisión #10/#11: P/S y el Kd del WACC necesitan base TTM, no un solo
+    # trimestre, para no distorsionarse ~4x), fallback anual idéntico al
+    # comportamiento de antes de esta spec en caso contrario.
+    if income_statements_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        eps_ttm = income_ttm.net_income_ttm / income_ttm.shares_outstanding_reciente
+        revenue = income_ttm.revenue_ttm
+        cost_of_revenue = income_ttm.cost_of_revenue_ttm
+        shares_outstanding = income_ttm.shares_outstanding_reciente
+        wacc_interest_expense = income_ttm.interest_expense_ttm
+        wacc_income_tax_expense = income_ttm.income_tax_expense_ttm
+        wacc_income_before_tax = income_ttm.income_before_tax_ttm
+        eps_historial = _annual_series(income_statements, "eps") or _annual_series(
+            income_statements, "netIncome"
+        )
+        revenue_historial = _annual_series(income_statements, "revenue")
+        net_income_historial = _annual_series(income_statements, "netIncome")
+        periodos_por_anio_eps = 4
+    else:
+        latest_income = income_statements[0]
+        net_income = latest_income.get("netIncome")
+        shares_outstanding = latest_income.get("weightedAverageShsOutDil") or latest_income.get(
+            "weightedAverageShsOut"
+        )
+        eps_ttm = rules.calculate_eps(net_income, shares_outstanding)
+        if eps_ttm is None:
+            eps_ttm = latest_income.get("eps")
+        revenue = latest_income.get("revenue")
+        cost_of_revenue = latest_income.get("costOfRevenue")
+        wacc_interest_expense = latest_income.get("interestExpense") or 0.0
+        wacc_income_tax_expense = latest_income.get("incomeTaxExpense") or 0.0
+        wacc_income_before_tax = latest_income.get("incomeBeforeTax") or 0.0
+        eps_historial = _annual_series(income_statements, "eps") or _annual_series(
+            income_statements, "netIncome"
+        )
+        revenue_historial = _annual_series(income_statements, "revenue")
+        net_income_historial = _annual_series(income_statements, "netIncome")
+        periodos_por_anio_eps = 1
+
+    if cash_flow_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        fcf_historial = fcf_historial_trimestral
+        fcf_base = fcf_ttm
+        periodos_por_anio_fcf = 4
+    else:
+        fcf_historial = [
+            (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
+            for s in reversed(cash_flows)
+        ]
+        fcf_base = None
+        periodos_por_anio_fcf = 1
 
     gross_margin = rules.calculate_gross_margin(revenue, cost_of_revenue)
     liquidity = rules.calculate_liquidity_ratio(current_assets, current_liabilities)
@@ -206,22 +373,12 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
     except treasury_client.TreasuryError as exc:
         logger.warning("No se pudo obtener Y — %s", exc)
 
-    eps_historial = _annual_series(income_statements, "eps") or _annual_series(
-        income_statements, "netIncome"
-    )
-    fcf_historial = [
-        (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
-        for s in reversed(cash_flows)
-    ]
-    revenue_historial = _annual_series(income_statements, "revenue")
-    net_income_historial = _annual_series(income_statements, "netIncome")
-
     wacc_inputs = {
-        "interest_expense": latest_income.get("interestExpense") or 0.0,
+        "interest_expense": wacc_interest_expense,
         "total_debt": (latest_balance.get("shortTermDebt") or 0.0)
         + (latest_balance.get("longTermDebt") or 0.0),
-        "income_tax_expense": latest_income.get("incomeTaxExpense") or 0.0,
-        "income_before_tax": latest_income.get("incomeBeforeTax") or 0.0,
+        "income_tax_expense": wacc_income_tax_expense,
+        "income_before_tax": wacc_income_before_tax,
         "beta": beta,
         "market_cap": market_cap or 0.0,
     }
@@ -232,6 +389,12 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
     # campo a campo idéntico a lo que devolvía `compute_valuation(...)` antes
     # de este patch (sigue existiendo sin cambios, pero ya no hace falta
     # llamarla aparte: sería recalcular lo mismo).
+    #
+    # `periodos_por_anio_eps`/`periodos_por_anio_fcf`/`fcf_base`
+    # (`SDD_eps_ttm_real.md`, Decisión #13/#14): 4/4/FCF TTM cuando la fuente
+    # respectiva es trimestral, 1/1/None (comportamiento anual de siempre)
+    # en caso contrario — corrige el `n_años` del CAGR de Graham/DCF y ancla
+    # la proyección del DCF en el FCF TTM en vez de un solo trimestre suelto.
     scenarios = valuation.compute_valuation_scenarios(
         eps_ttm=eps_ttm,
         eps_historial=eps_historial,
@@ -240,6 +403,9 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         y=y_value,
         wacc_inputs=wacc_inputs,
         shares_outstanding=shares_outstanding or 0.0,
+        periodos_por_anio_eps=periodos_por_anio_eps,
+        periodos_por_anio_fcf=periodos_por_anio_fcf,
+        fcf_base=fcf_base,
     )
     conservador = scenarios.conservador
 
@@ -309,6 +475,12 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         "per": per_result.per,
         "per_no_aplicable": per_result.per_no_aplicable,
         "ps": ps,
+        # 3 flags de fuente independientes (Decisión #10/#16) — nunca 1 solo
+        # agregado, cada endpoint decide su propia fuente sin afectar a los
+        # otros 2.
+        "income_statements_fuente": income_statements_fuente,
+        "cash_flow_fuente": cash_flow_fuente,
+        "balance_fuente": balance_fuente,
     }
     pillars_dict = {
         "ingresos_crecientes": pillars.ingresos_crecientes,
@@ -368,6 +540,7 @@ async def fetch_and_analyze_parts(ticker: str, clients: Clients, perfil: str) ->
         extras=extras_dict,
         vix=vix_dict,
         corporate_events=corporate_events_list,
+        escenario_elegido=escenario_elegido,
     )
 
 
@@ -491,12 +664,52 @@ async def _deliver_all(reply_fn, first_msg, remaining_or_all, ticker, **kwargs) 
             )
 
 
+async def _ask_escenario(reply_fn, ticker: str) -> None:
+    """Primer paso del flujo interactivo (`SDD_eps_ttm_real.md`, ronda 2,
+    Decisión #20): pregunta el escenario de Valor Justo. `reply_fn` es
+    `update.message.reply_text` (primer mensaje del bot) o
+    `query.edit_message_text` (si venía de una desambiguación `tk:`) —
+    ambos comparten la firma `(text, reply_markup=...)`."""
+    buttons = [
+        [
+            InlineKeyboardButton(
+                _ESCENARIO_BUTTON_LABELS[escenario],
+                callback_data=f"esc:{ticker}:{escenario}",
+            )
+        ]
+        for escenario in ESCENARIOS_VALIDOS
+    ]
+    await reply_fn(ASK_ESCENARIO_MSG, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _ask_ventana(reply_fn, ticker: str, escenario: str) -> None:
+    """Segundo paso del flujo interactivo (Decisión #20): pregunta la
+    ventana de historial (12 = 3 años, 20 = 5 años)."""
+    buttons = [
+        [
+            InlineKeyboardButton(
+                _VENTANA_BUTTON_LABELS[VENTANA_TRIMESTRES_CORTO],
+                callback_data=f"vent:{ticker}:{escenario}:{VENTANA_TRIMESTRES_CORTO}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                _VENTANA_BUTTON_LABELS[VENTANA_TRIMESTRES_LARGO],
+                callback_data=f"vent:{ticker}:{escenario}:{VENTANA_TRIMESTRES_LARGO}",
+            )
+        ],
+    ]
+    await reply_fn(ASK_VENTANA_MSG, reply_markup=InlineKeyboardMarkup(buttons))
+
+
 def build_query_handlers(
     get_conn: Callable[[], sqlite3.Connection],
     clients: Clients,
     rate_limiter,
 ) -> list:
-    """Devuelve los handlers de texto libre + callback de desambiguación."""
+    """Devuelve los handlers de texto libre + los 3 callbacks encadenados
+    (`tk:` desambiguación → `esc:` escenario → `vent:` ventana, Decisión #19
+    — diseño stateless, todo el estado viaja en `callback_data`)."""
 
     async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn = get_conn()
@@ -509,7 +722,6 @@ def build_query_handlers(
         if profile is None:
             await update.message.reply_text(NO_ONBOARDING_MSG)
             return
-        perfil = profile["perfil"]
 
         raw_text = update.message.text or ""
         normalized = normalize_query(raw_text)
@@ -556,13 +768,78 @@ def build_query_handlers(
             )
             return
 
-        await _run_analysis(update.message.reply_text, resolved, perfil)
+        # Ronda 2 (Decisión #19-24): ya no dispara el análisis directamente
+        # — encadena a la pregunta de escenario. `perfil` no se necesita acá
+        # (se re-consulta desde `db` recién en el paso final, `handle_ventana`).
+        await _ask_escenario(update.message.reply_text, resolved)
 
     async def handle_disambiguation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        ticker = query.data.split(":", 1)[1]
+        parts = query.data.split(":", 1)
+        ticker_raw = parts[1] if len(parts) == 2 else ""
+        ticker = _parse_ticker_from_callback(ticker_raw)
+        if ticker is None:
+            logger.warning(
+                "callback_data de tk: con ticker inválido: %s",
+                sanitize_for_log(ticker_raw),
+            )
+            await query.edit_message_text(INVALID_BUTTON_MSG)
+            return
 
+        # Ronda 2: encadena a la pregunta de escenario editando el mismo
+        # mensaje, en vez de disparar el análisis directamente.
+        await _ask_escenario(query.edit_message_text, ticker)
+
+    async def handle_escenario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            logger.warning(
+                "callback_data de esc: malformado (%d partes, esperaba 3)", len(parts)
+            )
+            await query.edit_message_text(INVALID_BUTTON_MSG)
+            return
+
+        _, ticker_raw, escenario = parts
+        ticker = _parse_ticker_from_callback(ticker_raw)
+        if ticker is None or escenario not in ESCENARIOS_VALIDOS:
+            logger.warning(
+                "callback_data de esc: inválido (ticker=%s escenario=%s)",
+                sanitize_for_log(ticker_raw), sanitize_for_log(escenario),
+            )
+            await query.edit_message_text(INVALID_BUTTON_MSG)
+            return
+
+        await _ask_ventana(query.edit_message_text, ticker, escenario)
+
+    async def handle_ventana(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        parts = query.data.split(":")
+        if len(parts) != 4:
+            logger.warning(
+                "callback_data de vent: malformado (%d partes, esperaba 4)", len(parts)
+            )
+            await query.edit_message_text(INVALID_BUTTON_MSG)
+            return
+
+        _, ticker_raw, escenario, n_raw = parts
+        ticker = _parse_ticker_from_callback(ticker_raw)
+        ventana = _VENTANAS_VALIDAS.get(n_raw)
+        if ticker is None or escenario not in ESCENARIOS_VALIDOS or ventana is None:
+            logger.warning(
+                "callback_data de vent: inválido (ticker=%s escenario=%s n=%s)",
+                sanitize_for_log(ticker_raw), sanitize_for_log(escenario),
+                sanitize_for_log(n_raw),
+            )
+            await query.edit_message_text(INVALID_BUTTON_MSG)
+            return
+
+        # `perfil` se re-consulta acá, nunca cacheado de un paso anterior
+        # (mismo criterio que `handle_disambiguation` ya aplicaba antes de
+        # esta spec).
         conn = get_conn()
         try:
             db.init_db(conn)
@@ -571,23 +848,46 @@ def build_query_handlers(
             conn.close()
         perfil = profile["perfil"] if profile is not None else "moderado"
 
-        await _run_analysis(query.edit_message_text, ticker, perfil)
+        chat_id = str(update.effective_chat.id)
+        await _run_analysis(
+            query.edit_message_text, ticker, perfil, chat_id,
+            escenario_elegido=escenario, ventana_trimestres=ventana,
+        )
 
-    async def _run_analysis(reply_fn, ticker: str, perfil: str) -> None:
+    async def _run_analysis(
+        reply_fn, ticker: str, perfil: str, chat_id: str, *,
+        escenario_elegido: str = "conservador",
+        ventana_trimestres: int = VENTANA_TRIMESTRES_LARGO,
+    ) -> None:
+        # Hallazgo 1 de `security` (BLOQUEANTE): único choke-point compartido
+        # por texto libre (vía la cadena tk:/esc:/vent:) y por cualquier
+        # `vent:` viejo reutilizado — un botón `vent:` no puede re-disparar
+        # un análisis completo (hasta 9 requests a FMP) sin límite.
+        if not rate_limiter.allow(chat_id):
+            await reply_fn(RATE_LIMITED_MSG)
+            return
+
         loading_msg = None
         try:
             loading_msg = await reply_fn(LOADING_MSG.format(ticker=ticker))
         except TelegramError as exc:
             logger.warning(
-                "No se pudo enviar el mensaje de carga para %s — %s", ticker, exc
+                "No se pudo enviar el mensaje de carga para %s — %s",
+                sanitize_for_log(ticker), exc,
             )
 
         try:
-            parts = await fetch_and_analyze_parts(ticker, clients, perfil)
+            parts = await fetch_and_analyze_parts(
+                ticker, clients, perfil,
+                escenario_elegido=escenario_elegido,
+                ventana_trimestres=ventana_trimestres,
+            )
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
             final_parts, kwargs = [str(exc)], {}
         except Exception:
-            logger.exception("Error inesperado analizando %s", ticker)
+            # Hallazgo 2 de `security` (BLOQUEANTE): el ticker se sanea antes
+            # de loguearse en los 2 puntos compartidos por texto/tk:/vent:.
+            logger.exception("Error inesperado analizando %s", sanitize_for_log(ticker))
             final_parts, kwargs = [GENERIC_ERROR_MSG], {}
         else:
             final_parts, kwargs = parts, {"parse_mode": "Markdown"}
@@ -595,7 +895,9 @@ def build_query_handlers(
         try:
             chunks = chunk_for_telegram(final_parts)
         except Exception:
-            logger.exception("Fallo inesperado partiendo el mensaje para %s", ticker)
+            logger.exception(
+                "Fallo inesperado partiendo el mensaje para %s", sanitize_for_log(ticker)
+            )
             chunks = [_hard_truncate_with_marker(final_parts)]
 
         chunks = _with_continuation_prefixes(chunks)
@@ -618,4 +920,6 @@ def build_query_handlers(
     return [
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
         CallbackQueryHandler(handle_disambiguation, pattern=r"^tk:"),
+        CallbackQueryHandler(handle_escenario, pattern=r"^esc:"),
+        CallbackQueryHandler(handle_ventana, pattern=r"^vent:"),
     ]

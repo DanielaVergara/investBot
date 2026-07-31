@@ -142,6 +142,41 @@ def test_main_arranca_sin_finnhub_ni_sec_edgar_configuradas(monkeypatch, tmp_pat
     assert run_polling_calls["n"] == 1
 
 
+# ---------------------------------------------------------------------------
+# SDD_eps_ttm_real.md (ronda 2) — los nuevos CallbackQueryHandler (`esc:`/
+# `vent:`) no interceptan updates del ConversationHandler de onboarding
+# (`^onb:`) — regex disjuntos, criterio explícito de `architect`/`security`.
+# ---------------------------------------------------------------------------
+
+
+def test_nuevos_handlers_esc_vent_no_interceptan_onboarding(tmp_path):
+    """Test de regresión explícito (no solo inspección visual del código):
+    los patrones `^esc:`/`^vent:` de `query_handler.build_query_handlers`
+    son disjuntos de `^onb:` — un `callback_data` de onboarding nunca
+    matchea contra ninguno de los 2 patrones nuevos."""
+    db_path = str(tmp_path / "bot_test_disjuntos.db")
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+    )
+    import re
+
+    onb_callback_data = "onb:0:10"
+    patrones_nuevos = []
+    for handlers_del_grupo in application.handlers.values():
+        for handler in handlers_del_grupo:
+            pattern = getattr(handler, "pattern", None)
+            if pattern is not None and pattern.pattern in (r"^esc:", r"^vent:"):
+                patrones_nuevos.append(pattern)
+
+    assert len(patrones_nuevos) == 2
+    for pattern in patrones_nuevos:
+        assert re.match(pattern, onb_callback_data) is None
+
+
 def test_main_arranca_con_finnhub_y_sec_edgar_configuradas(monkeypatch, tmp_path):
     """Caso feliz: con ambas variables configuradas, main() también llega
     hasta run_polling sin abortar."""

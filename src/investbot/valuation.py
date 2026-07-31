@@ -189,6 +189,8 @@ def calculate_dcf_fair_value(
     terminal_growth: float = TERMINAL_GROWTH_RATE,
     years: int = DCF_PROJECTION_YEARS,
     g_fcf_override: Optional[float] = None,
+    fcf_base_override: Optional[float] = None,
+    periodos_por_anio: int = 1,
 ) -> Optional[float]:
     """DCF por acción: proyección de FCF a `years` + valor terminal (Gordon Growth).
 
@@ -201,8 +203,19 @@ def calculate_dcf_fair_value(
     valor de `g_fcf` en vez de recalcularlo desde `fcf_historial` — permite a
     `compute_valuation_scenarios` desplazar el crecimiento proyectado
     (`g_fcf ∓ DELTA_G`) sin triplicar la lógica de proyección/descuento.
+
+    `fcf_base_override`/`periodos_por_anio` (`SDD_eps_ttm_real.md`, Decisión
+    #14): ambos opcionales, con default retrocompatible (`None`/`1`).
+    `periodos_por_anio` corrige el piso mínimo de longitud y el `n_años` del
+    CAGR cuando `fcf_historial` es una serie trimestral cruda (4 períodos por
+    año) en vez de anual. `fcf_base_override`, si no es `None`, reemplaza
+    `fcf_historial[-1]` como ancla de la PROYECCIÓN (nivel) — el CAGR
+    (`g_fcf`) sigue midiéndose siempre sobre los valores crudos de
+    `fcf_historial[0]`/`fcf_historial[-1]` (tendencia), nunca sobre
+    `fcf_base_override`: son 2 preguntas distintas (cuánto genera hoy vs. si
+    crece o decrece).
     """
-    if not fcf_historial or len(fcf_historial) < CAGR_MIN_N_AÑOS + 1:
+    if not fcf_historial or len(fcf_historial) < (CAGR_MIN_N_AÑOS * periodos_por_anio) + 1:
         return None
     if shares_outstanding is None or shares_outstanding <= 0:
         return None
@@ -214,7 +227,7 @@ def calculate_dcf_fair_value(
 
     fcf_reciente = fcf_historial[-1]
     fcf_antiguo = fcf_historial[0]
-    n_años = len(fcf_historial) - 1
+    n_años = (len(fcf_historial) - 1) / periodos_por_anio
 
     if g_fcf_override is not None:
         g_fcf = g_fcf_override
@@ -223,8 +236,12 @@ def calculate_dcf_fair_value(
         if g_fcf is None:
             return None
 
+    # Ancla de la PROYECCIÓN (nivel, no tendencia): FCF TTM cuando está
+    # disponible (`fcf_base_override`), el último punto crudo del historial
+    # en caso contrario — comportamiento anual de hoy, sin cambios, cuando
+    # `fcf_base_override` es `None` (default).
     fcf_proyectado = []
-    fcf = fcf_reciente
+    fcf = fcf_base_override if fcf_base_override is not None else fcf_reciente
     for _ in range(years):
         fcf = fcf * (1 + g_fcf)
         fcf_proyectado.append(fcf)
@@ -277,6 +294,9 @@ def compute_valuation(
     y: Optional[float],
     wacc_inputs: dict,
     shares_outstanding: float,
+    periodos_por_anio_eps: int = 1,
+    periodos_por_anio_fcf: int = 1,
+    fcf_base: Optional[float] = None,
 ) -> ValuationResult:
     """Orquesta los 3 modelos y arma la estructura de retorno del Spec Patch Iter-2.
 
@@ -286,6 +306,16 @@ def compute_valuation(
 
     Cada modelo se calcula de forma independiente; si no es calculable, se
     excluye del promedio con su motivo (nunca se sustituye por 0).
+
+    `periodos_por_anio_eps`/`periodos_por_anio_fcf`/`fcf_base`
+    (`SDD_eps_ttm_real.md`, Decisión #13/#14): parámetros aditivos, con
+    default retrocompatible (`1`/`1`/`None`) que preserva byte a byte el
+    comportamiento anual de antes de esta spec para cualquier llamador que
+    no los pase. `periodos_por_anio_eps`/`_fcf` corrigen el `n_años` usado en
+    el CAGR de Graham/DCF cuando el historial recibido es trimestral (4
+    períodos por año) en vez de anual (1). `fcf_base` es el FCF TTM (si está
+    disponible) usado como ancla de nivel de la proyección del DCF — ver
+    `calculate_dcf_fair_value`.
     """
     result = ValuationResult()
 
@@ -309,7 +339,7 @@ def compute_valuation(
     if eps_no_positivo:
         result.modelos_excluidos.append(ModeloExcluido("graham", "eps_ttm_no_positivo"))
     else:
-        n_años_eps = len(eps_historial) - 1 if eps_historial else 0
+        n_años_eps = (len(eps_historial) - 1) / periodos_por_anio_eps if eps_historial else 0
         eps_antiguo = eps_historial[0] if eps_historial else None
         eps_reciente = eps_historial[-1] if eps_historial else None
         g_eps = calculate_cagr(eps_reciente, eps_antiguo, n_años_eps)
@@ -330,7 +360,7 @@ def compute_valuation(
                 )
 
     # --- DCF ---
-    n_años_fcf = len(fcf_historial) - 1 if fcf_historial else 0
+    n_años_fcf = (len(fcf_historial) - 1) / periodos_por_anio_fcf if fcf_historial else 0
     fcf_antiguo = fcf_historial[0] if fcf_historial else None
     fcf_reciente = fcf_historial[-1] if fcf_historial else None
     g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años_fcf)
@@ -346,6 +376,8 @@ def compute_valuation(
                 fcf_historial=fcf_historial,
                 wacc=wacc,
                 shares_outstanding=shares_outstanding,
+                periodos_por_anio=periodos_por_anio_fcf,
+                fcf_base_override=fcf_base,
             )
             if result.valor_justo_dcf is None:
                 result.modelos_excluidos.append(
@@ -437,6 +469,9 @@ def compute_valuation_scenarios(
     shares_outstanding: float,
     delta_g: float = DELTA_G,
     delta_wacc: float = DELTA_WACC,
+    periodos_por_anio_eps: int = 1,
+    periodos_por_anio_fcf: int = 1,
+    fcf_base: Optional[float] = None,
 ) -> ValuationScenarios:
     """Calcula los 3 escenarios (Pesimista/Conservador/Optimista) de los 3
     modelos (Spec Patch Iter-3, secciones 1-2).
@@ -473,7 +508,7 @@ def compute_valuation_scenarios(
     multiplos_valido = nivel1_multiplos is None
 
     # --- Nivel 1: Graham (depende del CAGR de EPS, "g") ---
-    n_años_eps = len(eps_historial) - 1 if eps_historial else 0
+    n_años_eps = (len(eps_historial) - 1) / periodos_por_anio_eps if eps_historial else 0
     eps_antiguo = eps_historial[0] if eps_historial else None
     eps_reciente = eps_historial[-1] if eps_historial else None
     g_eps = calculate_cagr(eps_reciente, eps_antiguo, n_años_eps)
@@ -490,7 +525,7 @@ def compute_valuation_scenarios(
     graham_valido = nivel1_graham is None
 
     # --- Nivel 1: DCF (depende del CAGR de FCF y del WACC conservador) ---
-    n_años_fcf = len(fcf_historial) - 1 if fcf_historial else 0
+    n_años_fcf = (len(fcf_historial) - 1) / periodos_por_anio_fcf if fcf_historial else 0
     fcf_antiguo = fcf_historial[0] if fcf_historial else None
     fcf_reciente = fcf_historial[-1] if fcf_historial else None
     g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años_fcf)
@@ -550,6 +585,8 @@ def compute_valuation_scenarios(
                 wacc=wacc_escenario,
                 shares_outstanding=shares_outstanding,
                 g_fcf_override=g_fcf_escenario,
+                periodos_por_anio=periodos_por_anio_fcf,
+                fcf_base_override=fcf_base,
             )
             if scenario.valor_justo_dcf is None:
                 scenario.modelos_excluidos.append(ModeloExcluido("dcf", "dcf_no_calculable"))

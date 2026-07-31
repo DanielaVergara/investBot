@@ -3,12 +3,110 @@
 Funciones puras (sin I/O), fórmulas exactas de la sección "Reglas de
 validación de empresa" de la spec, con las guardas del Spec Patch Iter-2
 (B3: pasivos circulantes = 0; B4: EPS TTM <= 0).
+
+`SDD_eps_ttm_real.md` (Decisión #9) agrega las funciones TTM generalizadas
+(`sum_ttm_field`/`calculate_income_statement_ttm`/`calculate_fcf_ttm`) usadas
+por `query_handler.py` para derivar EPS TTM real, P/S y los inputs del WACC
+de una suma de los últimos 4 trimestres, en vez de un solo reporte anual.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+
+# Constantes de fuente de datos (mismo patrón que peers.PEERS_FUENTE_*) —
+# Decisión #9 de SDD_eps_ttm_real.md.
+DATOS_FUENTE_TRIMESTRAL = "trimestral_real"
+DATOS_FUENTE_ANUAL_FALLBACK = "anual_fallback"
+
+
+def _is_valid_number(value: object) -> bool:
+    """`True` solo para `int`/`float` reales — excluye `bool` explícitamente
+    (`isinstance(True, int)` es `True` en Python, y un booleano colándose
+    como cifra financiera sería un bug silencioso, no un dato válido)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def sum_ttm_field(quarterly_statements: list[dict], field: str) -> Optional[float]:
+    """Suma `field` de los primeros 4 elementos de `quarterly_statements`
+    (recent-first, FMP confirmado con `curl` real). `None` si hay menos de 4
+    elementos o si alguno de los 4 tiene el campo ausente/`None`/no numérico
+    (incluye `bool`) — nunca suma parcialmente con menos de 4 trimestres
+    reales."""
+    primeros_4 = quarterly_statements[:4]
+    valores = [q.get(field) for q in primeros_4]
+    if len(quarterly_statements) < 4 or any(not _is_valid_number(v) for v in valores):
+        return None
+    return sum(valores)
+
+
+@dataclass
+class IncomeStatementTtmResult:
+    disponible: bool
+    net_income_ttm: Optional[float] = None
+    revenue_ttm: Optional[float] = None
+    cost_of_revenue_ttm: Optional[float] = None
+    interest_expense_ttm: Optional[float] = None
+    income_tax_expense_ttm: Optional[float] = None
+    income_before_tax_ttm: Optional[float] = None
+    shares_outstanding_reciente: Optional[float] = None
+
+
+_INCOME_STATEMENT_TTM_CAMPOS = (
+    "netIncome",
+    "revenue",
+    "costOfRevenue",
+    "interestExpense",
+    "incomeTaxExpense",
+    "incomeBeforeTax",
+)
+
+
+def calculate_income_statement_ttm(
+    quarterly_statements: list[dict],
+) -> IncomeStatementTtmResult:
+    """TTM real de los 6 campos de `/income-statement` que antes de esta spec
+    se leían del último reporte anual. Diseño ATÓMICO por decisión explícita
+    (Decisión #9, `SDD_eps_ttm_real.md`): si CUALQUIERA de los 6 campos no se
+    puede sumar en TTM (falta un trimestre, un campo viene no numérico), se
+    descarta el paquete COMPLETO — `disponible=False` — en vez de mezclar
+    fuentes campo por campo (ej. EPS TTM real pero P/S con revenue anual).
+    """
+    sumas = {
+        campo: sum_ttm_field(quarterly_statements, campo)
+        for campo in _INCOME_STATEMENT_TTM_CAMPOS
+    }
+    if any(v is None for v in sumas.values()):
+        return IncomeStatementTtmResult(disponible=False)
+
+    shares = quarterly_statements[0].get("weightedAverageShsOutDil") or quarterly_statements[
+        0
+    ].get("weightedAverageShsOut")
+    if not _is_valid_number(shares) or shares <= 0:
+        return IncomeStatementTtmResult(disponible=False)
+
+    return IncomeStatementTtmResult(
+        disponible=True,
+        net_income_ttm=sumas["netIncome"],
+        revenue_ttm=sumas["revenue"],
+        cost_of_revenue_ttm=sumas["costOfRevenue"],
+        interest_expense_ttm=sumas["interestExpense"],
+        income_tax_expense_ttm=sumas["incomeTaxExpense"],
+        income_before_tax_ttm=sumas["incomeBeforeTax"],
+        shares_outstanding_reciente=shares,
+    )
+
+
+def calculate_fcf_ttm(fcf_historial: list[float]) -> Optional[float]:
+    """FCF TTM = suma de los últimos 4 valores de `fcf_historial` (ya
+    construido con la fórmula existente `operatingCashFlow -
+    abs(capitalExpenditure)`, aplicada por período, orden cronológico
+    antiguo→reciente). `None` si hay menos de 4 períodos disponibles."""
+    ultimos_4 = fcf_historial[-4:]
+    if len(ultimos_4) < 4:
+        return None
+    return sum(ultimos_4)
 
 
 def calculate_eps(net_income: float, shares_outstanding: float) -> Optional[float]:

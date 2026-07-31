@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from investbot import peers, rules, summary
 from investbot.query_handler import chunk_for_telegram
 from tests.fixtures.crecimiento_estilizado import (
@@ -1525,3 +1527,150 @@ def test_corporate_events_aclara_etiqueta_es_traduccion_del_bot():
     assert "traducción del bot" in text
     assert "no una cita textual" in text
     assert "NO resume" in text
+
+
+# ---------------------------------------------------------------------------
+# SDD_eps_ttm_real.md, Decisión #17 — MOTIVO_LABELS wording period-agnóstico
+# ---------------------------------------------------------------------------
+
+_MOTIVOS_ACTUALIZADOS_DECISION_17 = [
+    "eps_base_no_positivo",
+    "eps_reciente_no_positivo",
+    "fcf_base_no_positivo",
+    "fcf_reciente_no_positivo",
+    "historial_insuficiente",
+]
+
+# `historial_insuficiente` sí menciona "años" pero explícitamente como
+# unidad de tiempo genérica calificada ("sea en reportes anuales o
+# trimestrales") — no asume una cadencia exclusiva, así que se verifica por
+# separado (test siguiente) en vez de con la regex estricta de abajo.
+_MOTIVOS_SIN_PALABRA_ANIO = [
+    "eps_base_no_positivo",
+    "eps_reciente_no_positivo",
+    "fcf_base_no_positivo",
+    "fcf_reciente_no_positivo",
+]
+
+
+def test_motivo_labels_wording_actualizado_no_asume_solo_anual():
+    """Ninguna de las 4 entradas de la Decisión #17 que antes decían
+    literalmente "años"/"el año más reciente" sigue asumiendo exclusivamente
+    cadencia anual — el historial que las alimenta ahora puede ser
+    trimestral."""
+    for motivo in _MOTIVOS_SIN_PALABRA_ANIO:
+        texto = summary.MOTIVO_LABELS[motivo]
+        assert not re.search(r"\baños?\b", texto), (
+            f"'{motivo}' todavía asume cadencia anual: {texto!r}"
+        )
+
+
+def test_motivo_labels_historial_insuficiente_menciona_ambas_cadencias():
+    texto = summary.MOTIVO_LABELS["historial_insuficiente"]
+    assert "anuales" in texto
+    assert "trimestrales" in texto
+
+
+def test_motivo_labels_entradas_no_modificadas_siguen_iguales():
+    """El resto del diccionario (no listado en la Decisión #17) queda
+    idéntico — regresión explícita de que no se tocó de más."""
+    assert summary.MOTIVO_LABELS["eps_ttm_no_positivo"] == (
+        "la empresa tiene EPS (ganancia por acción) negativo o cero"
+    )
+    assert summary.MOTIVO_LABELS["y_no_disponible"] == (
+        "no pude obtener la tasa del bono del tesoro (FRED/Treasury.gov)"
+    )
+    assert summary.MOTIVO_LABELS["wacc_no_calculable"] == (
+        "no se pudo estimar el costo de capital (WACC) con los datos disponibles"
+    )
+    assert summary.MOTIVO_LABELS["dcf_no_calculable"] == (
+        "no se pudo proyectar el flujo de caja con los datos disponibles"
+    )
+    assert summary.MOTIVO_LABELS["per_peers_no_disponible"] == (
+        "no pude obtener el PER de los comparables del sector"
+    )
+    assert summary.MOTIVO_LABELS["graham_multiplicador_no_positivo"] == (
+        "en este escenario el crecimiento estimado haría el múltiplo de Graham cero o negativo"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SDD_eps_ttm_real.md, Decisión #24 (ronda 2) — resaltado de escenario_elegido
+# en build_valuation_scenarios_section/build_summary_parts.
+# ---------------------------------------------------------------------------
+
+
+def test_build_valuation_scenarios_section_sin_escenario_elegido_regresion_byte_a_byte():
+    sin_pasar_el_parametro = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3
+    )
+    con_none_explicito = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3, escenario_elegido=None
+    )
+    assert sin_pasar_el_parametro == con_none_explicito
+    assert "*Rango de Valor Justo estimado (Pesimista | Conservador | Optimista):*" in sin_pasar_el_parametro
+
+
+@pytest.mark.parametrize(
+    "escenario,marcado,no_marcados",
+    [
+        ("pesimista", "*Pesimista* ✅", ["*Conservador* ✅", "*Optimista* ✅"]),
+        ("conservador", "*Conservador* ✅", ["*Pesimista* ✅", "*Optimista* ✅"]),
+        ("optimista", "*Optimista* ✅", ["*Pesimista* ✅", "*Conservador* ✅"]),
+    ],
+)
+def test_build_valuation_scenarios_section_resalta_columna_correcta(
+    escenario, marcado, no_marcados
+):
+    text = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3,
+        escenario_elegido=escenario,
+    )
+    assert marcado in text
+    for otro in no_marcados:
+        assert otro not in text
+
+
+def test_build_valuation_scenarios_section_escenario_invalido_no_marca_nada_ni_crashea():
+    for invalido in ("neutral", "", "CONSERVADOR"):
+        text = summary.build_valuation_scenarios_section(
+            _base_scenarios(), precio_actual=333.0, n_peers_validos=3,
+            escenario_elegido=invalido,
+        )
+        assert "✅" not in text
+
+
+def test_build_summary_parts_sin_escenario_elegido_regresion_byte_a_byte():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    sin_parametro = summary.build_summary_parts(**kwargs)
+    con_none_explicito = summary.build_summary_parts(escenario_elegido=None, **kwargs)
+    assert sin_parametro == con_none_explicito
+
+
+def test_build_summary_parts_con_escenario_elegido_resalta_en_la_seccion_correcta():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(escenario_elegido="optimista", **kwargs)
+    valuation_part = next(p for p in parts if p.startswith("*Rango de Valor Justo"))
+    assert "*Optimista* ✅" in valuation_part
