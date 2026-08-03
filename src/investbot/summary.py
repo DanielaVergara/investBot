@@ -250,6 +250,25 @@ def build_valuation_scenarios_section(
             if escenario.get(campo) is None:
                 modelos_nivel2_nd.append((modelo_label, escenario_nombre))
 
+    graham_g_cap_avisos: list[str] = []
+    for escenario_nombre, escenario in (
+        ("Pesimista", pesimista),
+        ("Conservador", conservador),
+        ("Optimista", optimista),
+    ):
+        if escenario.get("graham_g_capped"):
+            g_original = escenario.get("graham_g_original")
+            g_aplicado = escenario.get("graham_g_aplicado")
+            graham_g_cap_avisos.append(
+                f"- ℹ️ Graham ({escenario_nombre}): el crecimiento histórico (g) "
+                f"usado se limitó de {g_original * 100:.1f}% a "
+                f"{g_aplicado * 100:.0f}% porque la fórmula de Graham no puede "
+                "modelar razonablemente crecimientos tan altos de forma "
+                "sostenida — evita un Valor Justo por Graham artificialmente "
+                "inflado."
+            )
+    lines.extend(graham_g_cap_avisos)
+
     for item in excluidos_base:
         modelo_label = MODELO_LABELS.get(item["modelo"], item["modelo"])
         if item["motivo"] == "peers_validos_insuficientes":

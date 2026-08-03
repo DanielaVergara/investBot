@@ -56,6 +56,49 @@ DELTA_WACC = 0.01  # ±1pp — WACC del DCF
 # infle valor_justo_total con el mismo peso que Graham/DCF.
 MIN_PEERS_VALIDOS_PARA_MULTIPLOS = 2
 
+# Spec Patch [Iter-4] — techo superior sobre `g` (CAGR de EPS) al alimentar
+# la fórmula de Graham. Constante documentada, ajustable sin que sea una
+# "regresión" de un criterio verde (mismo tratamiento que MARKET_RISK_PREMIUM
+# /DELTA_G/DELTA_WACC). Valor: 15%.
+#
+# Justificación del número: la fórmula de Graham (8.5 + 2×g_pct) es LINEAL
+# en g — a diferencia del DCF (que amortigua un g alto con descuento
+# compuesto a 5 años + valor terminal), acá cada punto porcentual de más en
+# g suma 2 puntos enteros al multiplicador, sin techo natural. Graham (1962)
+# diseñó "g" para una expectativa de crecimiento FUTURO razonable a 7-10
+# años, advirtiendo explícitamente contra extrapolar crecimiento fuera de lo
+# típico — no para un CAGR histórico trailing crudo de una empresa en un
+# ciclo de expansión extraordinario (caso NVDA). 15% es, de forma
+# consistente con implementaciones públicas conocidas de esta fórmula
+# (calculadoras de "Graham Number"/valor intrínseco de uso común en la
+# comunidad value investing), el techo más citado para "crecimiento alto
+# pero todavía plausible de sostener": el crecimiento nominal de utilidades
+# del S&P 500 en el largo plazo ronda 6-8%; 15% ya representa una empresa de
+# alta calidad y crecimiento muy por encima del promedio del mercado. Por
+# encima de eso, la extrapolación lineal de Graham deja de ser una
+# aproximación razonable y empieza a producir múltiplos que ninguna empresa,
+# por buena que sea, sostiene indefinidamente.
+GRAHAM_G_CAP = 0.15
+
+
+def _cap_graham_g(g: float) -> tuple[float, bool]:
+    """Aplica `GRAHAM_G_CAP` sobre `g` ANTES de que alimente
+    `calculate_graham_fair_value`. Devuelve `(g_aplicado, fue_limitado)`.
+
+    Vive como helper de módulo, separado de `calculate_graham_fair_value`,
+    a propósito: `compute_valuation`/`compute_valuation_scenarios` necesitan
+    el PAR `(g_original, g_aplicado)` para poblar los campos nuevos de
+    `ValuationResult`/`ScenarioValuationResult` (Decisión #33) que alimentan
+    la nota de transparencia (Decisión #34). Cambiar la firma pública de
+    `calculate_graham_fair_value(eps_ttm, g, y) -> Optional[float]` para que
+    devuelva esa metadata rompería su contrato actual (2 call sites, tests
+    existentes) sin necesidad — el cap se decide ANTES de llamarla; ella
+    sigue recibiendo un `g` ya listo, exactamente como antes de este patch,
+    sin saber que existe un cap."""
+    if g > GRAHAM_G_CAP:
+        return GRAHAM_G_CAP, True
+    return g, False
+
 
 def calculate_cagr(
     valor_reciente: float, valor_antiguo: float, n_años: int
@@ -280,6 +323,9 @@ class ValuationResult:
     valor_justo_dcf: Optional[float] = None
     valor_justo_total: Optional[float] = None
     modelos_excluidos: list[ModeloExcluido] = field(default_factory=list)
+    graham_g_original: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_aplicado: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_capped: bool = False               # NUEVO — Iter-4
 
     def as_dict(self) -> dict:
         return {
@@ -290,6 +336,9 @@ class ValuationResult:
             "modelos_excluidos": [
                 {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos
             ],
+            "graham_g_original": self.graham_g_original,     # NUEVO
+            "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
+            "graham_g_capped": self.graham_g_capped,         # NUEVO
         }
 
 
@@ -372,7 +421,11 @@ def compute_valuation(
         elif y is None or y <= 0:
             result.modelos_excluidos.append(ModeloExcluido("graham", "y_no_disponible"))
         else:
-            result.valor_justo_graham = calculate_graham_fair_value(eps_ttm, g_eps, y)
+            g_eps_aplicado, g_eps_capped = _cap_graham_g(g_eps)  # NUEVO
+            result.graham_g_original = g_eps                     # NUEVO
+            result.graham_g_aplicado = g_eps_aplicado             # NUEVO
+            result.graham_g_capped = g_eps_capped                 # NUEVO
+            result.valor_justo_graham = calculate_graham_fair_value(eps_ttm, g_eps_aplicado, y)
             if result.valor_justo_graham is None:
                 # Guarda de multiplicador (Spec Patch Iter-3, sección 1): g_eps,
                 # y y eps_ttm ya son válidos aquí — el único motivo restante por
@@ -438,6 +491,9 @@ class ScenarioValuationResult:
     valor_justo_dcf: Optional[float] = None
     valor_justo_total: Optional[float] = None
     modelos_excluidos: list[ModeloExcluido] = field(default_factory=list)  # nivel 1 + nivel 2
+    graham_g_original: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_aplicado: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_capped: bool = False               # NUEVO — Iter-4
 
     def as_dict(self) -> dict:
         return {
@@ -448,6 +504,9 @@ class ScenarioValuationResult:
             "modelos_excluidos": [
                 {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos
             ],
+            "graham_g_original": self.graham_g_original,     # NUEVO
+            "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
+            "graham_g_capped": self.graham_g_capped,         # NUEVO
         }
 
 
@@ -596,8 +655,12 @@ def compute_valuation_scenarios(
             scenario.modelos_excluidos.append(nivel1_graham)
         else:
             g_escenario = g_eps + g_delta
+            g_escenario_aplicado, g_escenario_capped = _cap_graham_g(g_escenario)  # NUEVO
+            scenario.graham_g_original = g_escenario                                # NUEVO
+            scenario.graham_g_aplicado = g_escenario_aplicado                        # NUEVO
+            scenario.graham_g_capped = g_escenario_capped                            # NUEVO
             scenario.valor_justo_graham = calculate_graham_fair_value(
-                eps_ttm, g_escenario, y
+                eps_ttm, g_escenario_aplicado, y
             )
             if scenario.valor_justo_graham is None:
                 scenario.modelos_excluidos.append(

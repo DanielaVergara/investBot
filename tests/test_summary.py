@@ -1656,6 +1656,86 @@ def test_build_valuation_scenarios_section_escenario_invalido_no_marca_nada_ni_c
         assert "✅" not in text
 
 
+# ---------------------------------------------------------------------------
+# Spec Patch [Iter-4], Decisión #34 — aviso de cap de Graham por escenario en
+# build_valuation_scenarios_section. Criterios de aceptación de `architect`.
+# ---------------------------------------------------------------------------
+
+
+def test_build_valuation_scenarios_section_sin_cap_regresion_byte_a_byte():
+    """Sin ningún escenario con `graham_g_capped=True` -> output byte a byte
+    idéntico al comportamiento de antes de este patch (regresión) — probado
+    con dicts que directamente no traen la clave `graham_g_capped` (como
+    haría un llamador previo a Iter-4, ej. los fixtures existentes de este
+    archivo) y con dicts que la traen explícita en `False`; ambos deben
+    producir el mismo texto, y ninguno debe mostrar el aviso."""
+    sin_clave = summary.build_valuation_scenarios_section(
+        _base_scenarios(), precio_actual=333.0, n_peers_validos=3
+    )
+
+    scenarios_con_false = _base_scenarios()
+    for nombre in ("pesimista", "conservador", "optimista"):
+        scenarios_con_false[nombre]["graham_g_capped"] = False
+        scenarios_con_false[nombre]["graham_g_original"] = 0.05
+        scenarios_con_false[nombre]["graham_g_aplicado"] = 0.05
+    con_false_explicito = summary.build_valuation_scenarios_section(
+        scenarios_con_false, precio_actual=333.0, n_peers_validos=3
+    )
+
+    assert sin_clave == con_false_explicito
+    assert "ℹ️ Graham" not in sin_clave
+
+
+def test_build_valuation_scenarios_section_aviso_cap_conservador():
+    scenarios = _base_scenarios()
+    scenarios["conservador"]["graham_g_capped"] = True
+    scenarios["conservador"]["graham_g_original"] = 0.75
+    scenarios["conservador"]["graham_g_aplicado"] = 0.15
+    text = summary.build_valuation_scenarios_section(
+        scenarios, precio_actual=333.0, n_peers_validos=3
+    )
+    assert "ℹ️ Graham (Conservador)" in text
+    assert "75.0%" in text
+    assert "15%" in text
+
+
+def test_build_valuation_scenarios_section_aviso_cap_2_de_3_escenarios():
+    """Cap activo en 2 de los 3 escenarios simultáneamente (Conservador y
+    Optimista, no Pesimista) -> aparecen exactamente 2 líneas de aviso, cada
+    una con el nombre de escenario correcto — no 1 sola genérica, no 3."""
+    scenarios = _base_scenarios()
+    scenarios["conservador"]["graham_g_capped"] = True
+    scenarios["conservador"]["graham_g_original"] = 0.75
+    scenarios["conservador"]["graham_g_aplicado"] = 0.15
+    scenarios["optimista"]["graham_g_capped"] = True
+    scenarios["optimista"]["graham_g_original"] = 0.80
+    scenarios["optimista"]["graham_g_aplicado"] = 0.15
+    text = summary.build_valuation_scenarios_section(
+        scenarios, precio_actual=333.0, n_peers_validos=3
+    )
+    lineas_aviso = [l for l in text.split("\n") if "ℹ️ Graham" in l]
+    assert len(lineas_aviso) == 2
+    assert any("Conservador" in l for l in lineas_aviso)
+    assert any("Optimista" in l for l in lineas_aviso)
+    assert not any("Pesimista" in l for l in lineas_aviso)
+
+
+def test_build_valuation_scenarios_section_aviso_independiente_de_escenario_elegido():
+    """El aviso aparece independientemente de cuál sea `escenario_elegido` —
+    con `escenario_elegido="pesimista"` y cap activo en `optimista`, el
+    aviso de Optimista sigue visible (nunca se filtra por el escenario
+    resaltado, mismo criterio que `modelos_nivel2_nd`)."""
+    scenarios = _base_scenarios()
+    scenarios["optimista"]["graham_g_capped"] = True
+    scenarios["optimista"]["graham_g_original"] = 0.80
+    scenarios["optimista"]["graham_g_aplicado"] = 0.15
+    text = summary.build_valuation_scenarios_section(
+        scenarios, precio_actual=333.0, n_peers_validos=3,
+        escenario_elegido="pesimista",
+    )
+    assert "ℹ️ Graham (Optimista)" in text
+
+
 def test_build_summary_parts_sin_escenario_elegido_regresion_byte_a_byte():
     kwargs = dict(
         ticker="ADBE",

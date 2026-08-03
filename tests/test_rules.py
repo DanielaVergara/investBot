@@ -10,7 +10,7 @@ from typing import Optional
 
 import pytest
 
-from investbot import rules
+from investbot import query_handler, rules
 from tests.fixtures.crecimiento_estilizado import (
     HISTORIAL_INGRESOS_CASO_ESTILIZADO,
     HISTORIAL_UTILIDADES_CASO_ESTILIZADO,
@@ -536,3 +536,120 @@ def test_evaluate_pillars_con_historial_trimestral_largo():
     )
     assert pillars.ingresos_crecientes is True
     assert pillars.utilidades_crecientes is True
+
+
+# ---------------------------------------------------------------------------
+# build_ttm_historial (Spec Patch [Iter-4], Decisión #29 — Causa 1 del bug de
+# Graham sobrevaluando NVDA: eps_historial pasa de trimestres sueltos a TTM
+# rolling). Criterios de aceptación de `architect` + los agregados por `qa`.
+# ---------------------------------------------------------------------------
+
+
+def _quarters_con_campo(valores_recent_first: list, field: str = "eps") -> list[dict]:
+    """`valores_recent_first[0]` es el trimestre más reciente (misma
+    convención que la respuesta cruda de FMP)."""
+    return [{field: v} for v in valores_recent_first]
+
+
+def test_build_ttm_historial_20_trimestres_17_puntos_ventanas_correctas():
+    """20 trimestres válidos -> 17 puntos TTM, cada uno la suma de una
+    ventana de 4 consecutivos, en orden cronológico (antiguo -> reciente)."""
+    v_chron = [float(i) for i in range(1, 21)]  # 1..20, antiguo -> reciente
+    recent_first = list(reversed(v_chron))
+    quarters = _quarters_con_campo(recent_first)
+
+    resultado = rules.build_ttm_historial(quarters, "eps")
+
+    esperado = [sum(v_chron[i : i + 4]) for i in range(len(v_chron) - 3)]
+    assert len(resultado) == 17
+    assert resultado == pytest.approx(esperado)
+
+
+def test_build_ttm_historial_12_trimestres_9_puntos():
+    """12 trimestres válidos -> 9 puntos TTM (Decisión #31: `n_años_eps`
+    resultante = 8/4 = 2.0 exacto, en el piso pero no excluido)."""
+    v_chron = [float(i) for i in range(1, 13)]
+    recent_first = list(reversed(v_chron))
+    quarters = _quarters_con_campo(recent_first)
+
+    resultado = rules.build_ttm_historial(quarters, "eps")
+
+    esperado = [sum(v_chron[i : i + 4]) for i in range(len(v_chron) - 3)]
+    assert len(resultado) == 9
+    n_años_eps = (len(resultado) - 1) / 4
+    assert n_años_eps == pytest.approx(2.0)
+    assert resultado == pytest.approx(esperado)
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3])
+def test_build_ttm_historial_menos_de_4_trimestres_lista_vacia(n):
+    quarters = _quarters_con_campo([1.0] * n)
+    assert rules.build_ttm_historial(quarters, "eps") == []
+
+
+def test_build_ttm_historial_valor_no_numerico_omite_solo_las_ventanas_afectadas():
+    """Un valor no numérico/ausente en 1 trimestre dentro del rango -> solo
+    la(s) ventana(s) que lo incluyen se omiten, las demás ventanas válidas se
+    conservan (atomicidad por VENTANA, no por serie completa) — 7 trimestres
+    de entrada, índice 0 (recent-first, el más reciente) con valor
+    no-numérico: solo la ventana `start=0` lo incluye, las 3 restantes
+    (`start=1,2,3`) quedan intactas."""
+    recent_first = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0]
+    quarters = _quarters_con_campo(recent_first)
+    quarters[0]["eps"] = "N/A"  # trimestre más reciente, dato corrupto
+
+    resultado = rules.build_ttm_historial(quarters, "eps")
+
+    # start=1 -> [200,300,400,500]=1400; start=2 -> [300,400,500,600]=1800;
+    # start=3 -> [400,500,600,700]=2200; reversed para orden cronológico.
+    assert resultado == pytest.approx([2200.0, 1800.0, 1400.0])
+
+
+def test_build_ttm_historial_campo_totalmente_ausente_permite_fallback_netincome():
+    """`build_ttm_historial` no implementa el fallback en sí (eso vive en el
+    `or` de `query_handler.py`, Decisión #30) — pero con el campo `"eps"`
+    totalmente ausente en TODOS los trimestres, cada ventana se omite y la
+    función devuelve `[]` (falsy), habilitando el mismo patrón `or` que
+    `_annual_series` ya usaba antes de este patch."""
+    quarters = [{"netIncome": v} for v in [100.0, 200.0, 300.0, 400.0]]
+    # Ningún trimestre tiene "eps".
+    assert rules.build_ttm_historial(quarters, "eps") == []
+
+    resultado_con_fallback = rules.build_ttm_historial(
+        quarters, "eps"
+    ) or rules.build_ttm_historial(quarters, "netIncome")
+    assert resultado_con_fallback == pytest.approx([1000.0])
+
+
+def test_build_ttm_historial_reduce_ruido_estacionalidad_vs_serie_cruda():
+    """Test comparativo explícito (pedido directo de Daniela/Claude,
+    criterio de aceptación de `architect`): con un fixture sintético de EPS
+    trimestral con crecimiento real (10%/año) pero estacionalidad marcada
+    (pesos [10%, 15%, 25%, 50%] del EPS anual por trimestre dentro de cada
+    año), el `g_eps` calculado sobre `build_ttm_historial(...)` da un valor
+    estrictamente MENOR que el `g_eps` calculado sobre la serie cruda
+    (`query_handler._annual_series`) para el mismo input — confirma que el
+    fix reduce el ruido de estacionalidad, no lo aumenta."""
+    from investbot import valuation
+
+    pesos = [0.10, 0.15, 0.25, 0.50]
+    anual = [4.00, 4.40, 4.84]  # +10% año a año
+    chron = [round(a * w, 4) for a in anual for w in pesos]
+    recent_first = list(reversed(chron))
+    quarters = _quarters_con_campo(recent_first)
+
+    raw_hist = query_handler._annual_series(quarters, "eps")
+    ttm_hist = rules.build_ttm_historial(quarters, "eps")
+
+    n_años_raw = (len(raw_hist) - 1) / 4
+    n_años_ttm = (len(ttm_hist) - 1) / 4
+    g_raw = valuation.calculate_cagr(raw_hist[-1], raw_hist[0], n_años_raw)
+    g_ttm = valuation.calculate_cagr(ttm_hist[-1], ttm_hist[0], n_años_ttm)
+
+    assert g_raw is not None and g_ttm is not None
+    assert g_ttm < g_raw
+    # El TTM recupera el crecimiento real subyacente (10%), la serie cruda lo
+    # exagera severamente por comparar 2 trimestres puntuales de estaciones
+    # distintas.
+    assert g_ttm == pytest.approx(0.10, abs=1e-9)
+    assert g_raw > 0.5  # exageración severa confirmada, no solo "un poco más"

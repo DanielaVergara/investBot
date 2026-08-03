@@ -1560,10 +1560,17 @@ async def test_fetch_and_analyze_nvda_camino_feliz_usa_ttm_no_un_solo_trimestre(
 async def test_fetch_and_analyze_nvda_historiales_crudos_trimestrales_cronologicos(
     adobe_fixtures, monkeypatch
 ):
-    """`revenue_historial`/`net_income_historial`/`eps_historial`/
-    `fcf_historial` con fuente trimestral disponible contienen los valores
-    CRUDOS por trimestre (no TTM móvil), en orden cronológico (antiguo ->
-    reciente) — Decisión #12."""
+    """`revenue_historial`/`net_income_historial`/`fcf_historial` con fuente
+    trimestral disponible contienen los valores CRUDOS por trimestre (no TTM
+    móvil), en orden cronológico (antiguo -> reciente) — Decisión #12.
+
+    `eps_historial` es la EXCEPCIÓN desde el Spec Patch [Iter-4] (Decisión
+    #29/#30, causa raíz 1 del bug de Graham sobrevaluando NVDA): pasa a ser
+    una serie TTM *rolling* vía `rules.build_ttm_historial`, no los valores
+    crudos por trimestre — este assert se actualizó para reflejar ese cambio
+    de comportamiento intencional (reportado explícitamente, no ajustado en
+    silencio); `fcf_historial` NO cambió (Decisión #35, fuera de alcance de
+    Iter-4)."""
     captured = {}
 
     def fake_compute_valuation_scenarios(**kwargs):
@@ -1588,8 +1595,12 @@ async def test_fetch_and_analyze_nvda_historiales_crudos_trimestrales_cronologic
         q["operatingCashFlow"] - abs(q["capitalExpenditure"]) for q in reversed(cf)
     ]
 
+    # Iter-4, Decisión #29/#30: TTM rolling, no trimestres crudos —
+    # `n` trimestres crudos de entrada -> `n - 3` puntos en `eps_historial`,
+    # no `n` puntos (criterio de aceptación explícito de `architect`).
+    assert len(captured["eps_historial"]) == len(inc) - 3
     assert captured["eps_historial"] == pytest.approx(
-        [q["eps"] for q in reversed(inc)]
+        rules.build_ttm_historial(inc, "eps")
     )
     assert captured["fcf_historial"] == pytest.approx(fcf_crudo_cronologico)
     assert captured["periodos_por_anio_eps"] == 4
@@ -1601,6 +1612,77 @@ async def test_fetch_and_analyze_nvda_historiales_crudos_trimestrales_cronologic
     # necesarios para reconstruir la aserción anterior.
     assert revenue_crudo_cronologico[0] == inc[-1]["revenue"]
     assert net_income_crudo_cronologico[-1] == inc[0]["netIncome"]
+
+
+async def test_fetch_and_analyze_adbe_eps_historial_anual_fallback_sin_cambios(
+    adobe_fixtures, monkeypatch
+):
+    """Criterio de aceptación de `architect` (Iter-4): rama anual fallback
+    (`DATOS_FUENTE_ANUAL_FALLBACK`, caso ADBE en estos fixtures) ->
+    `eps_historial` SIN CAMBIOS, sigue usando `_annual_series` cruda (no
+    `build_ttm_historial` — esa función solo se usa en la rama trimestral),
+    `periodos_por_anio_eps=1` (test de regresión byte a byte, confirma que
+    la Causa 1 no tocó esta rama)."""
+    captured = {}
+
+    def fake_compute_valuation_scenarios(**kwargs):
+        captured.update(kwargs)
+        return _real_compute_valuation_scenarios(**kwargs)
+
+    _real_compute_valuation_scenarios = query_handler.valuation.compute_valuation_scenarios
+    monkeypatch.setattr(
+        query_handler.valuation, "compute_valuation_scenarios", fake_compute_valuation_scenarios
+    )
+
+    clients = _make_clients(adobe_fixtures)
+    await query_handler.fetch_and_analyze_parts("ADBE", clients, perfil="moderado")
+
+    income_statements = adobe_fixtures["income_statement"]
+    eps_esperado = [s["eps"] for s in reversed(income_statements)]
+
+    assert captured["periodos_por_anio_eps"] == 1
+    assert captured["eps_historial"] == pytest.approx(eps_esperado)
+
+
+async def test_fetch_and_analyze_revenue_net_income_historial_sin_cambios_ambas_ramas(
+    adobe_fixtures, monkeypatch
+):
+    """Criterio de aceptación de `architect` (Iter-4): `revenue_historial`/
+    `net_income_historial` SIN CAMBIOS en ninguna de las 2 ramas — confirma
+    que la Causa 1 es exclusiva de `eps_historial` (grep confirmado en la
+    spec: sin otro consumidor). Verificado en ambas ramas: NVDA (trimestral)
+    y ADBE (anual fallback)."""
+    captured_pillars: dict = {}
+
+    def fake_evaluate_pillars(**kwargs):
+        captured_pillars.update(kwargs)
+        return _real_evaluate_pillars(**kwargs)
+
+    _real_evaluate_pillars = query_handler.rules.evaluate_pillars
+    monkeypatch.setattr(query_handler.rules, "evaluate_pillars", fake_evaluate_pillars)
+
+    clients_nvda = _make_clients_nvda(adobe_fixtures)
+    await query_handler.fetch_and_analyze_parts("NVDA", clients_nvda, perfil="moderado")
+
+    inc_nvda = adobe_fixtures["income_statement_quarterly_nvda"]
+    assert captured_pillars["revenue_historial"] == pytest.approx(
+        [q["revenue"] for q in reversed(inc_nvda)]
+    )
+    assert captured_pillars["net_income_historial"] == pytest.approx(
+        [q["netIncome"] for q in reversed(inc_nvda)]
+    )
+
+    captured_pillars.clear()
+    clients_adbe = _make_clients(adobe_fixtures)
+    await query_handler.fetch_and_analyze_parts("ADBE", clients_adbe, perfil="moderado")
+
+    inc_adbe = adobe_fixtures["income_statement"]
+    assert captured_pillars["revenue_historial"] == pytest.approx(
+        [q["revenue"] for q in reversed(inc_adbe)]
+    )
+    assert captured_pillars["net_income_historial"] == pytest.approx(
+        [q["netIncome"] for q in reversed(inc_adbe)]
+    )
 
 
 async def test_fetch_and_analyze_camino_feliz_exactamente_6_llamadas_propias(adobe_fixtures):

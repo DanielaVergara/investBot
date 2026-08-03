@@ -41,6 +41,45 @@ def sum_ttm_field(quarterly_statements: list[dict], field: str) -> Optional[floa
     return sum(valores)
 
 
+def build_ttm_historial(quarterly_statements: list[dict], field: str) -> list[float]:
+    """Serie TTM *rolling* (ventana de 4 trimestres consecutivos, deslizada
+    de a 1 trimestre) del campo `field`, en orden cronológico (antiguo →
+    reciente). `quarterly_statements` debe venir recent-first, misma
+    convención que `sum_ttm_field`/la respuesta cruda de FMP.
+
+    Reemplaza, para el uso específico del CAGR de Graham (Spec Patch Iter-4),
+    el uso de `_annual_series(quarterly_income, "eps")` sobre datos
+    trimestrales: esa función solo invertía el orden, dejando una serie de
+    puntos de UN trimestre suelto cada uno — comparar 2 puntos así para un
+    CAGR introduce ruido de estacionalidad y, en casos de crecimiento real
+    explosivo (caso NVDA), exagera el `g` resultante de forma severa. Cada
+    punto de la serie que devuelve esta función representa, en cambio, "los
+    últimos 4 trimestres reales terminando en ese trimestre" — un año
+    completo, no un trimestre.
+
+    Con `n` trimestres de entrada, produce `n - 3` puntos TTM (`n < 4` ->
+    lista vacía). Una ventana de 4 trimestres con cualquier valor
+    faltante/no numérico en `field` se OMITE (no se rellena con 0, no se
+    descarta la serie completa) — atomicidad por VENTANA, no por serie
+    completa; distinto del diseño 100% atómico de
+    `calculate_income_statement_ttm` (esa función es "el" EPS TTM mostrado
+    al usuario — todo o nada; acá es una serie de tendencia, donde tolerar 1
+    hueco puntual es preferible a perder toda la serie por 1 trimestre con
+    dato faltante).
+    """
+    n = len(quarterly_statements)
+    if n < 4:
+        return []
+    puntos_recent_first: list[float] = []
+    for start in range(n - 3):
+        ventana = quarterly_statements[start : start + 4]
+        valores = [q.get(field) for q in ventana]
+        if any(not isinstance(v, (int, float)) for v in valores):
+            continue
+        puntos_recent_first.append(sum(valores))
+    return list(reversed(puntos_recent_first))
+
+
 @dataclass
 class IncomeStatementTtmResult:
     disponible: bool

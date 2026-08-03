@@ -286,12 +286,16 @@ async def fetch_and_analyze_parts(
         wacc_interest_expense = income_ttm.interest_expense_ttm
         wacc_income_tax_expense = income_ttm.income_tax_expense_ttm
         wacc_income_before_tax = income_ttm.income_before_tax_ttm
-        eps_historial = _annual_series(income_statements, "eps") or _annual_series(
-            income_statements, "netIncome"
-        )
+        # Spec Patch [Iter-4], Decisión #29/#30 — TTM rolling, no trimestres
+        # sueltos. Solo cambia esta rama; la rama `else` de abajo (anual
+        # fallback, sin cambios) ya usa cifras anuales completas, no
+        # necesita este tratamiento.
+        eps_historial = rules.build_ttm_historial(
+            income_statements, "eps"
+        ) or rules.build_ttm_historial(income_statements, "netIncome")
         revenue_historial = _annual_series(income_statements, "revenue")
         net_income_historial = _annual_series(income_statements, "netIncome")
-        periodos_por_anio_eps = 4
+        periodos_por_anio_eps = 4  # SIN CAMBIOS — ver justificación abajo
     else:
         latest_income = income_statements[0]
         net_income = latest_income.get("netIncome")

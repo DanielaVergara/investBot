@@ -144,6 +144,18 @@ def test_graham_multiplicador_exactamente_cero_excluido():
     assert valuation.calculate_graham_fair_value(eps_ttm=5, g=-0.0425, y=0.04) is None
 
 
+def test_graham_g_alto_no_se_capea_dentro_de_la_funcion():
+    """Criterio QA (Iter-4, gap 3): `calculate_graham_fair_value` NO cambia
+    de comportamiento — recibe `g` ya listo del llamador y lo usa tal cual,
+    sin ningún techo interno. Confirma que `GRAHAM_G_CAP`/`_cap_graham_g`
+    viven 100% en el llamador (`compute_valuation`/`_scenarios`), no
+    migraron a esta función."""
+    g_alto = 0.75  # caso NVDA real, muy por encima de GRAHAM_G_CAP (0.15)
+    resultado = valuation.calculate_graham_fair_value(eps_ttm=10, g=g_alto, y=0.044)
+    esperado_sin_cap = 10 * (8.5 + 2 * 75) * 4.4 / 4.4
+    assert resultado == pytest.approx(esperado_sin_cap)
+
+
 # ---------------------------------------------------------------------------
 # WACC
 # ---------------------------------------------------------------------------
@@ -783,6 +795,13 @@ def test_valuation_adobe_scenarios(adobe_fixtures):
     assert scenarios.conservador.valor_justo_dcf == conservador_directo.valor_justo_dcf
     assert scenarios.conservador.valor_justo_total == conservador_directo.valor_justo_total
     assert scenarios.conservador.modelos_excluidos == conservador_directo.modelos_excluidos
+    # Iter-4, Decisión #33: paridad ampliada a los 3 campos nuevos del cap de
+    # Graham (este fixture no cruza GRAHAM_G_CAP — multiplicador 21.78-33.78,
+    # ver docstring — así que graham_g_capped debe dar False en ambos lados).
+    assert scenarios.conservador.graham_g_original == conservador_directo.graham_g_original
+    assert scenarios.conservador.graham_g_aplicado == conservador_directo.graham_g_aplicado
+    assert scenarios.conservador.graham_g_capped == conservador_directo.graham_g_capped
+    assert conservador_directo.graham_g_capped is False
 
     # --- Los 3 modelos calculables en los 3 escenarios (sin exclusiones de nivel 2) ---
     assert scenarios.modelos_excluidos_base == []
@@ -961,7 +980,14 @@ def test_compute_valuation_periodos_por_anio_eps_4_nueve_elementos_n_anios_2():
     """`periodos_por_anio_eps=4` con `eps_historial` de 9 elementos
     trimestrales → CAGR de Graham calculado con `n_años=2.0`, no con
     `n_años=8` — verificado comparando contra `calculate_cagr` invocado
-    directamente con `n_años=2.0`."""
+    directamente con `n_años=2.0`.
+
+    Iter-4: el `g_eps` crudo resultante de este fixture (~34.16%) cruza
+    `GRAHAM_G_CAP` (15%) — actualizado para aplicar `_cap_graham_g` sobre
+    `g_esperado` antes de pasarlo a `calculate_graham_fair_value`, igual que
+    hace `compute_valuation` internamente desde este patch (cambio de
+    comportamiento intencional, reportado explícitamente, no ajustado en
+    silencio)."""
     eps_historial = [1.0 + i * 0.1 for i in range(9)]  # 9 trimestres
     result = valuation.compute_valuation(
         eps_ttm=eps_historial[-1] * 4,
@@ -973,11 +999,15 @@ def test_compute_valuation_periodos_por_anio_eps_4_nueve_elementos_n_anios_2():
         shares_outstanding=1_000_000,
         periodos_por_anio_eps=4,
     )
-    g_esperado = valuation.calculate_cagr(eps_historial[-1], eps_historial[0], 2.0)
+    g_esperado_crudo = valuation.calculate_cagr(eps_historial[-1], eps_historial[0], 2.0)
+    g_esperado_aplicado, _ = valuation._cap_graham_g(g_esperado_crudo)
     esperado_graham = valuation.calculate_graham_fair_value(
-        eps_historial[-1] * 4, g_esperado, 0.044
+        eps_historial[-1] * 4, g_esperado_aplicado, 0.044
     )
     assert result.valor_justo_graham == pytest.approx(esperado_graham)
+    assert result.graham_g_capped is True
+    assert result.graham_g_original == pytest.approx(g_esperado_crudo)
+    assert result.graham_g_aplicado == pytest.approx(valuation.GRAHAM_G_CAP)
 
 
 def test_compute_valuation_periodos_por_anio_eps_4_ocho_elementos_historial_insuficiente():
@@ -1335,3 +1365,224 @@ def test_compute_valuation_n_peers_validos_cero_explicito_excluye_sin_caso_espec
     assert result.valor_justo_multiplos is None
     motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
     assert motivos.get("multiplos") == "peers_validos_insuficientes"
+
+
+# ---------------------------------------------------------------------------
+# Spec Patch [Iter-4] — GRAHAM_G_CAP / _cap_graham_g (Causa 2 del bug de
+# Graham sobrevaluando NVDA). Criterios de aceptación de `architect` +
+# los agregados por `qa`.
+# ---------------------------------------------------------------------------
+
+
+def test_cap_graham_g_por_debajo_del_cap_sin_modificar():
+    assert valuation._cap_graham_g(0.10) == (0.10, False)
+
+
+def test_cap_graham_g_exactamente_en_el_cap_no_capeado():
+    """Caso límite: `g == GRAHAM_G_CAP` exacto no se considera "por encima"
+    -> no capeado."""
+    assert valuation._cap_graham_g(valuation.GRAHAM_G_CAP) == (valuation.GRAHAM_G_CAP, False)
+
+
+def test_cap_graham_g_por_encima_del_cap_capea():
+    assert valuation._cap_graham_g(0.75) == (valuation.GRAHAM_G_CAP, True)
+
+
+def test_cap_graham_g_negativo_sin_cambios():
+    """El cap es solo superior — `g` muy negativo pasa sin modificar
+    (`False`); el piso lo sigue manejando la guarda de multiplicador
+    existente dentro de `calculate_graham_fair_value`."""
+    assert valuation._cap_graham_g(-0.50) == (-0.50, False)
+
+
+def test_compute_valuation_graham_g_por_debajo_del_cap_regresion_byte_a_byte():
+    """`g_eps` por debajo del cap -> `graham_g_capped=False`,
+    `graham_g_original == graham_g_aplicado`, y `valor_justo_graham` idéntico
+    al comportamiento de antes de este patch (test de regresión explícito:
+    comparación directa contra `calculate_graham_fair_value` con el `g`
+    crudo, sin pasar por `_cap_graham_g`)."""
+    eps_historial = [1.0, 1.03, 1.05]  # g_eps bajo, lejos del cap
+    eps_ttm = 5.0
+    y = 0.044
+    result = valuation.compute_valuation(
+        eps_ttm=eps_ttm,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=y,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    g_eps_crudo = valuation.calculate_cagr(eps_historial[-1], eps_historial[0], 2.0)
+    assert g_eps_crudo < valuation.GRAHAM_G_CAP
+    assert result.graham_g_capped is False
+    assert result.graham_g_original == pytest.approx(g_eps_crudo)
+    assert result.graham_g_aplicado == pytest.approx(g_eps_crudo)
+    esperado_sin_cap = valuation.calculate_graham_fair_value(eps_ttm, g_eps_crudo, y)
+    assert result.valor_justo_graham == pytest.approx(esperado_sin_cap)
+
+
+def test_compute_valuation_graham_g_por_encima_del_cap_capea_caso_nvda_like():
+    """`g_eps` por encima del cap (ej. `g_eps~0.75`, caso NVDA real) ->
+    `graham_g_capped=True`, `graham_g_aplicado=0.15`, `valor_justo_graham`
+    calculado con `g=0.15` (verificado contra `calculate_graham_fair_value`
+    directo)."""
+    eps_ttm = 5.0
+    y = 0.044
+    # antiguo=1.0, reciente=(1.75)^2=3.0625 -> g_eps=0.75 exacto, n_años=2.
+    eps_historial = [1.0, 1.75, 3.0625]
+    result = valuation.compute_valuation(
+        eps_ttm=eps_ttm,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=y,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    g_eps_crudo = valuation.calculate_cagr(eps_historial[-1], eps_historial[0], 2.0)
+    assert g_eps_crudo == pytest.approx(0.75)
+    assert result.graham_g_capped is True
+    assert result.graham_g_original == pytest.approx(0.75)
+    assert result.graham_g_aplicado == pytest.approx(valuation.GRAHAM_G_CAP)
+    esperado_con_cap = valuation.calculate_graham_fair_value(eps_ttm, valuation.GRAHAM_G_CAP, y)
+    assert result.valor_justo_graham == pytest.approx(esperado_con_cap)
+
+
+def test_compute_valuation_scenarios_cap_solo_en_optimista():
+    """`g_eps` base que cruza el cap solo en el escenario Optimista (ej.
+    `g_eps=0.13`, `delta_g=0.03` -> Optimista `0.16 > 0.15`) -> solo
+    `optimista.graham_g_capped=True`; `pesimista`/`conservador` sin capear —
+    confirma que el cap se evalúa de forma independiente por escenario, no
+    una sola vez sobre `g_eps` base."""
+    eps_ttm = 5.0
+    y = 0.044
+    # antiguo=1.0, reciente=(1.13)^2=1.2769 -> g_eps=0.13 exacto, n_años=2.
+    eps_historial = [1.0, 1.13, 1.2769]
+    peer_average = peers.PeerAverageResult(
+        per_promedio=20.0, per_minimo=18.0, per_maximo=22.0, peers_usados=["AAA", "BBB"]
+    )
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=eps_ttm,
+        eps_historial=eps_historial,
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=y,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    assert scenarios.pesimista.graham_g_capped is False
+    assert scenarios.pesimista.graham_g_original == pytest.approx(0.10, abs=1e-6)
+    assert scenarios.conservador.graham_g_capped is False
+    assert scenarios.conservador.graham_g_original == pytest.approx(0.13, abs=1e-6)
+    assert scenarios.optimista.graham_g_capped is True
+    assert scenarios.optimista.graham_g_original == pytest.approx(0.16, abs=1e-6)
+    assert scenarios.optimista.graham_g_aplicado == pytest.approx(valuation.GRAHAM_G_CAP)
+
+
+def test_compute_valuation_scenarios_paridad_conservador_con_cap_activo():
+    """Criterio QA (Iter-4, gap 2): la paridad campo a campo
+    `compute_valuation(...)` vs. `compute_valuation_scenarios(...).conservador`
+    repetida con un fixture donde `g_eps` SÍ cruza el cap (`g_eps=0.20`) — el
+    fixture existente de paridad (`test_valuation_adobe_scenarios`) nunca
+    ejercita `graham_g_capped=True`; un bug que solo aparece con el cap
+    activo (ej. orden de operaciones distinto entre ambos entry points)
+    pasaría inadvertido sin este test."""
+    eps_ttm = 5.0
+    y = 0.044
+    # antiguo=1.0, reciente=(1.20)^2=1.44 -> g_eps=0.20 exacto, n_años=2.
+    eps_historial = [1.0, 1.20, 1.44]
+    wacc_inputs = _wacc_inputs_validos()
+    fcf_historial = [80.0, 90.0, 100.0, 110.0, 120.0]
+    peer_average = peers.PeerAverageResult(
+        per_promedio=20.0, per_minimo=18.0, per_maximo=22.0, peers_usados=["AAA", "BBB"]
+    )
+
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=eps_ttm,
+        eps_historial=eps_historial,
+        peer_average=peer_average,
+        fcf_historial=fcf_historial,
+        y=y,
+        wacc_inputs=wacc_inputs,
+        shares_outstanding=1_000_000,
+    )
+    conservador_directo = valuation.compute_valuation(
+        eps_ttm=eps_ttm,
+        eps_historial=eps_historial,
+        per_promedio_peers=peer_average.per_promedio,
+        fcf_historial=fcf_historial,
+        y=y,
+        wacc_inputs=wacc_inputs,
+        shares_outstanding=1_000_000,
+    )
+
+    assert scenarios.conservador.graham_g_capped is True
+    assert conservador_directo.graham_g_capped is True
+    assert scenarios.conservador.graham_g_original == conservador_directo.graham_g_original
+    assert scenarios.conservador.graham_g_aplicado == conservador_directo.graham_g_aplicado
+    assert scenarios.conservador.graham_g_capped == conservador_directo.graham_g_capped
+    assert scenarios.conservador.valor_justo_graham == conservador_directo.valor_justo_graham
+    assert scenarios.conservador.valor_justo_total == conservador_directo.valor_justo_total
+
+
+def test_compute_valuation_11_trimestres_ttm_historial_insuficiente_end_to_end():
+    """Criterio QA (Iter-4, gap 1) — caso borde real de la Decisión #31: con
+    11 trimestres crudos válidos, `build_ttm_historial` produce 8 puntos TTM
+    -> `n_años_eps = 7/4 = 1.75 < CAGR_MIN_N_AÑOS` -> Graham se excluye con
+    motivo `"historial_insuficiente"` (vía `_motivo_cagr_invalido`) — test de
+    INTEGRACIÓN end-to-end, no solo la longitud de la lista intermedia
+    (eso ya lo cubre `test_rules.py`), sino la exclusión visible al usuario
+    que resulta de alimentar ese `eps_historial` en `compute_valuation`."""
+    from investbot import rules
+
+    # recent-first: índice 0 (más reciente) tiene el valor más alto ->
+    # crecimiento positivo cronológicamente (mismo criterio que el caso de
+    # 12 trimestres de abajo, aunque acá no importa para el resultado: con
+    # n_años<2 el motivo es historial_insuficiente sin importar la dirección
+    # del CAGR).
+    quarters_11 = [{"eps": 1.0 + (10 - i) * 0.1} for i in range(11)]
+    eps_historial = rules.build_ttm_historial(quarters_11, "eps")
+    assert len(eps_historial) == 8
+
+    result = valuation.compute_valuation(
+        eps_ttm=5.0,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    assert result.valor_justo_graham is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("graham") == "historial_insuficiente"
+
+
+def test_compute_valuation_12_trimestres_ttm_no_excluido_end_to_end():
+    """Complemento del caso anterior (borde opuesto, Decisión #31): con
+    exactamente 12 trimestres crudos válidos, `build_ttm_historial` produce
+    9 puntos TTM -> `n_años_eps = 8/4 = 2.0` exacto, en el piso pero no por
+    debajo -> Graham SÍ se calcula (no excluido por `historial_insuficiente`)."""
+    from investbot import rules
+
+    # recent-first: índice 0 (más reciente) tiene el valor más alto ->
+    # crecimiento positivo cronológicamente.
+    quarters_12 = [{"eps": 1.0 + (11 - i) * 0.1} for i in range(12)]
+    eps_historial = rules.build_ttm_historial(quarters_12, "eps")
+    assert len(eps_historial) == 9
+
+    result = valuation.compute_valuation(
+        eps_ttm=5.0,
+        eps_historial=eps_historial,
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+        periodos_por_anio_eps=4,
+    )
+    assert result.valor_justo_graham is not None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert "graham" not in motivos

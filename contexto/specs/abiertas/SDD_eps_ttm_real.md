@@ -1257,3 +1257,362 @@ Todos los criterios de aceptación de la spec original (v1 + ampliación ronda 1
 Este patch no agrega superficie HTTP, no agrega input de usuario nuevo, no cambia ningún cálculo financiero, y replica al 100% un mecanismo (`Optional[str]` de fuente → nota de texto condicional, default `None` retrocompatible) que `security` ya auditó explícitamente para `balance_sheet_fuente` sin hallazgos en esa parte del código (ver "Revisión de `security`" arriba — los 2 hallazgos bloqueantes de esa revisión son sobre la cadena de botones `esc:`/`vent:`, no sobre las notas de transparencia). Por la Regla 4 del pipeline (`pipeline.md`), un spec patch va directo a `implementer` salvo que toque superficie de seguridad o UI — no es el caso acá. `qa` puede agregar sus criterios de cobertura habituales (mismo piso ya fijado para `summary.py` en la sección 5: "el código nuevo específico de esta spec debe llegar a 100%/100% propio") sin que eso implique reabrir `architect`.
 
 **Pregunta abierta para Daniela, no bloqueante:** ¿el texto exacto de las 2 notas nuevas (Decisión #25) le sirve tal cual, o prefiere un wording más corto (ej. omitir la lista de ratios afectados y dejar solo "es TTM real: suma de los últimos 4 trimestres")? `implementer` puede ajustar el wording Markdown menor sin volver a `architect`, mismo criterio ya usado en la Pregunta 4 de la sección "Preguntas abiertas" original de esta spec.
+
+---
+
+## Spec Patch [Iter-4] para: `SDD_eps_ttm_real.md` — NVDA sobrevaluado por Graham ($757.61 vs DCF $363.46, precio real $206.64, PER 42x): 2 causas raíz, ambas corregidas
+
+**Rol:** `architect`. **Origen del pedido:** Daniela, leyendo el output real del bot para NVDA — el modelo Graham EPS del escenario conservador dio $757.61, visiblemente inflado frente al DCF ($363.46), arrastrando "Valor Justo Total" a mostrar NVDA como "barata en los 3 escenarios" cotizando a $206.64 con PER 42x. Pidió arreglar 2 causas raíz, confirmadas ambas leyendo el código real (no solo la spec).
+
+### Criterio que falló
+No aplica — no es una escalación de `implementer` (Ralph Loop). Es un bug de diseño real encontrado en producción sobre una spec que ya llegó a Scope Freeze (Iter-2) y tuvo un patch de presentación (Iter-3). Se trata como spec patch, no spec nueva, porque ambas correcciones son acotadas dentro de `rules.py`/`valuation.py`/`query_handler.py`/`summary.py` y no reabren el diseño núcleo de la spec (TTM real donde la fuente lo permite, fallback anual, transparencia por consulta) — lo extienden.
+
+### Estado actual (confirmado leyendo el código real, línea por línea, no solo el resumen de Daniela)
+
+**Causa 1 — `eps_historial` en la rama trimestral son trimestres sueltos, no TTM.** `query_handler.py` líneas 281-294: cuando `income_statements_fuente == rules.DATOS_FUENTE_TRIMESTRAL` (caso normal hoy, incluido NVDA, `income_statements = quarterly_income`, hasta `ventana_trimestres` trimestres — 12 o 20 según la Decisión #24 de ronda 2):
+```python
+eps_historial = _annual_series(income_statements, "eps") or _annual_series(
+    income_statements, "netIncome"
+)
+...
+periodos_por_anio_eps = 4
+```
+`_annual_series` (línea 142-146) solo invierte el orden a cronológico — no agrega nada. El campo `"eps"` de un reporte trimestral de FMP es el EPS de ESE trimestre puntual. `eps_historial` queda como una serie de hasta 20 valores de EPS de UN trimestre cada uno, no de EPS TTM. Este `eps_historial` alimenta `g_eps = calculate_cagr(eps_historial[-1], eps_historial[0], n_años_eps)` en `valuation.py` (`compute_valuation_scenarios`, línea 544; `compute_valuation`, línea 368), con `n_años_eps = (len(eps_historial)-1)/periodos_por_anio_eps` (línea 541/365) — matemáticamente el CAGR es válido como "tasa anualizada de crecimiento trimestre-puntual a N años", pero compara el EPS de UN trimestre específico de hace ~5 años contra el EPS de UN trimestre específico reciente, heredando ruido de estacionalidad (qué trimestre del año fiscal cayó en cada punta) que no existiría comparando TTM-contra-TTM. Para NVDA, con crecimiento real explosivo de por medio, esto exagera el `g` resultante (~70-75% en el caso real reportado por Daniela).
+
+**Confirmado por grep, no asumido: `eps_historial` no alimenta los pilares.** `rules.evaluate_pillars` (línea 241-271) recibe `revenue_historial`/`net_income_historial` — nunca `eps_historial`. `eps_historial` tiene un único consumidor en todo el código: `query_handler.py` línea 400, pasado a `compute_valuation_scenarios(eps_historial=eps_historial, ...)`. **Esto significa que la Causa 1 se puede corregir sin ningún efecto colateral sobre `evaluate_pillars`/`_es_creciente`** — no hay que decidir nada sobre pilares, no los tocan.
+
+**Causa 2 — sin `cap` sobre `g` en Graham.** `valuation.py` líneas 103-133, `calculate_graham_fair_value`: `EPS_TTM × (8.5 + 2×g_pct) × 4.4 / Y_pct`. La única guarda existente (Spec Patch Iter-3, línea 130-132) es `(8.5+2×g_pct) <= 0 → None` — evita valor negativo, no hay techo superior. Con `g≈75%`, `multiplicador = 8.5 + 2×75 = 158.5` dispara el resultado. La fórmula original de Graham (1962) fue calibrada para `g` como expectativa de crecimiento *futuro* razonable a 7-10 años — Graham mismo advertía no extrapolar crecimiento fuera de un rango típico; `g` acá es CAGR histórico trailing crudo, sin ningún filtro de plausibilidad.
+
+**Hallazgo adicional, confirmado explícitamente (no asumido) por pedido directo de Daniela: `fcf_historial` NO está completamente libre del problema de la Causa 1.** `query_handler.py` líneas 207-210 (`fcf_historial_trimestral`) construye una serie de FCF **por trimestre suelto** (`operatingCashFlow - abs(capitalExpenditure)` de cada trimestre crudo), igual patrón que `eps_historial` antes de este patch. Líneas 316-319, rama trimestral: `fcf_historial = fcf_historial_trimestral` (la serie cruda) y `fcf_base = fcf_ttm` (línea 318, vía `rules.calculate_fcf_ttm` — SÍ es TTM real, suma de los últimos 4 trimestres). La distinción importa: `fcf_base` se usa correctamente como **ancla de NIVEL** de la proyección del DCF (`fcf_base_override` en `calculate_dcf_fair_value`, Decisión #14 de Iter-2, líneas 247-252 de `valuation.py`) — ese número SÍ es TTM real, confirmado. Pero `g_fcf` — el CAGR que determina la *tendencia* de crecimiento proyectada — se calcula en `valuation.py` líneas 561/613 sobre `fcf_historial[0]`/`fcf_historial[-1]` (`compute_valuation_scenarios`) o línea 236-243 dentro de `calculate_dcf_fair_value` (`compute_valuation`), es decir sobre la serie **cruda trimestral**, no sobre una serie TTM rolling — mismo patrón de ruido de estacionalidad que la Causa 1 tenía para EPS. **No se corrige en este patch** — el pedido explícito de Daniela fue sobre Graham/EPS, y en el caso real reportado el DCF ($363.46) no mostró el mismo grado de distorsión que Graham ($757.61) — probablemente porque el DCF amortigua el efecto de un `g` inflado con el descuento a 5 años + valor terminal, a diferencia del multiplicador lineal de Graham. Queda documentado como Decisión #35 (candidato a spec patch futura, no implementado ahora).
+
+### Estado objetivo
+
+1. `eps_historial`, en la rama `DATOS_FUENTE_TRIMESTRAL` de `query_handler.py`, pasa a ser una serie TTM *rolling* (ventana de 4 trimestres consecutivos, deslizada de a 1) en vez de trimestres sueltos — cada punto representa "los últimos 4 trimestres reales terminando en ese trimestre", no un trimestre puntual.
+2. `g` (CAGR de EPS) usado en Graham queda acotado a un techo `GRAHAM_G_CAP = 0.15` (15%) — aplicado independientemente en cada uno de los 3 escenarios (Pesimista/Conservador/Optimista, cada uno con su propio `g` desplazado por `±DELTA_G`) — con nota de transparencia explícita al usuario cuando el cap se activa, mismo principio de "nunca ocultar un ajuste" que el resto de esta spec.
+
+### Decisión #29 — `rules.py`: nueva función `build_ttm_historial` (Causa 1)
+
+```python
+def build_ttm_historial(quarterly_statements: list[dict], field: str) -> list[float]:
+    """Serie TTM *rolling* (ventana de 4 trimestres consecutivos, deslizada
+    de a 1 trimestre) del campo `field`, en orden cronológico (antiguo →
+    reciente). `quarterly_statements` debe venir recent-first, misma
+    convención que `sum_ttm_field`/la respuesta cruda de FMP.
+
+    Reemplaza, para el uso específico del CAGR de Graham (Spec Patch Iter-4),
+    el uso de `_annual_series(quarterly_income, "eps")` sobre datos
+    trimestrales: esa función solo invertía el orden, dejando una serie de
+    puntos de UN trimestre suelto cada uno — comparar 2 puntos así para un
+    CAGR introduce ruido de estacionalidad y, en casos de crecimiento real
+    explosivo (caso NVDA), exagera el `g` resultante de forma severa. Cada
+    punto de la serie que devuelve esta función representa, en cambio, "los
+    últimos 4 trimestres reales terminando en ese trimestre" — un año
+    completo, no un trimestre.
+
+    Con `n` trimestres de entrada, produce `n - 3` puntos TTM (`n < 4` ->
+    lista vacía). Una ventana de 4 trimestres con cualquier valor
+    faltante/no numérico en `field` se OMITE (no se rellena con 0, no se
+    descarta la serie completa) — atomicidad por VENTANA, no por serie
+    completa; distinto del diseño 100% atómico de
+    `calculate_income_statement_ttm` (esa función es "el" EPS TTM mostrado
+    al usuario — todo o nada; acá es una serie de tendencia, donde tolerar 1
+    hueco puntual es preferible a perder toda la serie por 1 trimestre con
+    dato faltante).
+    """
+    n = len(quarterly_statements)
+    if n < 4:
+        return []
+    puntos_recent_first: list[float] = []
+    for start in range(n - 3):
+        ventana = quarterly_statements[start : start + 4]
+        valores = [q.get(field) for q in ventana]
+        if any(not isinstance(v, (int, float)) for v in valores):
+            continue
+        puntos_recent_first.append(sum(valores))
+    return list(reversed(puntos_recent_first))
+```
+
+**Por qué no reutilizar/generalizar `sum_ttm_field`:** esa función suma únicamente los primeros 4 elementos de la lista (un solo TTM puntual, Decisión #9 de Iter-2) — `build_ttm_historial` necesita TODAS las ventanas deslizantes, es una función distinta con un propósito distinto (serie de tendencia vs. cifra puntual), no una extensión natural de la misma firma.
+
+### Decisión #30 — `query_handler.py`: integración en la rama trimestral (reemplaza únicamente las líneas 289-291, dentro del bloque de la Decisión #10 de Iter-2)
+
+```python
+    if income_statements_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        eps_ttm = income_ttm.net_income_ttm / income_ttm.shares_outstanding_reciente
+        revenue = income_ttm.revenue_ttm
+        cost_of_revenue = income_ttm.cost_of_revenue_ttm
+        shares_outstanding = income_ttm.shares_outstanding_reciente
+        wacc_interest_expense = income_ttm.interest_expense_ttm
+        wacc_income_tax_expense = income_ttm.income_tax_expense_ttm
+        wacc_income_before_tax = income_ttm.income_before_tax_ttm
+        # Spec Patch [Iter-4], Decisión #29/#30 — TTM rolling, no trimestres
+        # sueltos. Solo cambia esta rama; la rama `else` de abajo (anual
+        # fallback, sin cambios) ya usa cifras anuales completas, no
+        # necesita este tratamiento.
+        eps_historial = rules.build_ttm_historial(
+            income_statements, "eps"
+        ) or rules.build_ttm_historial(income_statements, "netIncome")
+        revenue_historial = _annual_series(income_statements, "revenue")
+        net_income_historial = _annual_series(income_statements, "netIncome")
+        periodos_por_anio_eps = 4  # SIN CAMBIOS — ver justificación abajo
+    else:
+        ...  # rama anual fallback — SIN CAMBIOS
+```
+
+**Por qué `periodos_por_anio_eps` se queda en `4` sin ningún cambio en `valuation.py`:** con `n` trimestres crudos de entrada, `build_ttm_historial` produce `n-3` puntos TTM, pero **cada punto sigue estando 1 trimestre separado del siguiente** (ventana deslizada de a 1) — el "paso" entre puntos consecutivos de la serie sigue siendo 1 trimestre, exactamente igual que con los trimestres sueltos de antes. La fórmula existente `n_años_eps = (len(eps_historial)-1)/periodos_por_anio_eps` (Decisión #13 de Iter-2, sin tocar) sigue siendo matemáticamente correcta sin modificación: con `ventana_trimestres=20` → 17 puntos TTM → `n_años_eps = 16/4 = 4.0`; con `ventana_trimestres=12` → 9 puntos TTM → `n_años_eps = 8/4 = 2.0`. **Cero cambios en `valuation.py` para la Causa 1** — el fix es 100% de construcción de datos en `query_handler.py` + la función nueva en `rules.py`.
+
+**Revenue/net income NO cambian** (siguen con `_annual_series` cruda) — confirman la Causa 1 solo afecta `eps_historial`; `revenue_historial`/`net_income_historial` alimentan pilares (`_es_creciente`, comparación booleana de extremos, no CAGR), donde el ruido de estacionalidad ya fue evaluado y aceptado explícitamente en la Decisión #15 de Iter-2 — **no está en alcance de este patch** (pedido explícito de Daniela fue sobre Graham/EPS; si Daniela quiere extender el mismo tratamiento a pilares, es candidato a un patch futuro separado, no se decide en silencio acá).
+
+### Decisión #31 — Riesgo aceptado: la ventana mínima (`VENTANA_TRIMESTRES_CORTO=12`) pasa a tener margen cero antes de `historial_insuficiente`
+
+Construir TTM rolling "consume" 3 trimestres como período de calentamiento (los primeros 3 trimestres de la ventana cruda no alcanzan para formar un punto TTM válido). Efecto medido:
+- Antes de este patch, con 12 trimestres crudos: `n_años_eps = 11/4 = 2.75` (margen cómodo sobre el piso `CAGR_MIN_N_AÑOS=2`).
+- Después de este patch, con 12 trimestres crudos → 9 puntos TTM → `n_años_eps = 8/4 = 2.0` — exactamente en el piso, sin margen. Si FMP devuelve 11 trimestres en vez de 12 (dato faltante puntual, empresa con historial más corto), la serie post-patch cae a 8 puntos TTM → `n_años_eps = 1.75 < 2` → Graham se excluye con motivo `historial_insuficiente`, mientras que antes del patch con esos mismos 11 trimestres crudos (`n_años_eps = 10/4 = 2.5`) Graham SÍ se hubiese calculado.
+
+**Aceptado explícitamente, no corregido en este patch** (mismo tratamiento que la Decisión #15 de Iter-2 le dio al riesgo de estacionalidad): es un costo inherente al diseño rolling, más visible para empresas con historial trimestral cerca del mínimo (ej. IPOs recientes) cuando se usa la ventana corta (`VENTANA_TRIMESTRES_CORTO=12`, "3 años" en los botones de la Decisión #24 de Iter-2 ronda 2). Con la ventana larga (`VENTANA_TRIMESTRES_LARGO=20`) el margen sigue siendo amplio (17 puntos TTM, `n_años_eps=4.0`). Si esto resulta un problema real en producción, es candidato a que `implementer`/Daniela suban el piso `VENTANA_TRIMESTRES_CORTO` en un patch puntual, no algo que este patch deba resolver ahora.
+
+### Decisión #32 — `valuation.py`: techo `GRAHAM_G_CAP = 0.15` (15%) + helper `_cap_graham_g` (Causa 2)
+
+```python
+# Spec Patch [Iter-4] — techo superior sobre `g` (CAGR de EPS) al alimentar
+# la fórmula de Graham. Constante documentada, ajustable sin que sea una
+# "regresión" de un criterio verde (mismo tratamiento que MARKET_RISK_PREMIUM
+# /DELTA_G/DELTA_WACC). Valor: 15%.
+#
+# Justificación del número: la fórmula de Graham (8.5 + 2×g_pct) es LINEAL
+# en g — a diferencia del DCF (que amortigua un g alto con descuento
+# compuesto a 5 años + valor terminal), acá cada punto porcentual de más en
+# g suma 2 puntos enteros al multiplicador, sin techo natural. Graham (1962)
+# diseñó "g" para una expectativa de crecimiento FUTURO razonable a 7-10
+# años, advirtiendo explícitamente contra extrapolar crecimiento fuera de lo
+# típico — no para un CAGR histórico trailing crudo de una empresa en un
+# ciclo de expansión extraordinario (caso NVDA). 15% es, de forma
+# consistente con implementaciones públicas conocidas de esta fórmula
+# (calculadoras de "Graham Number"/valor intrínseco de uso común en la
+# comunidad value investing), el techo más citado para "crecimiento alto
+# pero todavía plausible de sostener": el crecimiento nominal de utilidades
+# del S&P 500 en el largo plazo ronda 6-8%; 15% ya representa una empresa de
+# alta calidad y crecimiento muy por encima del promedio del mercado. Por
+# encima de eso, la extrapolación lineal de Graham deja de ser una
+# aproximación razonable y empieza a producir múltiplos que ninguna empresa,
+# por buena que sea, sostiene indefinidamente.
+GRAHAM_G_CAP = 0.15
+
+
+def _cap_graham_g(g: float) -> tuple[float, bool]:
+    """Aplica `GRAHAM_G_CAP` sobre `g` ANTES de que alimente
+    `calculate_graham_fair_value`. Devuelve `(g_aplicado, fue_limitado)`.
+
+    Vive como helper de módulo, separado de `calculate_graham_fair_value`,
+    a propósito: `compute_valuation`/`compute_valuation_scenarios` necesitan
+    el PAR `(g_original, g_aplicado)` para poblar los campos nuevos de
+    `ValuationResult`/`ScenarioValuationResult` (Decisión #33) que alimentan
+    la nota de transparencia (Decisión #34). Cambiar la firma pública de
+    `calculate_graham_fair_value(eps_ttm, g, y) -> Optional[float]` para que
+    devuelva esa metadata rompería su contrato actual (2 call sites, tests
+    existentes) sin necesidad — el cap se decide ANTES de llamarla; ella
+    sigue recibiendo un `g` ya listo, exactamente como antes de este patch,
+    sin saber que existe un cap."""
+    if g > GRAHAM_G_CAP:
+        return GRAHAM_G_CAP, True
+    return g, False
+```
+
+**`calculate_graham_fair_value` (líneas 103-133) NO cambia ni una línea** — sigue recibiendo `g` ya acotado por el llamador, sigue sin saber que el cap existe. La guarda existente `(8.5+2×g_pct)<=0 → None` (Spec Patch Iter-3) sigue intacta y sigue aplicando solo al lado negativo (`g` muy negativo, empresa en fuerte declive) — **no se agrega ningún piso inferior simétrico**, no fue pedido y esa guarda ya cubre el caso de negocio real (excluir el modelo en vez de un valor sin sentido).
+
+### Decisión #33 — `ValuationResult`/`ScenarioValuationResult`: 3 campos nuevos + integración en `compute_valuation`/`compute_valuation_scenarios`
+
+```python
+@dataclass
+class ValuationResult:
+    valor_justo_multiplos: Optional[float] = None
+    valor_justo_graham: Optional[float] = None
+    valor_justo_dcf: Optional[float] = None
+    valor_justo_total: Optional[float] = None
+    modelos_excluidos: list[ModeloExcluido] = field(default_factory=list)
+    graham_g_original: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_aplicado: Optional[float] = None   # NUEVO — Iter-4
+    graham_g_capped: bool = False               # NUEVO — Iter-4
+
+    def as_dict(self) -> dict:
+        return {
+            "valor_justo_multiplos": self.valor_justo_multiplos,
+            "valor_justo_graham": self.valor_justo_graham,
+            "valor_justo_dcf": self.valor_justo_dcf,
+            "valor_justo_total": self.valor_justo_total,
+            "modelos_excluidos": [...],
+            "graham_g_original": self.graham_g_original,     # NUEVO
+            "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
+            "graham_g_capped": self.graham_g_capped,         # NUEVO
+        }
+```
+Mismos 3 campos, mismo `as_dict()`, en `ScenarioValuationResult`.
+
+En `compute_valuation` (líneas 361-383), rama `else` del bloque Graham:
+```python
+        else:
+            g_eps_aplicado, g_eps_capped = _cap_graham_g(g_eps)  # NUEVO
+            result.graham_g_original = g_eps                     # NUEVO
+            result.graham_g_aplicado = g_eps_aplicado             # NUEVO
+            result.graham_g_capped = g_eps_capped                 # NUEVO
+            result.valor_justo_graham = calculate_graham_fair_value(eps_ttm, g_eps_aplicado, y)
+            if result.valor_justo_graham is None:
+                result.modelos_excluidos.append(
+                    ModeloExcluido("graham", "graham_multiplicador_no_positivo")
+                )
+```
+
+En `compute_valuation_scenarios`, dentro de `_escenario(...)` (líneas 594-605), rama `else` del bloque Graham — **el cap se aplica al `g` YA desplazado por escenario (`g_escenario = g_eps + g_delta`), de forma independiente en cada uno de los 3 escenarios**, porque cada uno puede cruzar el techo en un punto distinto (ej. `g_eps=13%` no cruza el cap en Pesimista `10%` ni Conservador `13%`, pero sí en Optimista `16%`):
+```python
+        else:
+            g_escenario = g_eps + g_delta
+            g_escenario_aplicado, g_escenario_capped = _cap_graham_g(g_escenario)  # NUEVO
+            scenario.graham_g_original = g_escenario                                # NUEVO
+            scenario.graham_g_aplicado = g_escenario_aplicado                        # NUEVO
+            scenario.graham_g_capped = g_escenario_capped                            # NUEVO
+            scenario.valor_justo_graham = calculate_graham_fair_value(
+                eps_ttm, g_escenario_aplicado, y
+            )
+            if scenario.valor_justo_graham is None:
+                scenario.modelos_excluidos.append(
+                    ModeloExcluido("graham", "graham_multiplicador_no_positivo")
+                )
+```
+
+**Invariante existente a preservar, ya testeado (docstring de `compute_valuation`, líneas 335-337): paridad campo a campo entre `compute_valuation(...)` y `compute_valuation_scenarios(...).conservador`.** Por esto los 3 campos nuevos se agregan a AMBAS dataclasses de forma simétrica — si solo se agregaran a `ScenarioValuationResult`, ese invariante se rompería y el test de paridad existente fallaría.
+
+### Decisión #34 — `summary.py`: nota de transparencia cuando el cap se activa (Decisión de diseño de este `architect`, alineada con la recomendación de Daniela)
+
+Se adopta el patrón "cap + nota de transparencia explícita" — mismo principio que las notas de fuente de datos (Iter-3): **nunca ocultar un ajuste que cambia un número que el usuario ve.** Se descarta la alternativa de "cap silencioso" (aplicar el techo sin decir nada) porque contradice ese principio ya establecido 3 veces en esta misma spec (income-statement, cash-flow, balance-sheet) — sería inconsistente introducir una 4ª corrección de magnitud comparable (esta vez sobre un modelo de valoración completo, no solo una cifra auxiliar) sin el mismo nivel de aviso.
+
+En `build_valuation_scenarios_section` (`summary.py`, dentro del bloque que ya recorre `pesimista`/`conservador`/`optimista`, después del loop de `_MODELOS_ORDEN` y antes del renglón de `excluidos_base`):
+```python
+    graham_g_cap_avisos: list[str] = []
+    for escenario_nombre, escenario in (
+        ("Pesimista", pesimista),
+        ("Conservador", conservador),
+        ("Optimista", optimista),
+    ):
+        if escenario.get("graham_g_capped"):
+            g_original = escenario.get("graham_g_original")
+            g_aplicado = escenario.get("graham_g_aplicado")
+            graham_g_cap_avisos.append(
+                f"- ℹ️ Graham ({escenario_nombre}): el crecimiento histórico (g) "
+                f"usado se limitó de {g_original * 100:.1f}% a "
+                f"{g_aplicado * 100:.0f}% porque la fórmula de Graham no puede "
+                "modelar razonablemente crecimientos tan altos de forma "
+                "sostenida — evita un Valor Justo por Graham artificialmente "
+                "inflado."
+            )
+    lines.extend(graham_g_cap_avisos)
+```
+**Se muestra para los 3 escenarios donde aplique, no solo para `escenario_elegido`** — mismo criterio que `modelos_nivel2_nd` (N/D por escenario, líneas 245-251 de `summary.py`) ya usa: no se filtra por el escenario resaltado, todos los avisos relevantes son visibles siempre, "resalta, no oculta".
+
+**Por qué en la sección de Valor Justo y no en "Notas de transparencia"** (a diferencia de las notas de fuente de datos, Decisión #26 de Iter-3): esta nota es específica de UN modelo (Graham) y potencialmente de 1-3 escenarios distintos entre sí — ponerla en la sección global de transparencia (que hoy es 1 línea por concepto, no por escenario) requeriría un formato nuevo ahí. Vive junto a la fila de Graham y su fórmula (mismo patrón ya usado por `modelos_nivel2_nd`), donde el usuario ya está mirando ese número específico.
+
+### Decisión #35 — Hallazgo documentado, NO corregido en este patch: `fcf_historial`/`g_fcf` (DCF) tiene el mismo problema de unidad que `eps_historial` tenía
+
+Ver "Estado actual" arriba para el detalle completo confirmado por lectura de código. Resumen: `fcf_base` (ancla de NIVEL del DCF) ya es TTM real, correcto, sin cambios necesarios. `g_fcf` (CAGR de TENDENCIA) se sigue calculando sobre `fcf_historial` crudo trimestral, mismo patrón de ruido de estacionalidad que la Causa 1 tenía para EPS antes de este patch. **No se corrige acá** porque:
+1. El pedido explícito de Daniela fue sobre Graham/EPS, no sobre el DCF.
+2. En el caso real reportado (NVDA), el DCF ($363.46) no mostró el mismo grado de distorsión que Graham ($757.61) — la hipótesis de este `architect` es que el descuento compuesto a 5 años + valor terminal del DCF amortigua naturalmente un `g_fcf` inflado, a diferencia del multiplicador lineal sin techo de Graham (antes de este patch). No está probado con un caso real de FCF con estacionalidad severa — es una hipótesis razonable, no un hecho confirmado.
+3. Si Daniela confirma que quiere el mismo tratamiento (TTM rolling para `fcf_historial`, análogo a `build_ttm_historial`) aplicado al DCF, es un patch puntual de bajo riesgo — reutiliza `build_ttm_historial` (Decisión #29) tal cual, mismo `campo="freeCashFlow"` o reconstruyendo desde `operatingCashFlow`/`capitalExpenditure` por ventana. **No se implementa en silencio ahora** para no exceder el alcance que Daniela pidió explícitamente.
+
+### Criterios de aceptación
+
+**`rules.py`**
+- [ ] `build_ttm_historial` con 20 trimestres válidos → 17 puntos TTM, cada uno la suma de una ventana de 4 consecutiva, en orden cronológico.
+- [ ] `build_ttm_historial` con 12 trimestres válidos → 9 puntos TTM (`n_años_eps` resultante = 2.0 exacto, no excluido por `historial_insuficiente`).
+- [ ] `build_ttm_historial` con menos de 4 trimestres → `[]`.
+- [ ] `build_ttm_historial` con un valor no numérico/ausente en 1 trimestre dentro del rango → esa(s) ventana(s) que lo incluyen se omiten, las demás ventanas válidas se conservan (no se descarta toda la serie).
+- [ ] `build_ttm_historial` con el campo `"eps"` totalmente ausente → cae al fallback `"netIncome"` (mismo criterio `or` que antes tenía `_annual_series`).
+- [ ] **Test comparativo explícito (pedido directo de Daniela/Claude):** con un fixture sintético de EPS trimestral con crecimiento real pero estacionalidad marcada, `g_eps` calculado sobre `build_ttm_historial(...)` da un valor estrictamente menor (o igual) que `g_eps` calculado sobre `_annual_series(..., "eps")` cruda, para el mismo input — confirma que el fix reduce (nunca aumenta) el ruido de estacionalidad.
+
+**`valuation.py`**
+- [ ] `_cap_graham_g(g)` con `g <= GRAHAM_G_CAP` → `(g, False)` sin modificar el valor (incluye el caso límite `g == GRAHAM_G_CAP` exacto → no capeado).
+- [ ] `_cap_graham_g(g)` con `g > GRAHAM_G_CAP` → `(GRAHAM_G_CAP, True)`.
+- [ ] `_cap_graham_g` con `g` muy negativo → sin cambios (`False`, el cap es solo superior, `calculate_graham_fair_value` sigue manejando el piso vía su guarda de multiplicador existente).
+- [ ] `compute_valuation`/`compute_valuation_scenarios` con `g_eps` por debajo del cap → `graham_g_capped=False`, `graham_g_original == graham_g_aplicado`, `valor_justo_graham` **byte a byte idéntico** al comportamiento de antes de este patch (test de regresión explícito).
+- [ ] `compute_valuation`/`compute_valuation_scenarios` con `g_eps` por encima del cap (ej. `g_eps=0.75`, caso NVDA real) → `graham_g_capped=True`, `graham_g_aplicado=0.15`, `valor_justo_graham` calculado con `g=0.15` (verificable comparando contra `calculate_graham_fair_value(eps_ttm, 0.15, y)` directamente).
+- [ ] `compute_valuation_scenarios` con un `g_eps` base que cruza el cap solo en el escenario Optimista (ej. `g_eps=0.13`, `delta_g=0.03` → Optimista `0.16 > 0.15`) → solo `optimista.graham_g_capped=True`; `pesimista`/`conservador` sin capear — confirma que el cap se evalúa de forma independiente por escenario, no una sola vez sobre `g_eps` base.
+- [ ] Paridad campo a campo `compute_valuation(...)` vs. `compute_valuation_scenarios(...).conservador` **sigue verde** incluyendo los 3 campos nuevos (test de regresión sobre el invariante ya existente, ampliado).
+- [ ] `calculate_graham_fair_value` (función en sí) — ningún test existente cambia; no se modifica su firma ni su comportamiento interno.
+
+**`query_handler.py`**
+- [ ] Con fuente trimestral disponible → `eps_historial` construido vía `build_ttm_historial`, no vía `_annual_series` cruda (test que confirma el cambio de longitud: `ventana_trimestres` trimestres de entrada → `ventana_trimestres - 3` puntos en `eps_historial`, no `ventana_trimestres` puntos).
+- [ ] `periodos_por_anio_eps` sigue en `4` en la rama trimestral (test de regresión explícito, confirma que no se tocó).
+- [ ] Rama anual fallback (`DATOS_FUENTE_ANUAL_FALLBACK`) → `eps_historial` **sin cambios**, sigue usando `_annual_series` cruda, `periodos_por_anio_eps=1` (test de regresión byte a byte).
+- [ ] `revenue_historial`/`net_income_historial` **sin cambios** en ambas ramas (test de regresión explícito — confirma que la Causa 1 no tocó pilares).
+
+**`summary.py`**
+- [ ] `build_valuation_scenarios_section` sin ningún escenario con `graham_g_capped=True` → output **byte a byte idéntico** al comportamiento de antes de este patch (regresión).
+- [ ] Con `conservador.graham_g_capped=True` (`graham_g_original=0.75`, `graham_g_aplicado=0.15`) → la línea de aviso aparece, con "75.0%" y "15%" en el texto.
+- [ ] Con cap activo en 2 de los 3 escenarios simultáneamente (ej. Conservador y Optimista, no Pesimista) → aparecen exactamente 2 líneas de aviso, cada una con el nombre de escenario correcto — no 1 sola genérica, no 3.
+- [ ] El aviso aparece independientemente de cuál sea `escenario_elegido` (test con `escenario_elegido="pesimista"` y cap activo en `optimista` → el aviso de Optimista sigue visible).
+
+### Criterios de aceptación — qa
+
+**Rol:** `qa`, Momento 1 (pre-implementación). Revisión de los criterios de aceptación de `architect` de arriba, antes de Scope Freeze → `implementer`. No se reescriben — se complementan con los ángulos de cobertura/regresión que faltaban.
+
+**Tipo de prueba principal:** Unit testing (funciones puras sin I/O: `build_ttm_historial`, `_cap_graham_g`, bloque Graham de `compute_valuation`/`compute_valuation_scenarios`, bloque de avisos de `build_valuation_scenarios_section`) + Regression testing dirigido sobre la suite completa (no solo los módulos tocados) — justificado por Regla 3 (este patch cambia un Valor Justo real que el usuario ve) y porque `eps_historial` tiene un consumidor único pero atraviesa 4 archivos de producción.
+
+**Cobertura mínima requerida:**
+- [ ] 100% líneas y branches en `build_ttm_historial` y `_cap_graham_g` (lógica crítica de negocio — cambia un número financiero visible al usuario).
+- [ ] Todos los criterios de aceptación de `architect` (líneas ~1520-1551) cubiertos por al menos un test, más los 3 agregados abajo.
+
+**Gaps encontrados (los 3 puntos revisados explícitamente):**
+
+1. **Decisión #31 — falta el caso borde real (11 trimestres), solo está el caso "exacto en el piso" (12 trimestres).** El criterio existente (`build_ttm_historial` con 12 trimestres → `n_años_eps=2.0` exacto, no excluido) no cubre la caída que la propia Decisión #31 describe como riesgo aceptado: FMP devolviendo 11 trimestres por un dato faltante puntual. Agregado:
+   - [ ] `build_ttm_historial` con 11 trimestres válidos → 8 puntos TTM → `n_años_eps = 7/4 = 1.75 < CAGR_MIN_N_AÑOS`. Test de integración en `valuation.py` que confirma el efecto end-to-end: Graham se excluye con motivo `"historial_insuficiente"` (vía `_motivo_cagr_invalido`, `valuation.py` líneas 652-653) — no solo la longitud de la lista intermedia, sino la exclusión visible al usuario.
+
+2. **Paridad campo a campo — falta el caso CAPEADO, solo está el caso por defecto.** El fixture existente que prueba esta paridad (`test_valuation_adobe_scenarios`) tiene multiplicador Graham 21.78-33.78, muy por debajo del cap 15% — nunca ejercita `graham_g_capped=True`. Un bug que solo aparece con el cap activo (ej. orden de operaciones distinto entre `compute_valuation` y el escenario `conservador` de `compute_valuation_scenarios`) pasaría inadvertido. Agregado:
+   - [ ] Paridad campo a campo repetida con un fixture sintético donde `g_eps` cruza el cap (ej. `g_eps=0.20`): confirma `graham_g_original`, `graham_g_aplicado`, `graham_g_capped` y `valor_justo_graham` idénticos entre `compute_valuation(...)` y `compute_valuation_scenarios(...).conservador`, no solo en el caso sin cap.
+
+3. **Regresión silenciosa — falta correr la suite completa, no solo los tests dirigidos.** Todos los criterios de `architect` son puntuales (byte a byte en casos específicos); ninguno pide correr `pytest` completo. Como `eps_historial` cambia de forma en la rama trimestral, cualquier assert preexistente en `tests/test_query_handler.py` que dependa de su contenido/longitud exacta va a romper — esperado, pero debe quedar explícito, no ajustado en silencio. Agregado:
+   - [ ] `pytest` completo corre en verde antes de cerrar Iter-4 (no solo los 4 archivos de test dirigidos).
+   - [ ] Cualquier assert preexistente cuyo valor esperado cambie por este patch se lista explícitamente en el commit/PR — no se edita en silencio para que la suite pase.
+   - [ ] Ningún test de `calculate_graham_fair_value` (función pura, sin cap) cambia su valor esperado — confirma que la Causa 2 vive 100% en el llamador (`_cap_graham_g`), no migró a la función.
+
+**Testabilidad:**
+- [ ] `build_ttm_historial` y `_cap_graham_g` son funciones puras (sin I/O, sin estado), confirmado por la spec (Decisión #29/#32) — testeables con fixtures sintéticas, sin mockear HTTP/FMP.
+- [ ] El bloque de avisos en `build_valuation_scenarios_section` opera sobre dicts ya resueltos, sin mocks nuevos — consistente con el resto de `summary.py`.
+
+**Criterio de exit de QA:**
+- Todos los tests pasan (`pytest` completo, suite verde).
+- Sin tests ignorados/comentados para pasar CI.
+- Flaky rate = 0 en los tests nuevos.
+- Los 3 gaps de arriba incorporados a los criterios de aceptación antes de Scope Freeze.
+
+**Veredicto:** con estos 3 agregados, la spec queda lista para `implementer`. No hay problemas de testabilidad (sin acoplamiento duro, sin I/O escondido, sin lógica en constructores/estáticos no testeables) que ameriten escalar a `architect`.
+
+### Artefactos a crear/modificar
+- `src/investbot/rules.py` → función nueva `build_ttm_historial`.
+- `src/investbot/valuation.py` → constante `GRAHAM_G_CAP`, función nueva `_cap_graham_g`; `ValuationResult`/`ScenarioValuationResult` ganan 3 campos (`graham_g_original`, `graham_g_aplicado`, `graham_g_capped`) + `as_dict()` actualizado; `compute_valuation`/`compute_valuation_scenarios` (bloque Graham) integran el cap.
+- `src/investbot/query_handler.py` → línea ~289-291, rama `DATOS_FUENTE_TRIMESTRAL`: `eps_historial` vía `build_ttm_historial` en vez de `_annual_series`. Ninguna otra línea de este archivo cambia.
+- `src/investbot/summary.py` → `build_valuation_scenarios_section` gana el bloque de avisos de cap de Graham por escenario.
+- `tests/test_rules.py` → tests de `build_ttm_historial` (7 casos listados arriba).
+- `tests/test_valuation.py` → tests de `_cap_graham_g`, del cap integrado en `compute_valuation`/`compute_valuation_scenarios`, y de la paridad ampliada.
+- `tests/test_query_handler.py` → tests de la construcción de `eps_historial` en ambas ramas.
+- `tests/test_summary.py` → tests de los avisos de cap en `build_valuation_scenarios_section`.
+
+### Restricciones
+- **`calculate_graham_fair_value` no cambia de firma ni de comportamiento interno** — el cap se decide antes de llamarla.
+- **`rules._es_creciente`/`rules.evaluate_pillars`/`revenue_historial`/`net_income_historial` no cambian** — la Causa 1 es exclusiva de `eps_historial`, confirmado por grep que no tiene otro consumidor.
+- **`n_años_eps`/`periodos_por_anio_eps` en `valuation.py` no cambian** — el fix de la Causa 1 es 100% de construcción de datos, la fórmula matemática ya existente (Decisión #13 de Iter-2) sigue siendo correcta sin modificación.
+- **`fcf_historial`/`g_fcf`/el DCF no cambian en este patch** — hallazgo documentado (Decisión #35), fuera de alcance por decisión explícita, no en silencio.
+- **`GRAHAM_G_CAP=0.15` es una constante ajustable, no un valor sagrado** — mismo tratamiento que `MARKET_RISK_PREMIUM`/`DELTA_G`, Daniela puede pedir cambiarlo sin que sea una "regresión" de un criterio verde.
+- **El cap nunca es silencioso** — siempre acompañado de la nota de transparencia de la Decisión #34 cuando se activa.
+
+### Handoff → `qa` → `implementer`
+
+A diferencia del Spec Patch [Iter-3] (puramente de presentación, fue directo a `implementer`), este patch **cambia el valor numérico de un modelo de valoración financiera real** (Graham) que el usuario ve y en el que potencialmente toma decisiones — por Regla 3 del pipeline (`pipeline.md`), un cambio de este tipo amerita que `qa` agregue explícitamente sus criterios de cobertura/regresión antes de `implementer`, aunque no haya superficie HTTP ni input de usuario nuevo (mismo criterio de "no toca seguridad/UI" que permitió a Iter-3 saltar `security`, pero el impacto en un cálculo financiero visible justifica no saltar `qa`).
+
+### Specs producidas
+- Este Spec Patch [Iter-4], agregado a `contexto/specs/abiertas/SDD_eps_ttm_real.md`.
+
+### Decisiones de diseño tomadas (para que `qa`/`implementer` no las reabran)
+- **Causa 1 (unidad de `eps_historial`): TTM rolling vía `build_ttm_historial`, no una serie TTM más simple ni un cambio de `periodos_por_anio_eps`.** Se reconsideró explícitamente la alternativa "TTM móvil" que la Decisión #15 de Iter-2 había evaluado y descartado para toda la spec ("todo trimestral" literal) — acá se adopta, pero SOLO para `eps_historial` (consumidor único: CAGR de Graham), no para `revenue_historial`/`net_income_historial` (pilares) ni para `fcf_historial` (DCF, Decisión #35). No es una reversión silenciosa de la Decisión #15 — es una corrección puntual y acotada al síntoma real que Daniela reportó.
+- **Causa 2 (techo de `g`): cap duro en `0.15` + nota de transparencia siempre visible cuando se activa, evaluado por escenario de forma independiente.** Se descartó explícitamente un cap silencioso por inconsistencia con el resto de la spec.
+- **Hallazgo del `fcf_historial`/DCF: documentado, no corregido** — no es una omisión, es una decisión explícita de scope (Decisión #35).
+- **Ningún cambio rompe la paridad campo a campo `compute_valuation` vs. `compute_valuation_scenarios(...).conservador`** — los 3 campos nuevos se agregan simétricamente a ambas dataclasses.
+
+**Pregunta abierta para Daniela, no bloqueante para que `qa` continúe:** ¿el techo de 15% le parece razonable, o prefiere un número distinto (ej. 20%, más permisivo con empresas de alto crecimiento genuino) o que el cap dependa del sector (mucho más complejo, no recomendado por este `architect` para un MVP)? El texto exacto de la nota de transparencia (Decisión #34) también es ajustable por `implementer` sin volver a `architect`, mismo criterio que el resto de notas de esta spec.
