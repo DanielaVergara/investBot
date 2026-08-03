@@ -1504,6 +1504,29 @@ async def test_fetch_and_analyze_propaga_balance_sheet_fuente_a_build_summary_pa
     assert captured_adbe["balance_sheet_fuente"] == rules.DATOS_FUENTE_ANUAL_FALLBACK
 
 
+async def test_fetch_and_analyze_propaga_income_statement_fuente_y_cash_flow_fuente_a_build_summary_parts(
+    adobe_fixtures, monkeypatch
+):
+    """`fetch_and_analyze_parts` pasa `income_statement_fuente=income_statements_fuente`
+    y `cash_flow_fuente=cash_flow_fuente` a `summary.build_summary_parts`
+    (Spec Patch [Iter-3], mismo patrón que `balance_sheet_fuente`) —
+    trimestral con NVDA, anual-fallback con ADBE (el router no sirve
+    trimestral para símbolos que no sean NVDA)."""
+    captured_nvda = _capture_summary_call(monkeypatch)
+    await query_handler.fetch_and_analyze_parts(
+        "NVDA", _make_clients_nvda(adobe_fixtures), perfil="moderado"
+    )
+    assert captured_nvda["income_statement_fuente"] == rules.DATOS_FUENTE_TRIMESTRAL
+    assert captured_nvda["cash_flow_fuente"] == rules.DATOS_FUENTE_TRIMESTRAL
+
+    captured_adbe = _capture_summary_call(monkeypatch)
+    await query_handler.fetch_and_analyze_parts(
+        "ADBE", _make_clients(adobe_fixtures), perfil="moderado"
+    )
+    assert captured_adbe["income_statement_fuente"] == rules.DATOS_FUENTE_ANUAL_FALLBACK
+    assert captured_adbe["cash_flow_fuente"] == rules.DATOS_FUENTE_ANUAL_FALLBACK
+
+
 async def test_fetch_and_analyze_nvda_camino_feliz_usa_ttm_no_un_solo_trimestre(
     adobe_fixtures, monkeypatch
 ):

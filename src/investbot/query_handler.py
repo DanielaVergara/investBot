@@ -542,6 +542,8 @@ async def fetch_and_analyze_parts(
         corporate_events=corporate_events_list,
         escenario_elegido=escenario_elegido,
         balance_sheet_fuente=balance_fuente,
+        income_statement_fuente=income_statements_fuente,
+        cash_flow_fuente=cash_flow_fuente,
     )
 
 

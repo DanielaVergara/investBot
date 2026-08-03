@@ -645,6 +645,55 @@ def _build_balance_sheet_note(balance_sheet_fuente: Optional[str]) -> Optional[s
     return None
 
 
+def _build_income_statement_note(income_statement_fuente: Optional[str]) -> Optional[str]:
+    """Texto de transparencia sobre si el boletín (Estado de Resultados) usado
+    esta consulta es un TTM real (últimos 4 trimestres reales sumados) o el
+    último año fiscal reportado (fallback) — Spec Patch [Iter-3] de
+    `SDD_eps_ttm_real.md`, mismo patrón que `_build_balance_sheet_note`.
+
+    `None` (fuente no informada, llamadores viejos, o el dato no aplicó esta
+    consulta) -> no agrega ninguna línea, mismo criterio de "degradar con
+    gracia sin ruido" que el resto de notas opcionales de este módulo."""
+    if income_statement_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        return (
+            "El boletín (Estado de Resultados) usado en este análisis — EPS, "
+            "PER, margen bruto, P/S y el WACC (costo de capital) — es TTM "
+            "real: la suma de los últimos 4 trimestres reales reportados."
+        )
+    if income_statement_fuente == rules.DATOS_FUENTE_ANUAL_FALLBACK:
+        return (
+            "El boletín (Estado de Resultados) usado en este análisis — EPS, "
+            "PER, margen bruto, P/S y el WACC (costo de capital) — es del "
+            "último año fiscal reportado, no un TTM real de los últimos 12 "
+            "meses (no se pudo obtener un TTM real de 4 trimestres en esta "
+            "consulta)."
+        )
+    return None
+
+
+def _build_cash_flow_note(cash_flow_fuente: Optional[str]) -> Optional[str]:
+    """Texto de transparencia sobre si el extracto (Flujo de Efectivo) usado
+    esta consulta es un TTM real (últimos 4 trimestres reales sumados) o el
+    último año fiscal reportado (fallback) — Spec Patch [Iter-3] de
+    `SDD_eps_ttm_real.md`, mismo patrón que `_build_balance_sheet_note`."""
+    if cash_flow_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        return (
+            "El extracto (Flujo de Efectivo) usado en este análisis — el FCF "
+            "(Flujo de Caja Libre) y la proyección de Valor Justo por DCF — "
+            "es TTM real: la suma de los últimos 4 trimestres reales "
+            "reportados."
+        )
+    if cash_flow_fuente == rules.DATOS_FUENTE_ANUAL_FALLBACK:
+        return (
+            "El extracto (Flujo de Efectivo) usado en este análisis — el FCF "
+            "(Flujo de Caja Libre) y la proyección de Valor Justo por DCF — "
+            "es del último año fiscal reportado, no un TTM real de los "
+            "últimos 12 meses (no se pudo obtener un TTM real de 4 "
+            "trimestres en esta consulta)."
+        )
+    return None
+
+
 def _build_peers_note(fuente_peers: Optional[str]) -> str:
     """Texto de transparencia sobre la fuente de peers usada esta consulta
     (Parte 1, `SDD_peers_dinamicos_y_eventos_corporativos.md`, Decisión #6).
@@ -680,6 +729,8 @@ def build_summary_parts(
     corporate_events: Optional[list[dict]] = None,
     escenario_elegido: Optional[str] = None,
     balance_sheet_fuente: Optional[str] = None,
+    income_statement_fuente: Optional[str] = None,
+    cash_flow_fuente: Optional[str] = None,
 ) -> list[str]:
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
     y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
@@ -768,9 +819,15 @@ def build_summary_parts(
         transparency_lines.append(
             f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
         )
+    income_statement_note = _build_income_statement_note(income_statement_fuente)
+    if income_statement_note:
+        transparency_lines.append(f"_{income_statement_note}_")
     balance_sheet_note = _build_balance_sheet_note(balance_sheet_fuente)
     if balance_sheet_note:
         transparency_lines.append(f"_{balance_sheet_note}_")
+    cash_flow_note = _build_cash_flow_note(cash_flow_fuente)
+    if cash_flow_note:
+        transparency_lines.append(f"_{cash_flow_note}_")
     transparency_lines.append(
         "_El DCF es una aproximación con supuestos simplificados de WACC "
         "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
@@ -826,6 +883,8 @@ def build_summary(
     corporate_events: Optional[list[dict]] = None,
     escenario_elegido: Optional[str] = None,
     balance_sheet_fuente: Optional[str] = None,
+    income_statement_fuente: Optional[str] = None,
+    cash_flow_fuente: Optional[str] = None,
 ) -> str:
     """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
     puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
@@ -849,5 +908,7 @@ def build_summary(
             corporate_events=corporate_events,
             escenario_elegido=escenario_elegido,
             balance_sheet_fuente=balance_sheet_fuente,
+            income_statement_fuente=income_statement_fuente,
+            cash_flow_fuente=cash_flow_fuente,
         )
     )

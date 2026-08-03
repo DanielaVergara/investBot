@@ -1772,3 +1772,238 @@ def test_build_summary_parts_con_balance_sheet_fuente_anual_fallback_agrega_nota
     )
     transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
     assert "año fiscal más reciente" in transparency_part
+
+
+# ---------------------------------------------------------------------------
+# Spec Patch [Iter-3], SDD_eps_ttm_real.md — notas de transparencia para
+# income_statement_fuente (boletín) y cash_flow_fuente (extracto), mismo
+# patrón ya implementado arriba para balance_sheet_fuente (la foto).
+# ---------------------------------------------------------------------------
+
+
+def test_build_income_statement_note_trimestral():
+    texto = summary._build_income_statement_note(rules.DATOS_FUENTE_TRIMESTRAL)
+    assert "TTM real" in texto
+    assert "4 trimestres" in texto
+
+
+def test_build_income_statement_note_anual_fallback():
+    texto = summary._build_income_statement_note(rules.DATOS_FUENTE_ANUAL_FALLBACK)
+    assert "año fiscal" in texto
+    assert "es TTM real:" not in texto
+
+
+def test_build_income_statement_note_none_no_agrega_nada():
+    assert summary._build_income_statement_note(None) is None
+
+
+def test_build_income_statement_note_valor_desconocido_no_agrega_nada_ni_crashea():
+    assert summary._build_income_statement_note("algo_inesperado") is None
+
+
+def test_build_cash_flow_note_trimestral():
+    texto = summary._build_cash_flow_note(rules.DATOS_FUENTE_TRIMESTRAL)
+    assert "TTM real" in texto
+    assert "4 trimestres" in texto
+
+
+def test_build_cash_flow_note_anual_fallback():
+    texto = summary._build_cash_flow_note(rules.DATOS_FUENTE_ANUAL_FALLBACK)
+    assert "año fiscal" in texto
+    assert "es TTM real:" not in texto
+
+
+def test_build_cash_flow_note_none_no_agrega_nada():
+    assert summary._build_cash_flow_note(None) is None
+
+
+def test_build_cash_flow_note_valor_desconocido_no_agrega_nada_ni_crashea():
+    assert summary._build_cash_flow_note("algo_inesperado") is None
+
+
+def test_build_summary_parts_sin_income_statement_fuente_ni_cash_flow_fuente_regresion_byte_a_byte():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    sin_parametro = summary.build_summary_parts(**kwargs)
+    con_none_explicito = summary.build_summary_parts(
+        income_statement_fuente=None, cash_flow_fuente=None, **kwargs
+    )
+    assert sin_parametro == con_none_explicito
+
+
+def test_build_summary_parts_con_income_statement_fuente_trimestral_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        income_statement_fuente=rules.DATOS_FUENTE_TRIMESTRAL, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "TTM real" in transparency_part
+    assert "boletín" in transparency_part.lower()
+
+
+def test_build_summary_parts_con_income_statement_fuente_anual_fallback_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        income_statement_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "año fiscal" in transparency_part
+
+
+def test_build_summary_parts_con_cash_flow_fuente_trimestral_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        cash_flow_fuente=rules.DATOS_FUENTE_TRIMESTRAL, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "TTM real" in transparency_part
+    assert "extracto" in transparency_part.lower()
+
+
+def test_build_summary_parts_con_cash_flow_fuente_anual_fallback_agrega_nota():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        cash_flow_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK, **kwargs
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    assert "año fiscal" in transparency_part
+
+
+def test_build_summary_parts_con_las_3_fuentes_trimestrales_agrega_las_3_notas_en_orden_boletin_foto_extracto():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        income_statement_fuente=rules.DATOS_FUENTE_TRIMESTRAL,
+        balance_sheet_fuente=rules.DATOS_FUENTE_TRIMESTRAL,
+        cash_flow_fuente=rules.DATOS_FUENTE_TRIMESTRAL,
+        **kwargs,
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    idx_boletin = transparency_part.index("El boletín (Estado de Resultados)")
+    idx_foto = transparency_part.index("El balance general (la foto)")
+    idx_extracto = transparency_part.index("El extracto (Flujo de Efectivo)")
+    assert idx_boletin < idx_foto < idx_extracto
+
+
+def test_build_summary_parts_con_las_3_fuentes_anuales_agrega_las_3_notas_en_orden_boletin_foto_extracto():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        income_statement_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK,
+        balance_sheet_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK,
+        cash_flow_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK,
+        **kwargs,
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    idx_boletin = transparency_part.index("El boletín (Estado de Resultados)")
+    idx_foto = transparency_part.index("El balance general (la foto)")
+    idx_extracto = transparency_part.index("El extracto (Flujo de Efectivo)")
+    assert idx_boletin < idx_foto < idx_extracto
+    assert "es TTM real:" not in transparency_part
+
+
+def test_build_summary_parts_con_fuentes_mixtas_cada_nota_refleja_su_propia_fuente_independiente():
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    parts = summary.build_summary_parts(
+        income_statement_fuente=rules.DATOS_FUENTE_TRIMESTRAL,
+        cash_flow_fuente=rules.DATOS_FUENTE_ANUAL_FALLBACK,
+        balance_sheet_fuente=rules.DATOS_FUENTE_TRIMESTRAL,
+        **kwargs,
+    )
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+
+    boletin_texto = summary._build_income_statement_note(rules.DATOS_FUENTE_TRIMESTRAL)
+    foto_texto = summary._build_balance_sheet_note(rules.DATOS_FUENTE_TRIMESTRAL)
+    extracto_texto = summary._build_cash_flow_note(rules.DATOS_FUENTE_ANUAL_FALLBACK)
+
+    assert boletin_texto in transparency_part
+    assert foto_texto in transparency_part
+    assert extracto_texto in transparency_part
+    assert "TTM real" in boletin_texto
+    assert "trimestre más reciente" in foto_texto
+    assert "año fiscal" in extracto_texto

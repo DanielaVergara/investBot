@@ -1045,3 +1045,215 @@ No aplica un único piso para todos los módulos — mismo criterio de diferenci
 - [ ] Ningún criterio de esta sección requiere volver a `architect` — todos son criterios de testeo sobre decisiones de diseño ya cerradas; el único punto abierto (`chat_id` como parámetro nuevo de `_run_analysis`) es de implementación, no de arquitectura, y se resuelve en Momento 2 con evidencia.
 
 **Veredicto de `qa`:** la spec queda con **Scope Freeze lista para pasar a `implementer`**, condicionado a que los 2 hallazgos bloqueantes de `security` (ya redactados como criterios de aceptación dentro de la propia spec, líneas ~792-797 y ~825-830) se traten como **no negociables** en Ralph Loop — no se reabre `architect` ni `security` por nada de lo relevado en este documento, incluida la matriz de casos límite y el piso de cobertura, que son puramente de testeo sobre decisiones ya tomadas.
+
+---
+
+## Spec Patch [Iter-3] para: `SDD_eps_ttm_real.md` — Transparencia de `income_statements_fuente`/`cash_flow_fuente` al usuario (extiende el patrón ya implementado para `balance_sheet_fuente`)
+
+**Rol:** `architect`. **Origen del pedido:** Daniela — el flag de fuente del balance sheet (`balance_sheet_fuente`) ya se le informa en el chat vía `_build_balance_sheet_note`/Pregunta H (implementada, con tests en `tests/test_summary.py` líneas 1701-1786), pero los 2 flags análogos para el boletín/Estado de Resultados (`income_statements_fuente`) y el extracto/Flujo de Efectivo (`cash_flow_fuente`) — mismo mecanismo, ya calculados y guardados en `ratios_dict` (`query_handler.py` líneas 481-482) desde la Decisión #8/#10/#14 de esta misma spec — nunca llegan al mensaje. Quiere el mismo nivel de transparencia para los 3.
+
+### Criterio que falló
+No aplica — no es una escalación de `implementer` (esta parte del código ya está implementada y en verde). Es una ampliación de alcance menor pedida directamente por Daniela sobre una spec que ya llegó a Scope Freeze. Se trata como spec patch (no spec nueva) porque el ajuste es aditivo, acotado a `summary.py`/`query_handler.py`, y reutiliza sin cambios el mecanismo de fuente (`rules.DATOS_FUENTE_TRIMESTRAL`/`rules.DATOS_FUENTE_ANUAL_FALLBACK`) que esta misma spec ya diseñó y que `security`/`qa` ya auditaron para el caso del balance sheet.
+
+### Estado actual (confirmado leyendo el código real, no solo la spec)
+- `query_handler.py` líneas 177-239: las 3 fuentes (`income_statements_fuente`, `cash_flow_fuente`, `balance_fuente`) se calculan de forma independiente, mismo patrón try/fallback cada una (Decisiones #8/#10/#14/#16 ya vigentes).
+- `query_handler.py` líneas 471-484 (`ratios_dict`): las 3 quedan guardadas ahí — comentario explícito en el código: *"3 flags de fuente independientes... nunca 1 solo agregado"*.
+- `query_handler.py` línea 544: solo `balance_fuente` se pasa explícitamente a `summary.build_summary_parts(...)`, como `balance_sheet_fuente=balance_fuente`. `income_statements_fuente`/`cash_flow_fuente` quedan atrapadas en `ratios_dict` sin ningún camino hacia `summary.py` — `summary.py` no lee esas 2 claves del dict `ratios` en ningún punto (confirmado por grep: `ratios.get("income_statements_fuente"...)`/`ratios.get("cash_flow_fuente"...)` no existen en `summary.py`).
+- `summary.py` líneas 625-645: `_build_balance_sheet_note(balance_sheet_fuente)` ya implementa el patrón exacto a replicar — texto distinto por rama (`trimestral_real`/`anual_fallback`), `None` (o valor inesperado) → no agrega nada, sin excepción.
+- `summary.py` líneas 664-807 (`build_summary_parts`): recibe `balance_sheet_fuente: Optional[str] = None` como kwarg keyword-only con default retrocompatible (línea 682); construye la nota en la línea 771 y la agrega a `transparency_lines` solo si no es `None` (línea 772-773).
+- `summary.py` líneas 702-709 (intro `"Cómo leer este análisis"`): ya establece la analogía **boletín** (Estado de Resultados) → **la foto** (Balance General) → **el extracto** (Flujo de Efectivo), en ese orden — es el vocabulario que el usuario ya vio 2 párrafos antes de llegar a "Notas de transparencia", así que reutilizarlo en las notas nuevas es continuidad, no un término nuevo que aprender.
+- `tests/test_summary.py` líneas 1701-1786: 8 tests existentes cubren `_build_balance_sheet_note` (4 casos: trimestral/anual/`None`/valor desconocido) y `build_summary_parts` con `balance_sheet_fuente` (4 casos: regresión sin el kwarg, trimestral, anual, y el default). Es la plantilla de nombres/estructura a replicar.
+- `tests/test_query_handler.py` líneas 1487-1505: `test_fetch_and_analyze_propaga_balance_sheet_fuente_a_build_summary_parts` confirma con NVDA (trimestral) y ADBE (anual, el router de test no sirve trimestral fuera de NVDA) que el kwarg llega correctamente. Es la plantilla a replicar para los 2 flags nuevos.
+
+### Estado objetivo
+1. `summary.py` gana 2 funciones nuevas, mismo patrón exacto que `_build_balance_sheet_note`: `_build_income_statement_note(income_statement_fuente: Optional[str]) -> Optional[str]` y `_build_cash_flow_note(cash_flow_fuente: Optional[str]) -> Optional[str]`.
+2. `build_summary_parts`/`build_summary` ganan 2 kwargs nuevos, keyword-only, default `None` (retrocompatible, mismo criterio que `balance_sheet_fuente`): `income_statement_fuente: Optional[str] = None`, `cash_flow_fuente: Optional[str] = None`.
+3. `query_handler.py` línea 544 pasa a incluir los 2 kwargs nuevos junto a `balance_sheet_fuente=balance_fuente`.
+4. El mensaje final, cuando las 3 fuentes están informadas, muestra 3 líneas de transparencia (boletín/foto/extracto) en ese orden — no 1 sola agregada, mismo principio de independencia ya aplicado a los cálculos (Decisión #8: *"3 decisiones de fuente independientes por consulta... ninguna bloquea a las otras"*), ahora también en la presentación.
+
+### Decisión #25 — Texto exacto de las 2 notas nuevas
+
+Mismo tono que `_build_balance_sheet_note` (frase corta, explica qué se usó y por qué, sin jerga adicional) y misma estructura de 2 ramas + `None`/desconocido → nada. A diferencia del balance sheet (que es una *foto* puntual, "trimestre más reciente" vs. "año fiscal más reciente"), el income statement y el cash flow son series que alimentan un TTM (`trimestral_real` = 4 trimestres reales sumados) o un solo año completo (`anual_fallback`) — el texto lo refleja explícitamente para no confundir "trimestral" con "un solo trimestre suelto" (el mismo malentendido que la Decisión #11 de esta spec ya identificó como riesgo real de distorsión ~4x si no se aclara).
+
+```python
+def _build_income_statement_note(income_statement_fuente: Optional[str]) -> Optional[str]:
+    """Texto de transparencia sobre si el boletín (Estado de Resultados) usado
+    esta consulta es un TTM real (últimos 4 trimestres reales sumados) o el
+    último año fiscal reportado (fallback) — Spec Patch [Iter-3] de
+    `SDD_eps_ttm_real.md`, mismo patrón que `_build_balance_sheet_note`.
+
+    `None` (fuente no informada, llamadores viejos, o el dato no aplicó esta
+    consulta) -> no agrega ninguna línea, mismo criterio de "degradar con
+    gracia sin ruido" que el resto de notas opcionales de este módulo."""
+    if income_statement_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        return (
+            "El boletín (Estado de Resultados) usado en este análisis — EPS, "
+            "PER, margen bruto, P/S y el WACC (costo de capital) — es TTM "
+            "real: la suma de los últimos 4 trimestres reales reportados."
+        )
+    if income_statement_fuente == rules.DATOS_FUENTE_ANUAL_FALLBACK:
+        return (
+            "El boletín (Estado de Resultados) usado en este análisis — EPS, "
+            "PER, margen bruto, P/S y el WACC (costo de capital) — es del "
+            "último año fiscal reportado, no un TTM real de los últimos 12 "
+            "meses (no se pudo obtener un TTM real de 4 trimestres en esta "
+            "consulta)."
+        )
+    return None
+
+
+def _build_cash_flow_note(cash_flow_fuente: Optional[str]) -> Optional[str]:
+    """Texto de transparencia sobre si el extracto (Flujo de Efectivo) usado
+    esta consulta es un TTM real (últimos 4 trimestres reales sumados) o el
+    último año fiscal reportado (fallback) — Spec Patch [Iter-3] de
+    `SDD_eps_ttm_real.md`, mismo patrón que `_build_balance_sheet_note`."""
+    if cash_flow_fuente == rules.DATOS_FUENTE_TRIMESTRAL:
+        return (
+            "El extracto (Flujo de Efectivo) usado en este análisis — el FCF "
+            "(Flujo de Caja Libre) y la proyección de Valor Justo por DCF — "
+            "es TTM real: la suma de los últimos 4 trimestres reales "
+            "reportados."
+        )
+    if cash_flow_fuente == rules.DATOS_FUENTE_ANUAL_FALLBACK:
+        return (
+            "El extracto (Flujo de Efectivo) usado en este análisis — el FCF "
+            "(Flujo de Caja Libre) y la proyección de Valor Justo por DCF — "
+            "es del último año fiscal reportado, no un TTM real de los "
+            "últimos 12 meses (no se pudo obtener un TTM real de 4 "
+            "trimestres en esta consulta)."
+        )
+    return None
+```
+
+No hace falta ninguna constante nueva de fuente — ambas funciones reutilizan `rules.DATOS_FUENTE_TRIMESTRAL`/`rules.DATOS_FUENTE_ANUAL_FALLBACK`, exactamente igual que `_build_balance_sheet_note` ya hace.
+
+### Decisión #26 — Ubicación en el mensaje: junto a la nota de balance sheet, en el orden boletín → foto → extracto
+
+Van en la misma sección `"*Notas de transparencia:*"`, no en una sección aparte. Razón: son 3 variantes del mismo tipo de información (qué tan "fresco" es cada uno de los 3 estados financieros usados esta consulta) — separarlas en secciones distintas rompería la idea de "un solo lugar donde revisar procedencia de datos", que es exactamente el propósito de esa sección hoy (ya agrupa ahí la fuente de peers, la fuente de Y/treasury, y la fuente del balance sheet).
+
+Dentro de `transparency_lines` (`summary.py` líneas 761-793), el orden pasa a ser:
+
+```python
+transparency_lines = [
+    "*Notas de transparencia:*",
+    "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
+    "obtenidos de Financial Modeling Prep (FMP)._",
+    f"_Nota de transparencia: {peers_note_final}_",
+]
+if treasury_source:
+    transparency_lines.append(f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._")
+
+income_statement_note = _build_income_statement_note(income_statement_fuente)  # NUEVO — boletín
+if income_statement_note:
+    transparency_lines.append(f"_{income_statement_note}_")
+
+balance_sheet_note = _build_balance_sheet_note(balance_sheet_fuente)  # ya existente — la foto
+if balance_sheet_note:
+    transparency_lines.append(f"_{balance_sheet_note}_")
+
+cash_flow_note = _build_cash_flow_note(cash_flow_fuente)  # NUEVO — el extracto
+if cash_flow_note:
+    transparency_lines.append(f"_{cash_flow_note}_")
+
+transparency_lines.append(...)  # WACC disclaimer, sin cambios
+transparency_lines.append(...)  # disclaimer general, sin cambios
+```
+
+**Por qué este orden y no otro:** coincide literalmente con el orden en que la intro (`summary.py` líneas 702-709) presenta la analogía 2 párrafos antes — *"el boletín... la foto... y el extracto"*. Mantener el mismo orden en la sección de transparencia evita que el usuario tenga que remapear mentalmente un orden distinto para el mismo trío de conceptos. No hay ninguna razón técnica para otro orden (las 3 notas son independientes entre sí, ninguna depende de que otra se muestre antes).
+
+### Decisión #27 — Cambio de firma en `summary.build_summary_parts`/`build_summary` y en la llamada de `query_handler.py`
+
+```python
+def build_summary_parts(
+    *,
+    ticker: str,
+    company_name: str,
+    precio_actual: float,
+    ratios: dict,
+    pillars: dict,
+    scenarios: dict,
+    n_peers_validos: int,
+    momentum: dict,
+    peer_comparison: dict,
+    risk_fit: dict,
+    treasury_source: str | None = None,
+    peers_note: Optional[str] = None,
+    extras: Optional[dict] = None,
+    vix: Optional[dict] = None,
+    corporate_events: Optional[list[dict]] = None,
+    escenario_elegido: Optional[str] = None,
+    balance_sheet_fuente: Optional[str] = None,
+    income_statement_fuente: Optional[str] = None,  # NUEVO
+    cash_flow_fuente: Optional[str] = None,          # NUEVO
+) -> list[str]:
+```
+
+Mismo cambio, mismos 2 kwargs nuevos, en `build_summary` (el wrapper de una línea, `summary.py` líneas 810-828+) — se propagan tal cual al `build_summary_parts(...)` interno.
+
+En `query_handler.py`, la llamada de la línea 528-545 pasa a incluir los 2 kwargs nuevos, reutilizando las variables `income_statements_fuente`/`cash_flow_fuente` que **ya existen** desde las Decisiones #8/#14 (no hace falta calcular nada nuevo, ya están en scope en ese punto de la función):
+
+```python
+return summary.build_summary_parts(
+    ...,
+    escenario_elegido=escenario_elegido,
+    balance_sheet_fuente=balance_fuente,
+    income_statement_fuente=income_statements_fuente,  # NUEVO
+    cash_flow_fuente=cash_flow_fuente,                  # NUEVO
+)
+```
+
+Nota de nombres (no es un error, es intencional): la variable local en `query_handler.py` se llama `income_statements_fuente` (plural, "statements") pero el kwarg/parámetro en `summary.py` se llama `income_statement_fuente` (singular) — mismo patrón de asimetría que ya existe hoy entre la variable local `balance_fuente` y el kwarg `balance_sheet_fuente`. No se homogeniza en este patch porque tocar el nombre de la variable local implicaría un diff innecesario en las ~15 líneas de `query_handler.py` que ya la usan (Decisiones #8/#10), fuera del alcance de este patch.
+
+Con ambos kwargs en default `None`, ningún llamador existente de `build_summary_parts`/`build_summary` (tests u otro código) se rompe — mismo criterio de retrocompatibilidad que `balance_sheet_fuente` ya estableció.
+
+### Decisión #28 — Criterio de "siempre mostrar la nota" (mismo criterio que `balance_sheet_fuente`, no solo en el caso `anual_fallback`)
+
+**Se aplica el mismo criterio que `_build_balance_sheet_note` ya usa hoy: la nota se muestra en ambas ramas (`trimestral_real` y `anual_fallback`), nunca solo quien está en fallback.** No se restringe a "avisar solo cuando algo salió peor de lo ideal".
+
+Evalué la alternativa (mostrar la nota solo cuando la fuente es `anual_fallback`, para no repetir 3 confirmaciones triviales en el camino feliz) y la descarto explícitamente, por 2 razones:
+
+1. **Consistencia con el precedente ya implementado.** `_build_balance_sheet_note` no distingue "mostrar solo si es la rama mala" — ya muestra una nota en el camino feliz (*"...es del trimestre más reciente disponible"*) tanto como en el fallback. Si las 2 notas nuevas usaran un criterio distinto (silenciosas en el camino feliz, solo hablan en el fallback), el usuario vería un comportamiento inconsistente entre los 3 flags de la misma familia sin ninguna razón visible — una asimetría que no se puede explicar sin leer el código.
+2. **El "camino feliz" no es trivial de confirmar para este proyecto en particular.** A diferencia de una app con datos siempre disponibles, esta spec completa (Decisiones #8-#16) existe justamente porque la disponibilidad de `period=quarter` en el plan gratuito de FMP fue, en su momento, una duda real (ver "Alcance original — v1") y sigue siendo un fallback que puede activarse por rate limit/timeout/cambio de política de FMP en cualquier consulta futura. Que el bot confirme "sí, esta vez fue TTM real" no es ruido — es la misma información que hace 1 spec permitió detectar el bug original (EPS/PER "desactualizado" sin que nada en el mensaje lo explicara). Ocultar la confirmación en el camino feliz reintroduce parcialmente el problema que motivó toda esta spec: que el usuario no pueda saber, mirando el mensaje, qué fuente se usó.
+
+**Costo aceptado, documentado explícitamente (no en silencio):** en el camino feliz (las 3 fuentes trimestrales disponibles, el caso más común en operación normal), el mensaje final gana 3 líneas de confirmación en vez de 0. Es el mismo costo que Daniela ya aceptó al confirmar la Pregunta H para el balance sheet — este patch solo extiende ese mismo trade-off a los 2 flags que faltaban, no introduce una decisión de producto nueva.
+
+### Criterios de aceptación
+
+**`summary.py` — funciones puras nuevas (mismo patrón que las 4 de `_build_balance_sheet_note`, líneas 1701-1716 de `tests/test_summary.py`)**
+- [ ] `test_build_income_statement_note_trimestral` — `_build_income_statement_note(rules.DATOS_FUENTE_TRIMESTRAL)` devuelve el texto exacto de la Decisión #25 (o al menos confirma que menciona "TTM real" y "4 trimestres").
+- [ ] `test_build_income_statement_note_anual_fallback` — idem con `rules.DATOS_FUENTE_ANUAL_FALLBACK`, confirma que menciona "año fiscal" y que NO dice "TTM real" (para no poder confundirse con la rama trimestral).
+- [ ] `test_build_income_statement_note_none_no_agrega_nada` — `_build_income_statement_note(None)` → `None`.
+- [ ] `test_build_income_statement_note_valor_desconocido_no_agrega_nada_ni_crashea` — `_build_income_statement_note("algo_inesperado")` → `None`, sin excepción.
+- [ ] Los mismos 4 tests, mismo nombre con `cash_flow` en vez de `income_statement`, para `_build_cash_flow_note`.
+
+**`summary.py` — `build_summary_parts` (mismo patrón que las 3 de `build_summary_parts` con `balance_sheet_fuente`, líneas 1719-1786)**
+- [ ] `test_build_summary_parts_sin_income_statement_fuente_ni_cash_flow_fuente_regresion_byte_a_byte` — sin pasar ninguno de los 2 kwargs nuevos (o pasando `None` explícito) → output idéntico byte a byte al comportamiento anterior a este patch.
+- [ ] `test_build_summary_parts_con_income_statement_fuente_trimestral_agrega_nota` / `..._anual_fallback_agrega_nota` — 2 tests, confirman que la nota aparece en `transparency_lines`/en el output final.
+- [ ] Los mismos 2 tests, con `cash_flow_fuente` en vez de `income_statement_fuente`.
+- [ ] **Caso "ambas fuentes trimestrales" (mezcla #1 de la tarea):** `test_build_summary_parts_con_las_3_fuentes_trimestrales_agrega_las_3_notas_en_orden_boletin_foto_extracto` — `balance_sheet_fuente=income_statement_fuente=cash_flow_fuente=rules.DATOS_FUENTE_TRIMESTRAL` → las 3 notas aparecen, y en ese orden relativo dentro del string final (Decisión #26) — test que busca los 3 fragmentos con `str.index(...)` y confirma `index(boletín) < index(foto) < index(extracto)`, no solo `in`.
+- [ ] **Caso "ambas fuentes anuales" (mezcla #2 de la tarea):** mismo test con las 3 en `rules.DATOS_FUENTE_ANUAL_FALLBACK` — las 3 notas aparecen, mismo orden, ninguna dice "TTM real".
+- [ ] **Caso "mezcla" (mezcla #3 de la tarea, el más importante para probar independencia real):** `test_build_summary_parts_con_fuentes_mixtas_cada_nota_refleja_su_propia_fuente_independiente` — ej. `income_statement_fuente=TRIMESTRAL`, `cash_flow_fuente=ANUAL_FALLBACK`, `balance_sheet_fuente=TRIMESTRAL` → la nota de boletín dice "TTM real", la de extracto dice "año fiscal", la de foto dice "trimestre más reciente" — confirma que las 3 no están acopladas (que un fallback en cash-flow no "contamina" el texto de income-statement ni de balance).
+
+**`query_handler.py` (mismo patrón que `test_fetch_and_analyze_propaga_balance_sheet_fuente_a_build_summary_parts`, líneas 1487-1505)**
+- [ ] `test_fetch_and_analyze_propaga_income_statement_fuente_y_cash_flow_fuente_a_build_summary_parts` — con NVDA (trimestral en las 3 fuentes vía el router de test) y ADBE (anual-fallback en las 3), confirma que `captured["income_statement_fuente"]` y `captured["cash_flow_fuente"]` llegan con el valor correcto — mismo mecanismo de captura (`monkeypatch` sobre `summary.build_summary_parts`) que el test ya existente para `balance_sheet_fuente`.
+
+### Artefactos a crear/modificar
+- `src/investbot/summary.py` → 2 funciones nuevas (`_build_income_statement_note`, `_build_cash_flow_note`); `build_summary_parts`/`build_summary` ganan 2 kwargs (`income_statement_fuente`, `cash_flow_fuente`); `transparency_lines` reordenado según Decisión #26.
+- `src/investbot/query_handler.py` → línea ~544, la llamada a `summary.build_summary_parts(...)` gana 2 kwargs nuevos reutilizando variables ya existentes (`income_statements_fuente`, `cash_flow_fuente`) — ningún cálculo nuevo, ningún endpoint nuevo.
+- `tests/test_summary.py` → 8 tests de las funciones puras nuevas + 6 tests de `build_summary_parts` (regresión, 2×trimestral, 2×anual, 3-trimestrales, 3-anuales, mezcla) — 14 tests nuevos aprox., mismo bloque que los 8 existentes de `balance_sheet_fuente` (líneas 1701-1786), agregados a continuación.
+- `tests/test_query_handler.py` → 1 test nuevo de propagación (NVDA/ADBE), a continuación del test existente de `balance_sheet_fuente` (línea ~1505).
+
+### Restricciones (heredadas, sin cambios)
+- **No hay endpoint HTTP nuevo, ni cálculo nuevo** — `income_statements_fuente`/`cash_flow_fuente` ya existen desde las Decisiones #8/#14 de esta spec; este patch solo los hace visibles en el mensaje, mismo alcance que la Pregunta H ya resuelta para el balance sheet.
+- **`rules.py`/`valuation.py`/`query_handler.py` (más allá de la línea 544) no cambian** — el patch es puramente de presentación en `summary.py` + 1 línea de propagación en `query_handler.py`.
+- **Ambos kwargs nuevos son opcionales con default `None` retrocompatible** — ningún llamador existente de `build_summary_parts`/`build_summary` se rompe (mismo criterio que `balance_sheet_fuente`, `escenario_elegido`, y el resto de kwargs opcionales ya presentes en esta función).
+- **No se toca el mecanismo de fuente (`rules.DATOS_FUENTE_TRIMESTRAL`/`rules.DATOS_FUENTE_ANUAL_FALLBACK`)** — se reutiliza tal cual, sin agregar constantes nuevas.
+
+### Criterios que NO cambian
+Todos los criterios de aceptación de la spec original (v1 + ampliación ronda 1 + ampliación ronda 2 + revisión de `security` + criterios de `qa`) siguen vigentes sin modificación — este patch no reabre ninguna decisión de diseño previa (#1 a #24), solo agrega 2 funciones y 2 kwargs siguiendo un patrón ya auditado.
+
+### Handoff → `implementer` (sin pasar de nuevo por `security`)
+
+Este patch no agrega superficie HTTP, no agrega input de usuario nuevo, no cambia ningún cálculo financiero, y replica al 100% un mecanismo (`Optional[str]` de fuente → nota de texto condicional, default `None` retrocompatible) que `security` ya auditó explícitamente para `balance_sheet_fuente` sin hallazgos en esa parte del código (ver "Revisión de `security`" arriba — los 2 hallazgos bloqueantes de esa revisión son sobre la cadena de botones `esc:`/`vent:`, no sobre las notas de transparencia). Por la Regla 4 del pipeline (`pipeline.md`), un spec patch va directo a `implementer` salvo que toque superficie de seguridad o UI — no es el caso acá. `qa` puede agregar sus criterios de cobertura habituales (mismo piso ya fijado para `summary.py` en la sección 5: "el código nuevo específico de esta spec debe llegar a 100%/100% propio") sin que eso implique reabrir `architect`.
+
+**Pregunta abierta para Daniela, no bloqueante:** ¿el texto exacto de las 2 notas nuevas (Decisión #25) le sirve tal cual, o prefiere un wording más corto (ej. omitir la lista de ratios afectados y dejar solo "es TTM real: suma de los últimos 4 trimestres")? `implementer` puede ajustar el wording Markdown menor sin volver a `architect`, mismo criterio ya usado en la Pregunta 4 de la sección "Preguntas abiertas" original de esta spec.
