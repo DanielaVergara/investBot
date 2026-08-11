@@ -52,6 +52,18 @@ DEFAULT_TIMEOUT_SECONDS = 8.0
 # solo controla el read timeout, el caso "PC prendida pero generando lento").
 CONNECT_TIMEOUT_SECONDS = 3.0
 
+# Tope duro de tokens de salida (`num_predict` de Ollama) — no configurable
+# por env, a propósito: es una red de seguridad de tiempo, no una perilla de
+# tuning de usuario. Sin esto, un modelo puede generar indefinidamente sin
+# converger a un stop token (observado en producción: >1100 tokens en una
+# sola reescritura), haciendo que CUALQUIER timeout, por generoso que sea,
+# eventualmente se agote sin producir ninguna respuesta utilizable. Si la
+# reescritura se corta a mitad de camino por este tope, los marcadores
+# <<<SECTION_N>>> quedan incompletos y el guard de reconstrucción cae a
+# fallback igual que cualquier otra respuesta malformada — nunca llega un
+# mensaje cortado al usuario final.
+MAX_OUTPUT_TOKENS = 600
+
 _TRUTHY_VALUES = {"true", "1", "yes"}
 
 # Indicador visible en el mensaje final (Pregunta abierta 1, resuelta por
@@ -286,6 +298,7 @@ async def rewrite_parts(
                 "system": SYSTEM_PROMPT,
                 "prompt": prompt,
                 "stream": False,
+                "options": {"num_predict": MAX_OUTPUT_TOKENS},
             },
             timeout=timeout,
         )
