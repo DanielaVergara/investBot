@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, TypeHandler
 
-from investbot import db, onboarding, query_handler, security
+from investbot import ai_rewrite, db, onboarding, query_handler, security
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,8 @@ def build_application(
     fred_api_key: str | None,
     finnhub_api_key: str | None = None,
     sec_edgar_user_agent: str | None = None,
+    ollama_http: httpx.AsyncClient | None = None,
+    ollama_config: ai_rewrite.OllamaConfig | None = None,
 ) -> Application:
     application = Application.builder().token(telegram_token).build()
 
@@ -83,6 +85,8 @@ def build_application(
         finnhub_api_key=finnhub_api_key,
         sec_edgar_http=sec_edgar_http,
         sec_edgar_user_agent=sec_edgar_user_agent,
+        ollama_http=ollama_http,
+        ollama_config=ollama_config,
     )
     rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
     for handler in query_handler.build_query_handlers(get_conn, clients, rate_limiter):
@@ -118,6 +122,14 @@ def main() -> None:
     sec_edgar_user_agent = os.environ.get("SEC_EDGAR_USER_AGENT")
     db_path = os.environ.get("INVESTBOT_DB_PATH", "/data/investbot.db")
 
+    # SDD_redaccion_ia_ollama.md — mismo patrón best-effort que Finnhub/SEC
+    # EDGAR: `load_config()` nunca lanza, y sin configuración completa
+    # (`OLLAMA_REWRITE_ENABLED`/`OLLAMA_BASE_URL`) resuelve a `enabled=False`
+    # sin abortar el arranque. Solo se abre un `httpx.AsyncClient` dedicado
+    # si la feature está efectivamente habilitada.
+    ollama_config = ai_rewrite.load_config()
+    ollama_http = httpx.AsyncClient() if ollama_config.enabled else None
+
     conn = db.get_connection(db_path)
     db.init_db(conn)
     conn.close()
@@ -130,6 +142,8 @@ def main() -> None:
         fred_api_key=fred_api_key,
         finnhub_api_key=finnhub_api_key,
         sec_edgar_user_agent=sec_edgar_user_agent,
+        ollama_http=ollama_http,
+        ollama_config=ollama_config,
     )
 
     allowed_chat_ids_repr = ",".join(str(chat_id) for chat_id in sorted(allowed_chat_ids))

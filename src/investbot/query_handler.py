@@ -24,6 +24,7 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from investbot import (
+    ai_rewrite,
     corporate_events,
     db,
     finnhub_client,
@@ -137,6 +138,13 @@ class Clients:
     finnhub_api_key: Optional[str] = None
     sec_edgar_http: Optional[httpx.AsyncClient] = None
     sec_edgar_user_agent: Optional[str] = None
+    # NUEVO (SDD_redaccion_ia_ollama.md) — mismo criterio que finnhub_http/
+    # sec_edgar_http de arriba: default `None` explícito para no romper los
+    # call-sites existentes de `Clients(...)` en tests. `ollama_config` con
+    # `enabled=False` (o `None`) hace que `ai_rewrite.rewrite_parts` sea un
+    # no-op inmediato en `_run_analysis`.
+    ollama_http: Optional[httpx.AsyncClient] = None
+    ollama_config: Optional[ai_rewrite.OllamaConfig] = None
 
 
 def _annual_series(statements: list[dict], field: str) -> list[float]:
@@ -916,6 +924,18 @@ def build_query_handlers(
             logger.exception("Error inesperado analizando %s", sanitize_for_log(ticker))
             final_parts, kwargs = [GENERIC_ERROR_MSG], {}
         else:
+            # SDD_redaccion_ia_ollama.md — única llamada a `ai_rewrite`,
+            # solo en el camino exitoso (nunca sobre los mensajes de error
+            # de 1 línea de los 2 `except` de arriba). Con la feature
+            # deshabilitada (`clients.ollama_config` ausente o
+            # `enabled=False`) esto es un no-op inmediato, sin latencia ni
+            # llamadas HTTP — comportamiento idéntico al bot de hoy.
+            ollama_config = clients.ollama_config or ai_rewrite.OllamaConfig(
+                enabled=False, base_url="", model="", timeout_seconds=0.0
+            )
+            parts = await ai_rewrite.rewrite_parts(
+                parts, ollama_config, http_client=clients.ollama_http
+            )
             final_parts, kwargs = parts, {"parse_mode": "Markdown"}
 
         try:

@@ -214,13 +214,44 @@ feature completa se omite (nunca se manda una request sin el header).
 
 **El bot NO resume el contenido legal del 8-K con NLP/LLM** — decisión
 explícita: un resumen incorrecto de un litigio o un cambio de gerencia es
-peor que no mostrar nada, y este proyecto no tiene ningún componente de
-NLP/LLM hoy. Se muestra fecha + tipo de evento (Item) + link directo al
-filing público en `sec.gov` para leerlo vos misma si te interesa.
+peor que no mostrar nada. Se muestra fecha + tipo de evento (Item) + link
+directo al filing público en `sec.gov` para leerlo vos misma si te
+interesa. (Ver más abajo, sección "Redacción mejorada por IA local", la
+única feature del proyecto que sí usa un LLM — y solo para tono, nunca
+para resumir/interpretar datos crudos de ningún proveedor.)
 
 Ninguna de las 2 features nuevas de esta sección consume el cupo de 250
 req/día de FMP — proveedores distintos, mismo principio que FRED/
 Treasury.gov.
+
+---
+
+## Redacción mejorada por IA local (Ollama) — opcional
+
+**Opcional, apagada por defecto — el bot funciona igual sin configurarla.**
+Post-procesa el TONO del mensaje que `summary.py` ya terminó de armar (más
+claro, más natural), corriendo un LLM local en Ollama, en la PC de
+Daniela — nunca un servicio pago en la nube, nunca en el VPS. Solo
+disponible cuando esa PC está prendida y alcanzable por Tailscale; con la
+PC apagada, el bot responde exactamente igual que hoy, sin reescritura, sin
+error visible.
+
+**Garantía de integridad — es código, no una instrucción de prompt:** el
+LLM nunca ve datos crudos de FMP, no participa de ningún cálculo ni de
+ninguna decisión financiera (pilares, valor justo, veredicto). Antes de
+enviar una sección a Ollama, cada línea con un dato protegido (número, %,
+ticker, ✅/❌, SÍ/NO) se reemplaza por un placeholder opaco — el modelo solo
+reescribe la prosa alrededor, nunca ve ni puede alterar el dato real, que
+se restituye verbatim después de la respuesta (`ai_rewrite.py`, ver
+`contexto/specs/abiertas/SDD_redaccion_ia_ollama.md` para el detalle
+completo del mecanismo). El título del mensaje (nombre de la empresa +
+ticker) nunca se envía a Ollama, bajo ningún escenario.
+
+Setup completo (Tailscale + Ollama + aislamiento del puerto 11434) en
+`contexto/referencia/SETUP_TELEGRAM_BOT.md`, sección "Redacción mejorada
+por IA local". Variables de entorno en `.env.example`
+(`OLLAMA_REWRITE_ENABLED`/`OLLAMA_BASE_URL`/`OLLAMA_MODEL`/
+`OLLAMA_TIMEOUT_SECONDS`).
 
 ---
 
@@ -239,6 +270,7 @@ Daniela (Telegram) <--long polling--> investbot-bot (Docker) --HTTPS--> FMP
                                                           `----HTTPS--> FRED / Treasury.gov
                                                           `----HTTPS--> Finnhub (opcional, peers dinámicos)
                                                           `----HTTPS--> SEC EDGAR (opcional, eventos corporativos)
+                                                          `----Tailscale (opcional)--> Ollama en la PC de Daniela (redacción)
                                                           `----lectura/escritura--> SQLite (volumen)
 ```
 
@@ -363,6 +395,7 @@ src/investbot/
   treasury_client.py   FRED (DGS20) + fallback Treasury.gov
   sec_edgar_client.py   wrapper HTTP a SEC EDGAR (mapeo ticker→CIK cacheado + submissions, opcional)
   corporate_events.py   extracción pura de eventos 8-K relevantes desde submissions
+  ai_rewrite.py          redacción mejorada por IA local (Ollama, opcional) — guard de integridad por placeholder-y-restitución
   rules.py              ratios financieros + pilares de buena empresa
   valuation.py           motor propio de valoración (3 modelos + promedio parcial)
   risk_fit.py            encaje beta vs perfil de riesgo

@@ -143,6 +143,86 @@ def test_main_arranca_sin_finnhub_ni_sec_edgar_configuradas(monkeypatch, tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# SDD_redaccion_ia_ollama.md — wiring de `ai_rewrite.load_config()` +
+# `httpx.AsyncClient` de Ollama en `main()`/`build_application` (grupo J,
+# casos 56-57). Mismo patrón best-effort ya usado para Finnhub/SEC EDGAR:
+# ninguna combinación de configuración de Ollama aborta el arranque.
+# ---------------------------------------------------------------------------
+
+
+def test_main_arranca_sin_ollama_configurado(monkeypatch, tmp_path):
+    """Caso 56: sin `OLLAMA_REWRITE_ENABLED` seteada, `main()` llega hasta
+    `run_polling` sin abortar -- mismo patrón que Finnhub/SEC EDGAR
+    ausentes."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_REWRITE_ENABLED", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_ollama_ausente.db"))
+
+    from telegram.ext import Application
+
+    run_polling_calls = {"n": 0}
+
+    def fake_run_polling(self, **kwargs):
+        run_polling_calls["n"] += 1
+
+    monkeypatch.setattr(Application, "run_polling", fake_run_polling)
+
+    bot.main()
+    assert run_polling_calls["n"] == 1
+
+
+def test_main_arranca_con_ollama_enabled_pero_base_url_incompleta(monkeypatch, tmp_path):
+    """Caso 57: `OLLAMA_REWRITE_ENABLED=true` sin `OLLAMA_BASE_URL` (config
+    incompleta) -- `main()` sigue sin abortar, feature opcional no
+    fail-closed (Decisión de diseño #5)."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    monkeypatch.setenv("OLLAMA_REWRITE_ENABLED", "true")
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_ollama_incompleto.db"))
+
+    from telegram.ext import Application
+
+    run_polling_calls = {"n": 0}
+
+    def fake_run_polling(self, **kwargs):
+        run_polling_calls["n"] += 1
+
+    monkeypatch.setattr(Application, "run_polling", fake_run_polling)
+
+    bot.main()
+    assert run_polling_calls["n"] == 1
+
+
+def test_build_application_acepta_ollama_http_y_config_opcionales(tmp_path):
+    """Regresión: `build_application` con los 2 parámetros nuevos de Ollama
+    (con default `None`) no rompe la construcción existente, y con valores
+    reales poblados tampoco."""
+    from investbot import ai_rewrite
+
+    db_path = str(tmp_path / "bot_test_ollama.db")
+    ollama_config = ai_rewrite.OllamaConfig(
+        enabled=True, base_url="http://100.101.102.103:11434",
+        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+    )
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+        ollama_config=ollama_config,
+    )
+    assert application is not None
+
+
+# ---------------------------------------------------------------------------
 # SDD_eps_ttm_real.md (ronda 2) — los nuevos CallbackQueryHandler (`esc:`/
 # `vent:`) no interceptan updates del ConversationHandler de onboarding
 # (`^onb:`) — regex disjuntos, criterio explícito de `architect`/`security`.

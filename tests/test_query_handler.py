@@ -2391,3 +2391,154 @@ def test_query_handler_registra_4_handlers_con_patrones_disjuntos():
     onb_data = "onb:0:10"
     for pattern in patterns:
         assert _re.match(pattern, onb_data) is None
+
+
+# ---------------------------------------------------------------------------
+# SDD_redaccion_ia_ollama.md — integración de `ai_rewrite.rewrite_parts` en
+# `_run_analysis` (grupo I, casos 50-54) y wiring de `Clients` (grupo J,
+# caso 55). El resto de los 63 casos de la spec (grupos A-H, K, L) vive en
+# tests/test_ai_rewrite.py — acá solo lo que ejercita la integración real
+# con `query_handler.py`.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_analysis_llama_ai_rewrite_exactamente_una_vez_camino_exitoso(
+    conn_factory, monkeypatch
+):
+    """Caso 50: en el camino exitoso, `ai_rewrite.rewrite_parts` se llama
+    exactamente 1 vez con los `parts` devueltos por `fetch_and_analyze_parts`,
+    y su valor de retorno (no el original) es el que fluye hacia
+    `chunk_for_telegram` -- se verifica indirectamente comprobando que el
+    texto final entregado a Telegram es el de la reescritura simulada, no el
+    original."""
+    _complete_onboarding(conn_factory)
+    original_parts = ["*Adobe (ADBE)*", "Cuerpo original 15.0%"]
+    rewritten_parts = ["*Adobe (ADBE)*", "Cuerpo reescrito 15.0%"]
+
+    _patch_parts_and_search(monkeypatch, original_parts)
+
+    calls = []
+
+    async def fake_rewrite(parts, config, *, http_client=None):
+        calls.append(parts)
+        return rewritten_parts
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    assert calls == [original_parts]
+    loading_msg = query_vent.edit_message_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    args, kwargs = loading_msg.edit_text.call_args
+    assert args[0] == "\n\n".join(rewritten_parts)
+    assert "reescrito" in args[0]
+    assert "original" not in args[0]
+    assert kwargs.get("parse_mode") == "Markdown"
+
+
+async def test_run_analysis_fmp_error_no_llama_ai_rewrite(conn_factory, monkeypatch):
+    """Caso 51: el camino de excepción `FMPError`/`TreasuryError` nunca
+    invoca a `ai_rewrite.rewrite_parts` -- 0 llamadas."""
+    _complete_onboarding(conn_factory)
+
+    async def raise_fmp_error(ticker, clients_arg, perfil, **kwargs):
+        raise FMPError("429 rate limited")
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", raise_fmp_error)
+
+    calls = []
+
+    async def fake_rewrite(parts, config, *, http_client=None):
+        calls.append(parts)
+        return parts
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    await _drive_esc_vent(handlers, "ADBE")
+
+    assert calls == []
+
+
+async def test_run_analysis_error_generico_no_llama_ai_rewrite(conn_factory, monkeypatch):
+    """Caso 52: el camino de excepción genérica tampoco invoca a
+    `ai_rewrite.rewrite_parts` -- 0 llamadas."""
+    _complete_onboarding(conn_factory)
+
+    async def raise_unexpected(ticker, clients_arg, perfil, **kwargs):
+        raise RuntimeError("boom inesperado")
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", raise_unexpected)
+
+    calls = []
+
+    async def fake_rewrite(parts, config, *, http_client=None):
+        calls.append(parts)
+        return parts
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    await _drive_esc_vent(handlers, "ADBE")
+
+    assert calls == []
+
+
+async def test_run_analysis_feature_deshabilitada_comportamiento_identico_a_pre_spec(
+    conn_factory, monkeypatch
+):
+    """Caso 53 -- el más importante del grupo: con la feature deshabilitada
+    (config real de `ai_rewrite`, `rewrite_parts` SIN mockear -- se ejecuta
+    el no-op real), el comportamiento observable de `_run_analysis` (texto
+    final entregado, `parse_mode`) es idéntico al comportamiento pre-spec.
+    `_empty_clients()` no setea `ollama_config`, así que
+    `clients.ollama_config` es `None` -> `_run_analysis` arma un
+    `OllamaConfig(enabled=False, ...)` local y `ai_rewrite.rewrite_parts`
+    devuelve `parts` sin cambios ni llamadas HTTP."""
+    _complete_onboarding(conn_factory)
+    parts = ["*Adobe (ADBE)*", "Cuerpo sin cambios 15.0%"]
+    _patch_parts_and_search(monkeypatch, parts)
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    args, kwargs = loading_msg.edit_text.call_args
+    assert args[0] == "\n\n".join(parts)
+    assert kwargs.get("parse_mode") == "Markdown"
+
+
+def test_clients_acepta_ollama_http_y_ollama_config_sin_romper_call_sites_existentes(
+    adobe_fixtures,
+):
+    """Caso 55: `Clients` gana `ollama_http`/`ollama_config` opcionales con
+    default `None` -- los call-sites existentes de `Clients(...)` (ej.
+    `_make_clients`, usado ~15 veces en este archivo) siguen construyendo
+    sin `TypeError`, sin necesidad de tocarlos (ya lo confirma el resto de
+    la suite, que no fue modificada). Este test ejercita además el camino
+    explícito con los 2 kwargs nuevos poblados."""
+    clients_sin_ollama = _make_clients(adobe_fixtures)
+    assert clients_sin_ollama.ollama_http is None
+    assert clients_sin_ollama.ollama_config is None
+
+    from investbot import ai_rewrite
+
+    ollama_http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    ollama_config = ai_rewrite.OllamaConfig(
+        enabled=True, base_url="http://100.101.102.103:11434",
+        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+    )
+    clients_con_ollama = query_handler.Clients(
+        fmp_http=clients_sin_ollama.fmp_http,
+        fred_http=clients_sin_ollama.fred_http,
+        treasury_gov_http=clients_sin_ollama.treasury_gov_http,
+        fmp_api_key="test-key",
+        fred_api_key="test-fred-key",
+        ollama_http=ollama_http,
+        ollama_config=ollama_config,
+    )
+    assert clients_con_ollama.ollama_http is ollama_http
+    assert clients_con_ollama.ollama_config is ollama_config
