@@ -16,6 +16,7 @@ proyecto).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -56,9 +57,10 @@ def _ok_handler(response_text: str):
 
 
 def _section_response(sections: list[str]) -> str:
-    """Arma un texto de respuesta simulada de Ollama con los marcadores
-    `<<<SECTION_i>>>` en el mismo formato que `ai_rewrite._SECTION_DELIM`."""
-    return "".join(f"\n<<<SECTION_{i}>>>\n{text}" for i, text in enumerate(sections))
+    """Arma el string de respuesta simulada de Ollama como un objeto JSON
+    con claves de índice string ("0".."N-1"), mismo contrato que espera
+    `ai_rewrite._parse_json_sections`."""
+    return json.dumps({str(i): text for i, text in enumerate(sections)}, ensure_ascii=False)
 
 
 class _CountingClient:
@@ -250,8 +252,12 @@ async def test_rewrite_parts_json_sin_clave_response_fallback_silencioso():
     assert result == parts
 
 
-async def test_rewrite_parts_payload_incluye_stream_false():
-    """Caso 14: el payload a /api/generate incluye "stream": false explícito."""
+async def test_rewrite_parts_payload_incluye_stream_false_y_format_json():
+    """Caso 14: el payload a /api/generate incluye "stream": false y
+    "format": "json" explícitos -- el formato estructurado es lo que le
+    permite a Ollama restringir la generación a JSON válido a nivel de
+    grammar/sampling, en vez de depender de que el modelo reproduzca un
+    patrón de texto libre."""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -263,6 +269,7 @@ async def test_rewrite_parts_payload_incluye_stream_false():
     client = _client_with_handler(handler)
     await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
     assert captured["body"]["stream"] is False
+    assert captured["body"]["format"] == "json"
 
 
 async def test_rewrite_parts_cancelled_error_se_propaga():
@@ -652,16 +659,28 @@ async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_gran
     assert result[2] == section_b  # fallback: sección B vuelve al original
 
 
-async def test_rewrite_parts_end_to_end_cantidad_de_marcadores_incorrecta_fallback_completo(caplog):
-    """Caso 44: respuesta sin la cantidad esperada de marcadores
-    `<<<SECTION_i>>>` -> TODAS las secciones vuelven al original, WARNING."""
+@pytest.mark.parametrize(
+    "raw_response",
+    [
+        '{"0": "unica seccion"}',  # clave "1" faltante
+        '{"0": "a", "1": "b", "2": "c"}',  # clave "2" de más
+        "esto no es json",  # JSON inválido
+        '["a", "b"]',  # JSON válido pero no es un objeto (es una lista)
+        '{"0": "a", "1": 42}',  # valor no-string para la clave "1"
+    ],
+    ids=["clave_faltante", "clave_de_mas", "json_invalido", "no_es_objeto", "valor_no_string"],
+)
+async def test_rewrite_parts_end_to_end_estructura_json_invalida_fallback_completo(raw_response, caplog):
+    """Caso 44: matriz de estructuras JSON inválidas/inesperadas en la
+    respuesta de Ollama (claves faltantes/de más, JSON no parseable, JSON
+    que no es un objeto, o valores que no son string) -> TODAS las
+    secciones vuelven al original, WARNING."""
     section_a = "✅ Ingresos que crecen"
     section_b = "❌ Utilidades crecientes"
     parts = ["*Adobe (ADBE)*", section_a, section_b]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # Solo 1 marcador en vez de 2 -- estructura rota.
-        return httpx.Response(200, json={"response": _section_response(["única sección"])})
+        return httpx.Response(200, json={"response": raw_response})
 
     client = _client_with_handler(handler)
     with caplog.at_level(logging.WARNING):

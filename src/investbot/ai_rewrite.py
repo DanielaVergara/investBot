@@ -27,6 +27,7 @@ esperado del sistema, no una anomalía (Decisión de diseño #2).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -58,10 +59,10 @@ CONNECT_TIMEOUT_SECONDS = 3.0
 # converger a un stop token (observado en producción: >1100 tokens en una
 # sola reescritura), haciendo que CUALQUIER timeout, por generoso que sea,
 # eventualmente se agote sin producir ninguna respuesta utilizable. Si la
-# reescritura se corta a mitad de camino por este tope, los marcadores
-# <<<SECTION_N>>> quedan incompletos y el guard de reconstrucción cae a
-# fallback igual que cualquier otra respuesta malformada — nunca llega un
-# mensaje cortado al usuario final.
+# reescritura se corta a mitad de camino por este tope, el objeto JSON de
+# salida queda truncado/inválido y el guard de parseo cae a fallback igual
+# que cualquier otra respuesta malformada — nunca llega un mensaje cortado
+# al usuario final.
 MAX_OUTPUT_TOKENS = 600
 
 _TRUTHY_VALUES = {"true", "1", "yes"}
@@ -199,49 +200,69 @@ def _reconstruct_section(
     return reconstructed
 
 
-# --- Prompt (Decisión de diseño #3(a)/(b), regla 6 agregada por el patch) --
-
-_SECTION_DELIM = "\n<<<SECTION_{i}>>>\n"
-_SECTION_MARKER_RE = re.compile(r"<<<SECTION_\d+>>>\n?")
+# --- Prompt (Decisión de diseño #3(a)/(b), regla 6 agregada por el patch;
+# contrato de transporte JSON estructurado agregado en iteración posterior
+# — reemplaza los marcadores de texto libre <<<SECTION_N>>> porque modelos
+# chicos (qwen2.5:3b-instruct, phi3.5) no reproducen ese patrón de forma
+# confiable, mientras que `"format": "json"` de Ollama restringe la
+# generación a nivel de grammar/sampling, mucho más robusto. El guard de
+# integridad real (`_is_safe_rewrite`/placeholders) no cambia en absoluto —
+# esto es solo el "contenedor" de transporte.) --------------------------------
 
 SYSTEM_PROMPT = (
     "Sos un editor de redacción financiera en español rioplatense. Tu única tarea\n"
-    "es mejorar la CLARIDAD y NATURALIDAD del texto que te paso, sección por\n"
-    "sección, delimitada por marcadores <<<SECTION_N>>>.\n\n"
+    "es mejorar la CLARIDAD y NATURALIDAD del texto que te paso.\n\n"
+    "Contrato de entrada/salida: vas a recibir un objeto JSON cuyas claves son\n"
+    "índices numéricos en formato texto (\"0\", \"1\", \"2\", ...) y cuyos valores\n"
+    "son las secciones de texto a reescribir. Respondé ÚNICAMENTE con un objeto\n"
+    "JSON válido que tenga EXACTAMENTE las mismas claves que recibiste, ni de\n"
+    "más ni de menos, donde cada valor sea la reescritura de la sección\n"
+    "correspondiente a esa clave.\n\n"
     "Reglas estrictas, sin excepción:\n"
     "1. NUNCA cambies, agregues, quites ni \"corrijas\" ningún número, porcentaje,\n"
     "   ticker, símbolo (✅/❌), o palabra de veredicto (SÍ/NO) — copialos\n"
     "   exactamente como aparecen en el texto original.\n"
     "2. NUNCA agregues información, opinión, consejo financiero, ni datos que no\n"
     "   estén ya en el texto.\n"
-    "3. Mantené el formato Markdown de Telegram (*negrita*, _itálica_) y los\n"
-    "   marcadores <<<SECTION_N>>> exactamente en las mismas posiciones.\n"
+    "3. Mantené el formato Markdown de Telegram (*negrita*, _itálica_) dentro de\n"
+    "   cada valor de texto, y las claves del objeto JSON exactamente como las\n"
+    "   recibiste.\n"
     "4. Si una sección ya está clara, devolvela sin cambios.\n"
-    "5. Respondé ÚNICAMENTE con el texto reescrito completo, sin comentarios\n"
-    "   tuyos, sin explicaciones adicionales.\n"
-    "6. Vas a ver tokens de la forma ⟦PHn⟧ en el texto (n es un número). Son\n"
-    "   marcadores opacos — no sabés ni necesitás saber qué representan. Copialos\n"
-    "   EXACTAMENTE tal cual aparecen, una sola vez cada uno, en cualquier lugar\n"
-    "   del texto que tenga sentido para la fluidez de tu redacción. Nunca los\n"
-    "   modifiques, fusiones con palabras vecinas, dupliques, traduzcas, ni\n"
-    "   interpretes su contenido.\n"
+    "5. Respondé ÚNICAMENTE con el objeto JSON reescrito, sin comentarios tuyos,\n"
+    "   sin explicaciones adicionales, sin texto antes ni después del JSON.\n"
+    "6. Vas a ver tokens de la forma ⟦PHn⟧ dentro de los valores de texto del\n"
+    "   JSON (n es un número). Son marcadores opacos — no sabés ni necesitás\n"
+    "   saber qué representan. Copialos EXACTAMENTE tal cual aparecen, una sola\n"
+    "   vez cada uno, en cualquier lugar del texto que tenga sentido para la\n"
+    "   fluidez de tu redacción. Nunca los modifiques, fusiones con palabras\n"
+    "   vecinas, dupliques, traduzcas, ni interpretes su contenido.\n"
 )
 
 
-def _split_by_markers(text: str, expected_count: int) -> Optional[list[str]]:
-    """Parte la respuesta cruda de Ollama por los marcadores
-    `<<<SECTION_i>>>`. `None` si la cantidad de marcadores encontrados no
-    coincide exactamente con `expected_count` — estructura rota, fallback
-    completo (todas las secciones vuelven al original)."""
-    matches = list(_SECTION_MARKER_RE.finditer(text))
-    if len(matches) != expected_count:
+def _parse_json_sections(raw_text: str, expected_count: int) -> Optional[list[str]]:
+    """Parsea la respuesta cruda de Ollama como un objeto JSON con claves de
+    índice string (`"0"`..`"{expected_count-1}"`). `None` (mismo contrato
+    que la función que reemplaza) si:
+    - `raw_text` no es JSON válido (`json.JSONDecodeError`), o
+    - el resultado no es un `dict`, o
+    - el conjunto de claves no es exactamente `{"0", ..., str(expected_count-1)}`
+      (ni de más ni de menos), o
+    - algún valor no es `str`.
+
+    Estructura rota en cualquiera de esos casos -> fallback completo (todas
+    las secciones vuelven al original)."""
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
         return None
-    sections = []
-    for i, m in enumerate(matches):
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections.append(text[start:end].strip("\n"))
-    return sections
+    if not isinstance(data, dict):
+        return None
+    expected_keys = {str(i) for i in range(expected_count)}
+    if set(data.keys()) != expected_keys:
+        return None
+    if not all(isinstance(value, str) for value in data.values()):
+        return None
+    return [data[str(i)] for i in range(expected_count)]
 
 
 # --- Llamada de red + orquestación ------------------------------------------
@@ -278,8 +299,8 @@ async def rewrite_parts(
         placeholder_sections.append(placeholder_text)
         line_maps.append(line_map)
 
-    prompt = "".join(
-        _SECTION_DELIM.format(i=i) + text for i, text in enumerate(placeholder_sections)
+    prompt = json.dumps(
+        {str(i): text for i, text in enumerate(placeholder_sections)}, ensure_ascii=False
     )
 
     client = http_client if http_client is not None else httpx.AsyncClient()
@@ -298,6 +319,7 @@ async def rewrite_parts(
                 "system": SYSTEM_PROMPT,
                 "prompt": prompt,
                 "stream": False,
+                "format": "json",
                 "options": {"num_predict": MAX_OUTPUT_TOKENS},
             },
             timeout=timeout,
@@ -321,10 +343,10 @@ async def rewrite_parts(
         return parts
 
     try:
-        sections = _split_by_markers(raw_text, len(body_parts))
+        sections = _parse_json_sections(raw_text, len(body_parts))
         if sections is None:
             logger.warning(
-                "Respuesta de Ollama con estructura de marcadores inesperada "
+                "Respuesta de Ollama con estructura JSON inesperada "
                 "(%d secciones esperadas) — fallback completo a redacción original",
                 len(body_parts),
             )
@@ -348,10 +370,10 @@ async def rewrite_parts(
                 if reconstructed != original_section:
                     any_rewritten = True
     except Exception:
-        # Guard/parseo de marcadores lanzando una excepción propia (bug de
-        # programación, no un fallo de red) — mismo fallback que un fallo de
-        # red, nunca propaga hacia `_run_analysis` (criterio de `security`,
-        # sección 4, última fila).
+        # Guard/parseo del JSON de secciones lanzando una excepción propia
+        # (bug de programación, no un fallo de red) — mismo fallback que un
+        # fallo de red, nunca propaga hacia `_run_analysis` (criterio de
+        # `security`, sección 4, última fila).
         logger.warning(
             "Fallo inesperado reconstruyendo la respuesta de Ollama — "
             "fallback completo a redacción original", exc_info=True,
