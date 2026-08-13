@@ -63,7 +63,15 @@ CONNECT_TIMEOUT_SECONDS = 3.0
 # salida queda truncado/inválido y el guard de parseo cae a fallback igual
 # que cualquier otra respuesta malformada — nunca llega un mensaje cortado
 # al usuario final.
-MAX_OUTPUT_TOKENS = 600
+#
+# Subido de 600 a 2000 (2026-08-13) tras confirmar aceleración por GPU en
+# instalación nativa (~33 tok/s medido en producción, vs ~1.5-2 tok/s por
+# CPU en Docker Desktop): con 600 tokens, una reescritura JSON de 10
+# secciones se cortaba sistemáticamente antes de completar el objeto
+# (observado: siempre llegaba exactamente a 600 sin cerrar el JSON). A 33
+# tok/s, 2000 tokens cuestan ~60s de generación — presupuesto razonable
+# dado el timeout ya configurado (ver OLLAMA_TIMEOUT_SECONDS del .env).
+MAX_OUTPUT_TOKENS = 2000
 
 _TRUTHY_VALUES = {"true", "1", "yes"}
 
