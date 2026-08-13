@@ -1276,3 +1276,153 @@ Ninguno a nivel de código. Pendiente de evidencia (no defecto): checklist de in
 **APROBADO.** Los 63 casos de mi propia sección QA de Momento 1 están cubiertos (62 con test pasando + 1 `skip` pre-autorizado, no una omisión), cobertura 100%/100% en el módulo crítico, 0 regresiones verificadas a nivel de diff (no solo de conteo), y el mecanismo de placeholder-y-restitución — la barrera anti-alucinación central de toda esta spec — verificado con test real en ambos escenarios pedidos (dato embebido en prosa protegido, placeholder inventado con fallback seguro). No hay hallazgos bloqueantes ni correcciones menores pendientes para `implementer`. Queda un único punto abierto, ya clasificado como no bloqueante desde Momento 1: el checklist de infraestructura de 9 puntos, evidencia real contra el VPS/PC de Daniela, responsabilidad de `security`/Daniela antes del cierre completo de la spec — no reabre el trabajo de `implementer`.
 
 Corresponde que el pipeline siga con `security` + `frontend` (si aplica) validando sus dominios específicos, y luego `architect` aprobando cierre, según el diagrama del pipeline en `qa/skill.md`.
+
+---
+
+## Spec Patch [Iter-3] — condensación con protección de disclaimers
+
+**Rol:** `architect`. **Nota de encuadre honesta antes de arrancar:** esto no es una escalación del `implementer` sobre un criterio que falló (el formato estándar de la Regla 4 de `pipeline.md` asume eso) — el pipeline Iter-2 cerró limpio, en producción, sin defectos abiertos. Este patch nace de un pedido nuevo de Daniela sobre una spec ya cerrada. Lo trato como spec patch (no como spec nueva) porque cumple el espíritu de la Regla 4: el cambio es acotado, reutiliza el mecanismo ya existente sin rediseñarlo, y no amerita reabrir todo el pipeline desde `security` sección 1. Si en la validación de `security` aparece algo que sí requiera repensar el mecanismo de guard desde cero, ahí sí correspondería spec nueva — no lo anticipo, pero lo dejo dicho.
+
+### Motivo del patch (no "criterio que falló" — pedido nuevo)
+
+Daniela: el mensaje le sigue pareciendo muy largo. Quiere que Ollama, además de mejorar claridad (ya lo hace), **condense/acorte el texto** sin perder ningún dato.
+
+Riesgo identificado por mí antes de tocar el `SYSTEM_PROMPT`: si solo agrego "podés acortar" como instrucción de prompt, el modelo tiene un blanco nuevo y mucho más agresivo para "optimizar" — y las líneas de mayor riesgo si las recorta son las que **hoy no tienen ningún protected token** (`_protected_tokens` no las toca) pero tampoco deberían tocarse nunca: los disclaimers de transparencia/legales que arma `build_summary_parts` en `src/investbot/summary.py` (líneas 850-868 en el estado actual del archivo):
+
+1. La nota de WACC/DCF como aproximación simplificada (líneas 850-859).
+2. El disclaimer general de no-asesoramiento-financiero, que incluye la aclaración sobre SEC EDGAR (líneas 860-868).
+
+Ambas son prosa 100% libre hoy: `_classify_lines` no genera placeholder para ninguna de las dos porque no contienen números, tickers, ni ✅/❌/SÍ/NO. "Mejorar claridad" las dejaba casi intactas en la práctica (regla 4 del `SYSTEM_PROMPT`, "si una sección ya está clara, devolvela sin cambios"), pero "condensar" es un objetivo distinto y más agresivo que puede chocar exactamente con eso.
+
+**Decisión de diseño: no confiar en la instrucción de prompt para protegerlas — extender el mismo guard determinístico de código que ya protege los números.** Mismo principio que motivó el Spec Patch [Iter-2] (ver docstring de `ai_rewrite.py`, líneas 9-20): la garantía real nunca es que el LLM obedezca una regla, es un chequeo de código que hace imposible que el LLM vea o altere el contenido protegido.
+
+### Mecanismo elegido — constantes de módulo importadas, no lista duplicada ni marcador invisible
+
+Evalué 3 opciones:
+
+**Opción A — lista hardcodeada de strings exactos en `ai_rewrite.py`.**
+✅ Simple, cero cambios en `summary.py`.
+❌ Duplica el texto de los disclaimers en dos archivos. Si mañana alguien edita la redacción del disclaimer en `summary.py` (typo, aclaración legal nueva, cambio de tono) y no se acuerda de tocar la copia en `ai_rewrite.py`, la protección se rompe **en silencio** — el disclaimer vuelve a ser prosa libre sin que ningún test lo note, porque el string ya no hace match exacto.
+📌 Mejor cuando: los dos módulos son de dueños/equipos distintos y no pueden importarse entre sí. No es el caso acá.
+
+**Opción B — marcador invisible que `summary.py` inserta en el texto (ej. caracteres de control Unicode) y que `_classify_lines` reconoce.**
+✅ Desacopla `ai_rewrite.py` de conocer el contenido exacto del disclaimer.
+❌ El marcador viaja **dentro del mismo string que puede llegar a Telegram sin pasar por Ollama** — con la feature apagada (`OLLAMA_REWRITE_ENABLED` off, el caso por defecto) o con cualquier fallback (timeout, JSON inválido, guard que falla), `rewrite_parts` devuelve `parts` tal cual los recibió. Si el marcador se insertó en `summary.py` (antes de que `parts` exista como tal), hay que garantizar que se limpia en **todos** los caminos de salida de `rewrite_parts`, incluido el no-op inmediato de `config.enabled=False` — un solo camino donde se olvide el `strip()` filtra un carácter de control crudo al usuario final en Telegram. Superficie de bug innecesaria para lo que se gana.
+📌 Mejor cuando: no se puede importar entre módulos y el marcador nunca coexiste con un camino de fallback sin sanitizar. No es una ventaja clara acá.
+
+**Opción C (elegida) — hoisting a constantes de módulo en `summary.py`, importadas por `ai_rewrite.py`.**
+Mismo patrón que ya existe en el propio `summary.py` para `_PEERS_NOTE_FIJO`/`_PEERS_NOTE_FINNHUB` (líneas 624-641): se extraen los dos disclaimers de `transparency_lines` a constantes de nivel de módulo con nombre público (sin `_` inicial, porque ahora son importadas fuera del módulo — mismo criterio que `AI_REWRITE_INDICATOR` en `ai_rewrite.py`):
+
+```python
+# summary.py
+DISCLAIMER_WACC_DCF = (
+    "_El DCF es una aproximación con supuestos simplificados de WACC ..."
+    # texto idéntico al actual, sin cambiar un carácter
+)
+DISCLAIMER_NO_ASESORAMIENTO = (
+    "_Esto es una síntesis de datos financieros históricos, no "
+    # texto idéntico al actual, sin cambiar un carácter
+)
+```
+
+Y en `build_summary_parts`, reemplazar los dos `transparency_lines.append("...")` inline por `transparency_lines.append(DISCLAIMER_WACC_DCF)` / `transparency_lines.append(DISCLAIMER_NO_ASESORAMIENTO)` — cero cambio de comportamiento, solo se nombra lo que ya existía como literal.
+
+`ai_rewrite.py` importa ambas constantes (`from investbot.summary import DISCLAIMER_WACC_DCF, DISCLAIMER_NO_ASESORAMIENTO`, sin riesgo de import circular: confirmé que `summary.py` no importa `ai_rewrite` en ningún lado, solo importa `investbot.peers`/`investbot.rules`/`investbot.valuation`) y arma:
+
+```python
+_PROTECTED_DISCLAIMERS = frozenset({DISCLAIMER_WACC_DCF, DISCLAIMER_NO_ASESORAMIENTO})
+```
+
+✅ Es literalmente el mismo objeto/valor que usa `summary.py` para construir el mensaje real — no hay copia que pueda driftear. Si el texto del disclaimer cambia algún día en `summary.py`, `ai_rewrite.py` lo protege automáticamente sin tocar una línea.
+❌ Acopla `ai_rewrite.py` a `summary.py` (antes solo dependía de `httpx`/stdlib). Trade-off consciente: `ai_rewrite.py` ya depende conceptualmente de la forma en que `summary.py` arma las secciones (ambos son parte del mismo pipeline de armado de mensaje); ahora esa dependencia queda explícita en el import en vez de implícita en la cabeza de quien mantiene el código.
+📌 Mejor cuando (este caso): ambos módulos viven en el mismo paquete, un solo equipo los mantiene, y la alternativa es duplicación textual con riesgo de drift silencioso — exactamente la situación acá.
+
+### Ajuste de diseño — extensión de `_classify_lines`
+
+`_classify_lines` (`ai_rewrite.py:156-176`) hoy protege una línea si `_protected_tokens(line)` es no vacío. Se extiende la condición:
+
+```python
+for idx, line in enumerate(lines):
+    if line in _PROTECTED_DISCLAIMERS or _protected_tokens(line):
+        placeholder = f"⟦PH{idx}⟧"
+        line_map[placeholder] = line
+        result_lines.append(placeholder)
+    else:
+        result_lines.append(line)
+```
+
+Comparación por **igualdad exacta de string** (`in` sobre un `frozenset`), no substring ni `.strip()` difuso — porque tal como arma hoy `build_summary_parts` la sección de transparencia (`"\n\n".join(transparency_lines)`, y ninguno de los dos disclaimers tiene un `\n` interno en su literal), cada disclaimer aparece como **una línea completa propia** después de que `_classify_lines` hace `section.split("\n")`. Confirmé esto leyendo el literal fuente de ambos strings — ninguno de los dos tiene un `\n` embebido.
+
+No hace falta ningún código nuevo de restitución: al convertirse en placeholder, un disclaimer sigue exactamente el mismo camino que ya existe y está probado para líneas numéricas — `_reconstruct_section` lo restituye verbatim (Capa 1: el conjunto de placeholders debe matchear exacto) o cae a `None`/fallback si el modelo lo omite, lo duplica, o inventa uno. El LLM **nunca ve el contenido real** de estas dos líneas — no hay nada que "condensar" porque no hay nada que leer.
+
+**Riesgo residual que dejo documentado para `security` (no lo resuelvo yo en este patch, ver Handoff):** la comparación por igualdad exacta es *fail-open*, no *fail-closed*. Si en el futuro alguien cambia cómo `build_summary_parts` arma `transparency_lines` (por ejemplo, concatena el disclaimer con otro texto en la misma línea, o cambia el separador de `"\n\n"` a otra cosa), el `==` deja de matchear y el disclaimer **vuelve a ser prosa libre silenciosamente** — sin ningún error, sin ningún log, sin que nadie lo note hasta leer el mensaje final. Igual filosofía que el test de colisión de delimitador que ya existe en el proyecto (`qa`, Iter-2, criterio 33: "convierte una verificación puntual en regresión permanente automatizada") — este patch necesita su equivalente: un test canario que falle ruidosamente si algún día `DISCLAIMER_WACC_DCF`/`DISCLAIMER_NO_ASESORAMIENTO` dejan de aparecer como línea exacta y completa dentro del output real de `build_summary_parts`.
+
+### Cambio en el `SYSTEM_PROMPT` — nueva regla de condensación
+
+Se agrega una regla 7 (las 6 existentes no cambian de número ni de texto) y se ajusta la regla 4 para que no contradiga a la nueva:
+
+```
+4. Si una sección ya está clara Y breve, devolvela sin cambios.
+...
+7. Además de mejorar la claridad, podés CONDENSAR el texto: acortalo
+   eliminando redundancia, rodeos o repeticiones, siempre que no se
+   pierda ningún dato, número, ticker, veredicto, matiz de significado
+   ni idea completa. El objetivo es más claro y más corto, nunca menos
+   información. No resumas de forma agresiva — condensar no es resumir.
+```
+
+Esta regla aplica únicamente a las líneas de prosa libre que **siguen siendo** editables después del guard extendido (ni las numéricas ni las de disclaimer llegan como texto real al modelo, así que la regla no tiene forma de aplicarse sobre ellas — es una limitación estructural, no solo una instrucción que se espera que el modelo respete).
+
+### Criterios de aceptación
+
+- [ ] `DISCLAIMER_WACC_DCF` y `DISCLAIMER_NO_ASESORAMIENTO` existen como constantes de módulo público en `summary.py`, con el texto byte-idéntico al que hoy está inline en `build_summary_parts` (líneas ~850-868) — test de regresión que compara el output completo de `build_summary_parts` antes/después del refactor, carácter a carácter, para un mismo input.
+- [ ] `ai_rewrite.py` importa ambas constantes desde `investbot.summary` (no las redefine ni las copia como literal propio) — test que hace `monkeypatch` del valor de la constante en `summary` y confirma que `_classify_lines` de `ai_rewrite` sigue protegiendo el nuevo valor (prueba que es el mismo objeto, no una copia hardcodeada que ya divergió).
+- [ ] `_classify_lines` genera placeholder para una línea que sea igual (`==` exacto) a cualquier elemento de `_PROTECTED_DISCLAIMERS`, además del criterio ya existente de `_protected_tokens` — ambos criterios conviven con `or`, ninguno reemplaza al otro.
+- [ ] Test end-to-end sobre la sección real de "Notas de transparencia" que devuelve `build_summary_parts` (no un fixture simplificado): mockear una respuesta de Ollama que intenta activamente acortar/reformular/eliminar alguno de los dos disclaimers → el resultado final de `rewrite_parts` contiene ambos disclaimers byte-idénticos al original, incluso si el resto de la sección (notas de fuente de peers/treasury/estados financieros, que quedan fuera de esta protección) sale condensado.
+- [ ] Test adversarial: la respuesta simulada de Ollama omite el placeholder de un disclaimer (el modelo "decide" no copiarlo) → `_reconstruct_section` devuelve `None` (mismo camino ya probado para placeholders numéricos, caso 37 de QA Iter-2) → la sección completa cae a fallback, texto 100% original, no una versión parcialmente editada.
+- [ ] Test canario (mitiga el riesgo fail-open documentado arriba): recorrer el output real de `build_summary_parts` con un input de ejemplo y confirmar que `DISCLAIMER_WACC_DCF` y `DISCLAIMER_NO_ASESORAMIENTO` aparecen cada uno como **línea completa exacta** después de un `.split("\n")` sobre la última sección — si esto deja de cumplirse (alguien cambió cómo se arma `transparency_lines`), el test falla con un mensaje explícito señalando que la protección de disclaimers quedó rota, no un fallo genérico.
+- [ ] El `SYSTEM_PROMPT` incluye el texto exacto de la nueva regla 7 de condensación, y la regla 4 queda ajustada como se especifica arriba — test que inspecciona el payload enviado a Ollama (mismo patrón que el test existente para la regla 6, caso 45 de QA Iter-2).
+- [ ] Test de no-regresión sobre prosa libre sin disclaimers (ej. la sección `intro` de la analogía de la Tienda de Limonada): una reescritura más corta que el original pasa el guard sin problema — confirma que condensar contenido no protegido nunca dispara `_is_safe_rewrite` en falso (esa función solo compara protected tokens, nunca longitud).
+- [ ] Los 794 tests preexistentes (Iter-2) siguen pasando sin modificación — 0 regresiones.
+
+### Criterios que NO cambian
+
+Todos los criterios de aceptación base de `architect` (Iter-1), los 12 criterios adicionales del Spec Patch [Iter-2], y los ~28 criterios de `security` de las secciones 1, 2, 4, 5, 6, 7, 8 siguen vigentes sin modificación. El mecanismo de placeholder-y-restitución (`_classify_lines`/`_reconstruct_section`) no cambia de forma — solo se extiende el criterio de qué cuenta como "protegido". El fallback silencioso ante timeout/error de Ollama, el feature flag, `AI_REWRITE_INDICATOR`, y la exclusión permanente del título (`parts[0]`) no cambian.
+
+### Fuera de scope de este patch (documentado, no soy yo quien lo cierra)
+
+Las notas de fuente dinámicas de `transparency_lines` (nota de peers, nota de tasa libre de riesgo/treasury, notas de fuente de balance/income/cash-flow) **no** quedan protegidas por este patch — son texto interpolado (contienen el nombre de la fuente de datos), no disclaimers legales/de no-responsabilidad, y Daniela no las mencionó como riesgo. Si más adelante se decide protegerlas también, el mecanismo ya lo soporta sin rediseño: alcanza con agregar sus constantes (o una función que las genere) al mismo `_PROTECTED_DISCLAIMERS`.
+
+### Restricciones
+
+Lo que no cambia lo dejo arriba. Explícito para `implementer`: no toques la firma de `rewrite_parts`, `_reconstruct_section`, ni `_parse_json_sections` — el único archivo con cambio de comportamiento nuevo es `_classify_lines` (una condición `or` agregada) y el `SYSTEM_PROMPT` (una regla agregada + un ajuste de texto en la regla 4). `summary.py` cambia solo en hoisting de literales a constantes — cero cambio de output.
+
+### Handoff → `security`
+
+Foco esperado, mismo patrón que Iter-1/Iter-2 (agregás criterios, no reescribís):
+
+1. **Verificar el riesgo fail-open documentado arriba** (comparación por igualdad exacta) y decidir si el test canario que dejé como criterio de aceptación alcanza, o si hace falta algo más robusto (ej. un chequeo en tiempo de arranque del bot, no solo un test).
+2. **Escenario adversarial específico de esta iteración**: con la nueva regla de condensación en el prompt, ¿existe algún camino donde el modelo "decida" que un placeholder de disclaimer es redundante y lo omita a propósito (no por error) buscando cumplir la instrucción de acortar? El guard estructural ya lo cubre (si falta el placeholder, `None` → fallback completo), pero pedime confirmarlo con un test que simule exactamente esa intención, no solo una omisión accidental.
+3. Confirmar que no hay fuga de las constantes de disclaimer ni de sus nombres en logs (mismo criterio ya vigente, sección 7 de `security` Iter-1).
+4. Confirmar que el acoplamiento nuevo `ai_rewrite.py → summary.py` (import directo) no abre ninguna superficie nueva — mi lectura es que no, porque `summary.py` sigue sin importar nada relacionado a red/Ollama, pero quiero el chequeo explícito de alguien que no lo diseñó.
+5. Si algún hallazgo de estos resulta bloqueante (approach incorrecto, no un detalle), vuelve a mí como Iter-4 con spec patch — si es corrección menor, va directo a `implementer` sin pasar por mí, según Regla 3 de `pipeline.md`.
+
+No paso por `frontend` — no hay superficie de UI nueva, es texto de Telegram ya existente.
+
+---
+
+### Criterios de seguridad — security [Iter-3, 2026-08-13]
+
+**Rol:** `security`. Esta sección agrega criterios al Spec Patch [Iter-3] de `architect`; no reescribe el mecanismo elegido (Opción C) ni la extensión de `_classify_lines`. **Veredicto: hallazgos menores — aprobado con 3 criterios adicionales, no bloqueante.**
+
+**1. Comparación por igualdad exacta — verificada contra el código real, sin hueco hoy.** Leí `src/investbot/summary.py:828-883`. `transparency_lines` arma `DISCLAIMER_WACC_DCF`/`DISCLAIMER_NO_ASESORAMIENTO` con `transparency_lines.append(...)` **incondicional**, después de todos los bloques condicionales (`treasury_source`, `income_statement_note`, `balance_sheet_note`, `cash_flow_note`, líneas 837-849) — ningún camino de código concatena esas notas condicionales *dentro* del mismo string que un disclaimer; cada una es su propio elemento de lista. `"\n\n".join(transparency_lines)` (línea 881) más `section.split("\n")` en `_classify_lines` (`ai_rewrite.py:166`) produce líneas vacías intercaladas (por el doble `\n\n`), pero cada disclaimer sigue llegando como línea completa, byte-idéntica a la constante. Grep confirmó que el texto de ambos disclaimers no está duplicado en ningún otro archivo (`grep -rn "aproximación con supuestos simplificados\|síntesis de datos financieros históricos"` → un solo match cada uno, ambos en `summary.py`). **Conclusión: no hay camino real hoy (con o sin `treasury_source`, con o sin notas de fuente) que deje pasar un disclaimer sin protección.** El hueco que `architect` documentó es correctamente un riesgo *futuro*, no uno vigente.
+
+**2. Test canario — alcanza como diseño, pero "un input de ejemplo" es insuficiente cobertura. Criterio nuevo:**
+- [ ] El test canario del criterio de aceptación (`Spec Patch Iter-3`, penúltimo ítem) debe parametrizarse sobre al menos 4 combinaciones reales de `build_summary_parts`: (a) sin `treasury_source` y sin notas de fuente, (b) con `treasury_source` presente, (c) con `income_statement_fuente`/`balance_sheet_fuente`/`cash_flow_fuente` presentes, (d) con todos los opcionales presentes a la vez — en las 4, `DISCLAIMER_WACC_DCF`/`DISCLAIMER_NO_ASESORAMIENTO` deben aparecer como línea exacta y completa tras `.split("\n")`. Un solo caso feliz no habría detectado, por ejemplo, un futuro refactor que interpole una nota condicional dentro del mismo string que el disclaimer solo cuando `treasury_source` está presente.
+- [ ] Reforzar el fail-open con una verificación en tiempo de import (no solo test): un `assert "\n" not in DISCLAIMER_WACC_DCF and "\n" not in DISCLAIMER_NO_ASESORAMIENTO` a nivel de módulo en `summary.py` (o en el import de `ai_rewrite.py`) — el invariante real del que depende toda la protección es "el disclaimer es una sola línea sin `\n` interno"; hacerlo explícito y auto-verificable en cada arranque del bot es más fuerte que un test que solo corre en CI, y es barato (una línea, cero costo en runtime).
+
+**3. Regla 7 de condensación — bien acotada para disclaimers/datos (estructuralmente inalcanzables por diseño), pero deja un hueco no mecánico en prosa libre educativa.** El guard de código protege números/tickers/veredictos/disclaimers — pero la intro de la Tienda de Limonada, explicaciones de renta variable/beta, etc. siguen siendo prosa 100% libre y "condensar sin perder matiz" es una instrucción que, igual que "no toques los números" en Iter-1, **no tiene ningún chequeo determinístico que la respalde** — el propio principio de diseño de esta spec ("nunca confiar únicamente en que el LLM obedezca") no se aplica acá porque "preservar matiz" no es mecánicamente verificable como sí lo es un multiset de tokens. No es bloqueante (no es alteración de datos financieros, es riesgo de calidad pedagógica), pero es una asimetría real que dejo documentada, no resuelta por código:
+- [ ] Criterio de aceptación nuevo, no automatizable: antes de dar por cerrado este patch en producción, Daniela revisa manualmente al menos 3-5 mensajes reales con la sección educativa (Tienda de Limonada, beta, etc.) condensada por Ollama, comparando contra el original, para confirmar que no se perdió matiz — mismo patrón que el "Checklist de infraestructura — evidencia no automatizable" ya usado en Iter-2 para lo que no es testeable por pytest.
+- [ ] Nice-to-have, no bloqueante: loguear (a nivel `DEBUG`, nunca `INFO`/`WARNING` para no generar ruido) el texto original y el condensado de las secciones no protegidas durante las primeras N consultas tras activar la feature, para que exista evidencia auditable si Daniela nota pérdida de matiz más adelante y quiere diagnosticar cuál sección/prompt lo causó — se descarta después de la ventana de validación inicial, no es logging permanente.
+
+**Handoff:** ninguno de los 3 hallazgos es bloqueante para `architect`; los 2 primeros son correcciones menores que puede tomar `implementer` directo (extender el test canario existente + agregar el `assert` de import) sin volver a pasar por `architect`, según Regla 3 de `pipeline.md`. El tercero es un criterio de validación manual para Daniela, no un cambio de código.

@@ -640,6 +640,41 @@ _PEERS_NOTE_FINNHUB = (
     "elegido a mano por quien construyó el bot."
 )
 
+# Disclaimers de transparencia — hoisteados a constantes públicas (Spec Patch
+# [Iter-3] de `SDD_redaccion_ia_ollama.md`, Opción C elegida por `architect`):
+# `ai_rewrite.py` las importa directamente para protegerlas del guard de
+# condensación (nunca se envían a Ollama como texto libre). Mismo patrón que
+# `_PEERS_NOTE_FIJO`/`_PEERS_NOTE_FINNHUB` arriba, pero sin `_` inicial porque
+# ahora son consumidas fuera de este módulo (mismo criterio que
+# `AI_REWRITE_INDICATOR` en `ai_rewrite.py`). Texto byte-idéntico al que antes
+# vivía inline en `build_summary_parts` — cero cambio de comportamiento.
+DISCLAIMER_WACC_DCF = (
+    "_El DCF es una aproximación con supuestos simplificados de WACC "
+    "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
+    "la empresa financiarse con capital propio (accionistas) y con "
+    "deuda (bancos/bonistas), ponderado por cuánto usa de cada uno. Es "
+    "un cálculo propio del bot (no viene de FMP), simplificado — "
+    "es una aproximación más simple, no un sustituto completo del "
+    "WACC que armaría un analista con datos de mercado más "
+    "completos._"
+)
+DISCLAIMER_NO_ASESORAMIENTO = (
+    "_Esto es una síntesis de datos financieros históricos, no "
+    "asesoramiento financiero profesional ni una recomendación de "
+    "inversión. No incluye análisis de noticias ni del contexto "
+    "cualitativo del negocio más allá de los eventos corporativos "
+    "oficiales de SEC EDGAR listados arriba (si los hay) — y esos se "
+    "muestran sin resumir, no reemplazan leer el filing completo. "
+    "Revisá vos el resto del contexto cualitativo antes de decidir._"
+)
+# Invariante del que depende toda la protección de `ai_rewrite._classify_lines`
+# (comparación por igualdad exacta de línea completa, `security` Iter-3
+# sección 2): cada disclaimer debe ser una sola línea sin `\n` interno. Se
+# verifica acá, a nivel de import, para que una futura edición que rompa esto
+# falle ruidosamente al arrancar el bot, no en silencio.
+assert "\n" not in DISCLAIMER_WACC_DCF
+assert "\n" not in DISCLAIMER_NO_ASESORAMIENTO
+
 
 def _build_balance_sheet_note(balance_sheet_fuente: Optional[str]) -> Optional[str]:
     """Texto de transparencia sobre si el balance general (la foto) mostrado
@@ -847,25 +882,8 @@ def build_summary_parts(
     cash_flow_note = _build_cash_flow_note(cash_flow_fuente)
     if cash_flow_note:
         transparency_lines.append(f"_{cash_flow_note}_")
-    transparency_lines.append(
-        "_El DCF es una aproximación con supuestos simplificados de WACC "
-        "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
-        "la empresa financiarse con capital propio (accionistas) y con "
-        "deuda (bancos/bonistas), ponderado por cuánto usa de cada uno. Es "
-        "un cálculo propio del bot (no viene de FMP), simplificado — "
-        "es una aproximación más simple, no un sustituto completo del "
-        "WACC que armaría un analista con datos de mercado más "
-        "completos._"
-    )
-    transparency_lines.append(
-        "_Esto es una síntesis de datos financieros históricos, no "
-        "asesoramiento financiero profesional ni una recomendación de "
-        "inversión. No incluye análisis de noticias ni del contexto "
-        "cualitativo del negocio más allá de los eventos corporativos "
-        "oficiales de SEC EDGAR listados arriba (si los hay) — y esos se "
-        "muestran sin resumir, no reemplazan leer el filing completo. "
-        "Revisá vos el resto del contexto cualitativo antes de decidir._"
-    )
+    transparency_lines.append(DISCLAIMER_WACC_DCF)
+    transparency_lines.append(DISCLAIMER_NO_ASESORAMIENTO)
 
     parts = [
         titulo,

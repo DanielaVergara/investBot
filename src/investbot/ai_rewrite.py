@@ -36,6 +36,8 @@ from typing import Mapping, Optional
 
 import httpx
 
+from investbot.summary import DISCLAIMER_NO_ASESORAMIENTO, DISCLAIMER_WACC_DCF
+
 logger = logging.getLogger(__name__)
 
 # --- Configuración (Decisión de diseño #4) ---------------------------------
@@ -152,12 +154,23 @@ def _is_safe_rewrite(original: str, rewritten: str) -> bool:
 
 _PLACEHOLDER_RE = re.compile(r"⟦PH\d+⟧")
 
+# Disclaimers de transparencia/legales protegidos (Spec Patch [Iter-3]): se
+# importan como el MISMO objeto que usa `summary.py` para armar el mensaje
+# real (Opción C del patch) — no una copia hardcodeada que pueda driftear. Se
+# comparan por igualdad exacta de línea completa en `_classify_lines`, así
+# que nunca llegan a Ollama como texto libre editable — no hay nada que
+# "condensar" porque no hay nada que el modelo pueda leer.
+_PROTECTED_DISCLAIMERS = frozenset({DISCLAIMER_WACC_DCF, DISCLAIMER_NO_ASESORAMIENTO})
+
 
 def _classify_lines(section: str) -> tuple[str, dict[str, str]]:
-    """Reemplaza cada línea con >=1 protected token por un placeholder
-    opaco. Devuelve (texto_con_placeholders, mapa_placeholder_a_linea_original).
-    Líneas sin ningún protected token (prosa pura) quedan intactas y
-    completamente libres para que el LLM las reescriba sin restricción.
+    """Reemplaza cada línea con >=1 protected token, o que sea exactamente
+    uno de los disclaimers protegidos (`_PROTECTED_DISCLAIMERS`, Spec Patch
+    [Iter-3]), por un placeholder opaco. Devuelve
+    (texto_con_placeholders, mapa_placeholder_a_linea_original). Líneas sin
+    ningún protected token y que no sean un disclaimer (prosa pura) quedan
+    intactas y completamente libres para que el LLM las reescriba/condense
+    sin restricción.
 
     El índice de cada placeholder es la posición de línea *dentro de la
     sección* (se reinicia en cada llamada) — mismo criterio ya usado para
@@ -167,7 +180,7 @@ def _classify_lines(section: str) -> tuple[str, dict[str, str]]:
     line_map: dict[str, str] = {}
     result_lines = []
     for idx, line in enumerate(lines):
-        if _protected_tokens(line):
+        if line in _PROTECTED_DISCLAIMERS or _protected_tokens(line):
             placeholder = f"⟦PH{idx}⟧"
             line_map[placeholder] = line
             result_lines.append(placeholder)
@@ -235,7 +248,7 @@ SYSTEM_PROMPT = (
     "3. Mantené el formato Markdown de Telegram (*negrita*, _itálica_) dentro de\n"
     "   cada valor de texto, y las claves del objeto JSON exactamente como las\n"
     "   recibiste.\n"
-    "4. Si una sección ya está clara, devolvela sin cambios.\n"
+    "4. Si una sección ya está clara Y breve, devolvela sin cambios.\n"
     "5. Respondé ÚNICAMENTE con el objeto JSON reescrito, sin comentarios tuyos,\n"
     "   sin explicaciones adicionales, sin texto antes ni después del JSON.\n"
     "6. Vas a ver tokens de la forma ⟦PHn⟧ dentro de los valores de texto del\n"
@@ -244,6 +257,11 @@ SYSTEM_PROMPT = (
     "   vez cada uno, en cualquier lugar del texto que tenga sentido para la\n"
     "   fluidez de tu redacción. Nunca los modifiques, fusiones con palabras\n"
     "   vecinas, dupliques, traduzcas, ni interpretes su contenido.\n"
+    "7. Además de mejorar la claridad, podés CONDENSAR el texto: acortalo\n"
+    "   eliminando redundancia, rodeos o repeticiones, siempre que no se\n"
+    "   pierda ningún dato, número, ticker, veredicto, matiz de significado\n"
+    "   ni idea completa. El objetivo es más claro y más corto, nunca menos\n"
+    "   información. No resumas de forma agresiva — condensar no es resumir.\n"
 )
 
 

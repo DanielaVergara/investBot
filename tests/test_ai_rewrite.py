@@ -16,6 +16,7 @@ proyecto).
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 from pathlib import Path
@@ -23,7 +24,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from investbot import ai_rewrite
+from investbot import ai_rewrite, summary
 
 CANARY_SECRET = "OLLAMA-SHARED-SECRET-CANARY"
 
@@ -490,6 +491,134 @@ def test_summary_py_no_contiene_el_delimitador_de_placeholder():
 
 
 # ---------------------------------------------------------------------------
+# E-bis. Spec Patch [Iter-3] -- protección de disclaimers de transparencia en
+# `_classify_lines` (constantes hoisteadas en `summary.py`, importadas acá:
+# `DISCLAIMER_WACC_DCF`/`DISCLAIMER_NO_ASESORAMIENTO`, Opción C del patch).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_lines_protege_disclaimer_wacc_dcf_por_igualdad_exacta():
+    """`_classify_lines` genera placeholder para una línea igual (`==`
+    exacto) a `DISCLAIMER_WACC_DCF`, además del criterio ya existente de
+    `_protected_tokens` -- ambos criterios conviven con `or`."""
+    text, line_map = ai_rewrite._classify_lines(summary.DISCLAIMER_WACC_DCF)
+    assert len(line_map) == 1
+    placeholder = next(iter(line_map))
+    assert line_map[placeholder] == summary.DISCLAIMER_WACC_DCF
+    assert text == placeholder
+
+
+def test_classify_lines_protege_disclaimer_no_asesoramiento_por_igualdad_exacta():
+    """Mismo criterio que el test anterior, para `DISCLAIMER_NO_ASESORAMIENTO`."""
+    text, line_map = ai_rewrite._classify_lines(summary.DISCLAIMER_NO_ASESORAMIENTO)
+    assert len(line_map) == 1
+    placeholder = next(iter(line_map))
+    assert line_map[placeholder] == summary.DISCLAIMER_NO_ASESORAMIENTO
+    assert text == placeholder
+
+
+def test_classify_lines_protege_ambos_disclaimers_dentro_de_una_seccion_real():
+    """Sección real de transparencia (armada igual que `build_summary_parts`
+    la construye, con `\\n\\n` entre elementos): ambos disclaimers quedan
+    placeholder-eados. El título de la sección (única línea sin protected
+    tokens ni match con un disclaimer) queda como prosa libre.
+
+    Nota: la nota de fuente FMP NO sirve acá como ejemplo de "prosa libre
+    que queda sin proteger" porque ya contiene el protected token "FMP"
+    (mayúsculas 2-10 letras) -- este test usa una línea de prosa 100%
+    libre construida a propósito, sin ningún protected token, para no
+    confundir el criterio nuevo (igualdad exacta) con el ya existente
+    (`_protected_tokens`)."""
+    prosa_libre_sin_protected_tokens = "una línea de prosa común sin ningún dato protegido"
+    assert ai_rewrite._protected_tokens(prosa_libre_sin_protected_tokens) == []
+    section = (
+        "*Notas de transparencia:*\n\n"
+        f"{prosa_libre_sin_protected_tokens}\n\n"
+        f"{summary.DISCLAIMER_WACC_DCF}\n\n"
+        f"{summary.DISCLAIMER_NO_ASESORAMIENTO}"
+    )
+    text, line_map = ai_rewrite._classify_lines(section)
+    protected_lines = set(line_map.values())
+    assert summary.DISCLAIMER_WACC_DCF in protected_lines
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO in protected_lines
+    assert summary.DISCLAIMER_WACC_DCF not in text
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO not in text
+    # El título de la sección y la línea de prosa libre quedan sin placeholder.
+    assert "*Notas de transparencia:*" in text
+    assert prosa_libre_sin_protected_tokens in text
+
+
+def test_classify_lines_protege_por_igualdad_exacta_incluso_sin_protected_tokens(monkeypatch):
+    """Aísla el criterio NUEVO (igualdad exacta con `_PROTECTED_DISCLAIMERS`)
+    del criterio ya existente (`_protected_tokens`): usa un "disclaimer"
+    sintético sin ningún protected token (ni números, ni tickers, ni
+    ✅/❌/SÍ/NO) para demostrar que la protección dispara igual, solo por
+    matchear `_PROTECTED_DISCLAIMERS`.
+
+    Un test contra el texto real de los disclaimers de producción no
+    aislaría este criterio: ambos ya contienen protected tokens
+    incidentales (DCF/WACC/FMP en uno, SEC/EDGAR en el otro -- abreviaturas
+    en mayúsculas que matchean `_PROTECTED_TOKEN_RE`), así que ya estarían
+    protegidos por el criterio viejo aunque el nuevo no existiera."""
+    disclaimer_sintetico = "Este es un disclaimer de ejemplo sin ningún dato protegido adentro."
+    assert ai_rewrite._protected_tokens(disclaimer_sintetico) == []
+    monkeypatch.setattr(ai_rewrite, "_PROTECTED_DISCLAIMERS", frozenset({disclaimer_sintetico}))
+    text, line_map = ai_rewrite._classify_lines(disclaimer_sintetico)
+    assert line_map == {text: disclaimer_sintetico}
+
+
+def test_classify_lines_variante_no_identica_del_disclaimer_no_se_protege_fail_open(monkeypatch):
+    """Fail-open documentado por `architect` (Spec Patch [Iter-3]): la
+    comparación es por igualdad EXACTA -- una variación mínima (ej. una
+    palabra distinta) de un texto protegido NO activa la protección.
+    Confirma que el criterio es `==`, no un substring/fuzzy match. Usa el
+    mismo disclaimer sintético sin protected tokens del test anterior para
+    aislar el criterio nuevo del ya existente."""
+    disclaimer_sintetico = "Este es un disclaimer de ejemplo sin ningún dato protegido adentro."
+    variante = disclaimer_sintetico.replace("ejemplo", "muestra")
+    assert variante != disclaimer_sintetico
+    assert ai_rewrite._protected_tokens(variante) == []
+    monkeypatch.setattr(ai_rewrite, "_PROTECTED_DISCLAIMERS", frozenset({disclaimer_sintetico}))
+    text, line_map = ai_rewrite._classify_lines(variante)
+    assert line_map == {}
+    assert text == variante
+
+
+def test_protected_disclaimers_no_es_una_copia_hardcodeada_sino_importada_de_summary(monkeypatch):
+    """Criterio: `ai_rewrite.py` importa las constantes desde
+    `investbot.summary` (no las redefine ni las copia como literal propio).
+    Se prueba monkeypatcheando el valor real en `summary` y confirmando,
+    tras recargar `ai_rewrite` (simulando que el módulo se importa de nuevo
+    con el valor ya editado en `summary.py`, el escenario real que describe
+    el patch), que `_classify_lines` protege el NUEVO valor -- si
+    `ai_rewrite.py` tuviera una copia hardcodeada independiente, el nuevo
+    valor jamás se protegería."""
+    nuevo_valor = "_Disclaimer editado a mano para este test, valor nunca visto antes._"
+    original = summary.DISCLAIMER_WACC_DCF
+    monkeypatch.setattr(summary, "DISCLAIMER_WACC_DCF", nuevo_valor)
+    try:
+        reloaded = importlib.reload(ai_rewrite)
+        assert nuevo_valor in reloaded._PROTECTED_DISCLAIMERS
+        text, line_map = reloaded._classify_lines(nuevo_valor)
+        assert line_map == {text: nuevo_valor}
+    finally:
+        monkeypatch.setattr(summary, "DISCLAIMER_WACC_DCF", original)
+        importlib.reload(ai_rewrite)  # restaura el módulo real para el resto de la suite
+
+
+def test_ai_rewrite_no_hardcodea_el_texto_de_los_disclaimers_como_literal_propio():
+    """Confirma, a nivel de código fuente, que `ai_rewrite.py` no duplica el
+    texto de los disclaimers como string literal propio -- solo los conoce
+    vía import de `investbot.summary` (Opción C del Spec Patch [Iter-3], la
+    alternativa descartada explícitamente por riesgo de drift silencioso)."""
+    ai_rewrite_path = Path(__file__).parent.parent / "src" / "investbot" / "ai_rewrite.py"
+    source = ai_rewrite_path.read_text(encoding="utf-8")
+    assert "aproximación con supuestos simplificados de WACC" not in source
+    assert "síntesis de datos financieros históricos" not in source
+    assert "from investbot.summary import" in source
+
+
+# ---------------------------------------------------------------------------
 # F. _reconstruct_section (casos 34-41)
 # ---------------------------------------------------------------------------
 
@@ -892,3 +1021,181 @@ async def test_log_warning_estructura_inesperada_no_incluye_cuerpo_crudo_con_con
 )
 def test_ollama_shared_secret_nunca_en_logs_no_aplica_capa_no_implementada():
     """Caso 63 -- N/A en esta iteración, ver `reason` del skip."""
+
+
+# ---------------------------------------------------------------------------
+# M. Spec Patch [Iter-3] -- SYSTEM_PROMPT regla 7 de condensación +
+# end-to-end sobre la sección REAL de "Notas de transparencia".
+# ---------------------------------------------------------------------------
+
+
+def _real_transparency_section(**overrides) -> str:
+    """Arma la sección REAL de "Notas de transparencia" llamando a
+    `summary.build_summary_parts` con datos mínimos válidos -- no un
+    fixture simplificado que reconstruya el texto de los disclaimers a
+    mano (criterio de `security`/`architect`, Spec Patch [Iter-3])."""
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios={
+            "ratio_liquidez": 1.5,
+            "liquidez_sin_pasivos_circulantes": False,
+            "margen_bruto": 0.4,
+            "per": 15.0,
+            "per_no_aplicable": False,
+            "ps": 3.0,
+        },
+        pillars={
+            "ingresos_crecientes": True,
+            "utilidades_crecientes": True,
+            "deuda_controlada": True,
+            "precio_razonable": True,
+        },
+        scenarios={
+            "pesimista": {
+                "valor_justo_multiplos": 600.0, "valor_justo_graham": 435.64,
+                "valor_justo_dcf": 225.64, "valor_justo_total": 420.43,
+                "modelos_excluidos": [],
+            },
+            "conservador": {
+                "valor_justo_multiplos": 658.0, "valor_justo_graham": 555.64,
+                "valor_justo_dcf": 288.82, "valor_justo_total": 500.82,
+                "modelos_excluidos": [],
+            },
+            "optimista": {
+                "valor_justo_multiplos": 714.0, "valor_justo_graham": 675.64,
+                "valor_justo_dcf": 376.50, "valor_justo_total": 588.71,
+                "modelos_excluidos": [],
+            },
+            "modelos_excluidos_base": [],
+        },
+        n_peers_validos=3,
+        momentum={
+            "pct_vs_year_high": -4.2, "pct_vs_year_low": 18.6,
+            "pct_vs_avg_50": 3.5, "pct_vs_avg_200": 6.0,
+            "etiqueta": "impulso_positivo",
+        },
+        peer_comparison={
+            "per_propio": 28.4, "per_minimo_peers": 22.1,
+            "per_promedio_peers": 27.9, "per_maximo_peers": 33.5,
+            "peers_usados": ["MSFT", "ORCL", "CRM"],
+            "posicion": "en_linea", "motivo_no_comparable": None,
+        },
+        risk_fit={
+            "encaja": True, "perfil": "moderado", "beta": 1.0,
+            "etiqueta_activo": "renta variable",
+        },
+        treasury_source="FRED (serie DGS20)",
+    )
+    kwargs.update(overrides)
+    parts = summary.build_summary_parts(**kwargs)
+    return next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+
+
+async def test_rewrite_parts_condensa_notas_de_transparencia_reales_preserva_ambos_disclaimers():
+    """Test end-to-end sobre la sección REAL de "Notas de transparencia" que
+    devuelve `build_summary_parts` (no un fixture simplificado): se simula
+    una respuesta de Ollama que intenta activamente acortar/reformular la
+    prosa libre restante de la sección (respetando el contrato de
+    placeholders) -- el resultado final de `rewrite_parts` contiene ambos
+    disclaimers byte-idénticos al original, incluso si el resto de la
+    sección sale condensado."""
+    section = _real_transparency_section()
+    placeholder_text, _ = ai_rewrite._classify_lines(section)
+    placeholders_en_orden = ai_rewrite._PLACEHOLDER_RE.findall(placeholder_text)
+    # Al menos los 2 disclaimers deben haber quedado como placeholder.
+    assert len(placeholders_en_orden) >= 2
+
+    condensado = "Resumen mucho más corto de todas las notas. " + " ".join(placeholders_en_orden)
+    parts = ["*Adobe (ADBE)*", section]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": _section_response([condensado])})
+
+    client = _client_with_handler(handler)
+    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+
+    assert summary.DISCLAIMER_WACC_DCF in result[1]
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO in result[1]
+    assert "Resumen mucho más corto de todas las notas" in result[1]
+
+
+async def test_rewrite_parts_adversarial_omite_placeholder_de_disclaimer_cae_a_fallback_completo():
+    """Test adversarial (Spec Patch [Iter-3]): la respuesta simulada de
+    Ollama omite el placeholder de uno de los disclaimers -- el modelo
+    "decide" no copiarlo, buscando cumplir la instrucción de acortar
+    (regla 7). `_reconstruct_section` debe devolver `None` (mismo camino ya
+    probado para placeholders numéricos, caso 37 de QA Iter-2) -> la
+    sección completa cae a fallback, texto 100% original, no una versión
+    parcialmente editada."""
+    section = _real_transparency_section()
+    placeholder_text, line_map = ai_rewrite._classify_lines(section)
+    placeholders_en_orden = ai_rewrite._PLACEHOLDER_RE.findall(placeholder_text)
+    assert len(placeholders_en_orden) >= 2
+
+    # El LLM devuelve todos los placeholders MENOS el primero (omite un
+    # disclaimer a propósito, intentando "acortar" la sección).
+    respuesta_con_omision = "Notas condensadas. " + " ".join(placeholders_en_orden[1:])
+    parts = ["*Adobe (ADBE)*", section]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": _section_response([respuesta_con_omision])})
+
+    client = _client_with_handler(handler)
+    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+
+    # Fallback completo de la sección: texto 100% original, no una mezcla.
+    assert result[1] == section
+    assert summary.DISCLAIMER_WACC_DCF in result[1]
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO in result[1]
+
+
+async def test_rewrite_parts_system_prompt_incluye_regla_7_de_condensacion():
+    """El `SYSTEM_PROMPT` enviado incluye literalmente la regla 7 nueva del
+    Spec Patch [Iter-3] (instrucción de condensación) -- mismo patrón que el
+    test existente para la regla 6 (caso 45 de QA Iter-2)."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"response": _section_response(["Cuerpo sin cambios"])})
+
+    parts = ["*Adobe (ADBE)*", "Cuerpo sin cambios"]
+    client = _client_with_handler(handler)
+    await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert "CONDENSAR" in captured["body"]["system"]
+    assert "condensar no es resumir" in captured["body"]["system"]
+    assert captured["body"]["system"] == ai_rewrite.SYSTEM_PROMPT
+
+
+def test_system_prompt_regla_4_ajustada_para_no_contradecir_la_regla_7():
+    """La regla 4 queda ajustada ("clara Y breve") para no contradecir la
+    regla 7 nueva de condensación -- el texto viejo ("ya está clara") por sí
+    solo desalentaría acortar una sección ya clara pero larga."""
+    assert "Si una sección ya está clara Y breve, devolvela sin cambios." in ai_rewrite.SYSTEM_PROMPT
+    assert "Si una sección ya está clara, devolvela sin cambios." not in ai_rewrite.SYSTEM_PROMPT
+
+
+async def test_rewrite_parts_condensacion_de_prosa_libre_sin_disclaimers_no_regresion(caplog):
+    """Test de no-regresión sobre prosa libre SIN disclaimers (ej. la
+    sección `intro` de la analogía de la Tienda de Limonada): una
+    reescritura más corta que el original pasa el guard sin problema --
+    confirma que condensar contenido no protegido nunca dispara
+    `_is_safe_rewrite` en falso (esa función solo compara protected tokens,
+    nunca longitud)."""
+    intro_larga = (
+        "Pensá en una empresa como una Tienda de Limonada: el boletín te "
+        "dice cuánto vendió y ganó, la foto te dice qué tiene y qué debe, y "
+        "el extracto te dice cuánta plata de verdad entró y salió de la caja."
+    )
+    intro_condensada = "Pensá en la empresa como una Tienda de Limonada: boletín, foto y extracto."
+    parts = ["*Adobe (ADBE)*", intro_larga]
+    assert len(intro_condensada) < len(intro_larga)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": _section_response([intro_condensada])})
+
+    client = _client_with_handler(handler)
+    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert result[1].startswith(intro_condensada)

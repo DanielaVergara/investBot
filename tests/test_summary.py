@@ -2087,3 +2087,117 @@ def test_build_summary_parts_con_fuentes_mixtas_cada_nota_refleja_su_propia_fuen
     assert "TTM real" in boletin_texto
     assert "trimestre más reciente" in foto_texto
     assert "año fiscal" in extracto_texto
+
+
+# ---------------------------------------------------------------------------
+# Spec Patch [Iter-3] de SDD_redaccion_ia_ollama.md — hoisting de los 2
+# disclaimers de transparencia a constantes de módulo (DISCLAIMER_WACC_DCF,
+# DISCLAIMER_NO_ASESORAMIENTO), importadas por `ai_rewrite.py` para
+# protegerlas del guard de condensación. Criterios agregados por `security`
+# Iter-3, sección 2.
+# ---------------------------------------------------------------------------
+
+
+def _disclaimer_kwargs(**overrides):
+    kwargs = dict(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_disclaimer_constantes_no_contienen_salto_de_linea_interno():
+    """Invariante de import del que depende toda la protección de
+    `ai_rewrite._classify_lines` (comparación por igualdad exacta de línea
+    completa, `security` Iter-3 sección 2) -- espejo en test del `assert` a
+    nivel de módulo que ya vive en `summary.py`."""
+    assert "\n" not in summary.DISCLAIMER_WACC_DCF
+    assert "\n" not in summary.DISCLAIMER_NO_ASESORAMIENTO
+
+
+def test_disclaimer_constantes_texto_byte_idéntico_al_que_estaba_inline():
+    """Regresión byte a byte: el texto de ambas constantes es exactamente
+    el que antes vivía inline en `transparency_lines.append(...)` -- cero
+    cambio de comportamiento por el hoisting (Opción C del patch)."""
+    assert summary.DISCLAIMER_WACC_DCF == (
+        "_El DCF es una aproximación con supuestos simplificados de WACC "
+        "(Costo Promedio Ponderado de Capital): combina cuánto le cuesta a "
+        "la empresa financiarse con capital propio (accionistas) y con "
+        "deuda (bancos/bonistas), ponderado por cuánto usa de cada uno. Es "
+        "un cálculo propio del bot (no viene de FMP), simplificado — "
+        "es una aproximación más simple, no un sustituto completo del "
+        "WACC que armaría un analista con datos de mercado más "
+        "completos._"
+    )
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO == (
+        "_Esto es una síntesis de datos financieros históricos, no "
+        "asesoramiento financiero profesional ni una recomendación de "
+        "inversión. No incluye análisis de noticias ni del contexto "
+        "cualitativo del negocio más allá de los eventos corporativos "
+        "oficiales de SEC EDGAR listados arriba (si los hay) — y esos se "
+        "muestran sin resumir, no reemplazan leer el filing completo. "
+        "Revisá vos el resto del contexto cualitativo antes de decidir._"
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="sin_treasury_source_ni_notas_de_fuente"),
+        pytest.param(
+            {"treasury_source": "FRED (serie DGS20)"},
+            id="con_treasury_source",
+        ),
+        pytest.param(
+            {
+                "income_statement_fuente": rules.DATOS_FUENTE_TRIMESTRAL,
+                "balance_sheet_fuente": rules.DATOS_FUENTE_TRIMESTRAL,
+                "cash_flow_fuente": rules.DATOS_FUENTE_TRIMESTRAL,
+            },
+            id="con_notas_de_fuente_income_balance_cash_flow",
+        ),
+        pytest.param(
+            {
+                "treasury_source": "FRED (serie DGS20)",
+                "income_statement_fuente": rules.DATOS_FUENTE_ANUAL_FALLBACK,
+                "balance_sheet_fuente": rules.DATOS_FUENTE_ANUAL_FALLBACK,
+                "cash_flow_fuente": rules.DATOS_FUENTE_ANUAL_FALLBACK,
+            },
+            id="con_todos_los_opcionales_presentes",
+        ),
+    ],
+)
+def test_canario_disclaimers_aparecen_como_linea_completa_exacta(overrides):
+    """Test canario pedido por `security` Iter-3 sección 2 (mitiga el riesgo
+    fail-open documentado por `architect`: la comparación por igualdad
+    exacta en `_classify_lines` deja de proteger un disclaimer en silencio
+    si algún día `build_summary_parts` cambia cómo arma `transparency_lines`
+    de forma que el disclaimer deje de ser una línea propia completa).
+
+    Recorre el output REAL de `build_summary_parts` (no un fixture
+    simplificado) en las 4 combinaciones reales pedidas explícitamente por
+    `security` -- un solo caso feliz no habría detectado, por ejemplo, un
+    futuro refactor que interpole una nota condicional dentro del mismo
+    string que el disclaimer solo cuando `treasury_source` está presente."""
+    parts = summary.build_summary_parts(**_disclaimer_kwargs(**overrides))
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+    lines = transparency_part.split("\n")
+    assert summary.DISCLAIMER_WACC_DCF in lines, (
+        "La protección de disclaimers quedó rota: DISCLAIMER_WACC_DCF ya no "
+        "aparece como línea completa exacta en la sección de transparencia "
+        "de build_summary_parts."
+    )
+    assert summary.DISCLAIMER_NO_ASESORAMIENTO in lines, (
+        "La protección de disclaimers quedó rota: DISCLAIMER_NO_ASESORAMIENTO "
+        "ya no aparece como línea completa exacta en la sección de "
+        "transparencia de build_summary_parts."
+    )
