@@ -135,14 +135,27 @@ class FakeRateLimiter:
         return self.allow_value
 
 
+_PENSANDO_MESSAGE_ID = 4242
+
+
 def _fake_callback_update(data: str, chat_id: int = 777):
     """Mismo patrón que `test_query_handler._fake_callback_update`, adaptado
     a lo que consume `handle_explain` (`query.answer` + `context.bot.
-    send_message`, nunca `edit_message_text`)."""
+    send_message` para el mensaje de "pensando" + `context.bot.
+    edit_message_text` para reemplazarlo -- fix de producción 2026-09-02,
+    mejora de UX). `send_message` devuelve un `message_id` fijo para poder
+    verificar que `edit_message_text` edita ESE mensaje y ningún otro."""
     query = SimpleNamespace(data=data, answer=AsyncMock())
     update = SimpleNamespace(callback_query=query)
     update.effective_chat = SimpleNamespace(id=chat_id, type="private")
-    context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    context = SimpleNamespace(
+        bot=SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(message_id=_PENSANDO_MESSAGE_ID)
+            ),
+            edit_message_text=AsyncMock(),
+        )
+    )
     return update, query, context
 
 
@@ -284,8 +297,10 @@ def test_build_keyboard_callback_data_matchea_regex_y_bajo_64_bytes(kind):
 
 
 async def test_handler_callback_data_bien_formado_camino_feliz():
-    """C.9 + H.34: camino feliz completo -- mensaje nuevo con transparencia +
-    respuesta + disclaimer."""
+    """C.9 + H.34: camino feliz completo -- mensaje de "pensando" inmediato
+    (`send_message`), después editado (`edit_message_text`) con
+    transparencia + respuesta + disclaimer (fix de producción 2026-09-02,
+    mejora de UX)."""
     store = ai_explain.ExplanationContextStore()
     cid = store.put(_texto_libre_context())
     # `valor_justo_total` es el ÚLTIMO campo del sub-dict que arma
@@ -301,9 +316,13 @@ async def test_handler_callback_data_bien_formado_camino_feliz():
     await callback(update, context)
 
     query.answer.assert_awaited_once()
-    context.bot.send_message.assert_awaited_once()
-    _, kwargs = context.bot.send_message.call_args
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=777, text=ai_explain.EXPLAIN_PENDING_MSG
+    )
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
     assert kwargs["chat_id"] == 777
+    assert kwargs["message_id"] == _PENSANDO_MESSAGE_ID
     texto = kwargs["text"]
     assert texto.startswith(ai_rewrite.TRANSPARENCY_USED)
     assert respuesta in texto
@@ -380,10 +399,14 @@ async def test_handler_question_code_incompatible_con_kind_expired(context_kind,
 # ---------------------------------------------------------------------------
 
 
-def test_payload_pil_solo_contiene_pillars():
+def test_payload_pil_contiene_pillars_y_total_pilares():
+    """Bug 2 de producción (fix 2026-09-02): `total_pilares` -- dato fijo
+    del marco conceptual del bot (siempre 4), no data del ticker -- para
+    que el guard de integridad no rechace una respuesta de Ollama que
+    mencione "los 4 pilares" (como pide la pregunta fija de "pil")."""
     ctx = _texto_libre_context()
     payload = ai_explain._build_explain_payload(ctx, "pil")
-    assert payload == {"pillars": ctx.pillars}
+    assert payload == {"pillars": ctx.pillars, "total_pilares": len(ctx.pillars)}
 
 
 def test_payload_ver_contiene_veredicto_y_valor_justo_total():
@@ -418,6 +441,23 @@ def test_payload_mod_sector_fuera_de_allowlist_se_trata_como_no_disponible():
     payload = ai_explain._build_explain_payload(ctx, "mod")
     assert payload["sector"] == "no disponible"
     assert "Sector Raro Inventado" not in json.dumps(payload)
+
+
+def test_payload_mod_incluye_total_modelos_fijo():
+    """Bug 2 de producción (fix 2026-09-02), mismo criterio que "pil":
+    la pregunta fija de "mod" menciona "los 5" modelos -- dato fijo del
+    marco conceptual, no del ticker."""
+    ctx = _avanzado_context()
+    payload = ai_explain._build_explain_payload(ctx, "mod")
+    assert payload["total_modelos"] == 5
+
+
+def test_payload_aqr_contiene_factors_y_total_factores_fijo():
+    """Bug 2 de producción (fix 2026-09-02), mismo criterio que "pil":
+    la pregunta fija de "aqr" menciona "los 4 factores"."""
+    ctx = _avanzado_context()
+    payload = ai_explain._build_explain_payload(ctx, "aqr")
+    assert payload == {"factors": ctx.factors, "total_factores": 4}
 
 
 async def test_adversarial_sector_industry_nunca_llegan_al_prompt_de_ollama():
@@ -496,6 +536,40 @@ def test_guard_respuesta_vacia_es_true_caso_de_frontera():
     atrapar este caso antes, no el guard de tokens."""
     assert ai_explain._no_new_protected_tokens({"15.0%"}, "") is True
     assert ai_explain._no_new_protected_tokens(set(), "   ") is True
+
+
+# --- Bug 1 de producción (fix 2026-09-02): normalización de formato -------
+
+
+def test_guard_normaliza_simbolo_pesos_mismo_valor_pasa():
+    """"$405.63" (con signo, como escribe Ollama) vs "405.63" (dato crudo
+    de `json.dumps` de un float, sin signo) -- mismo valor, ya no se
+    rechaza solo por la diferencia de formato."""
+    assert ai_explain._no_new_protected_tokens({"405.63"}, "Vale $405.63.") is True
+
+
+def test_guard_normaliza_separador_de_miles_mismo_valor_pasa():
+    assert ai_explain._no_new_protected_tokens({"1234.56"}, "Vale $1,234.56.") is True
+
+
+def test_guard_normaliza_signo_mas_mismo_valor_pasa():
+    assert ai_explain._no_new_protected_tokens({"5.2%"}, "Subió +5.2%.") is True
+
+
+def test_guard_adversarial_numero_realmente_distinto_sigue_rechazado():
+    """Adversarial explícito pedido por Daniela: la normalización de
+    FORMATO (Bug 1) no afloja la detección de un número genuinamente
+    inventado -- "$999.99" (con "$", formato distinto) sigue rechazado
+    si el dato real es "405.63" (son VALORES distintos, no solo formato
+    distinto)."""
+    assert ai_explain._no_new_protected_tokens({"405.63"}, "Vale $999.99.") is False
+
+
+def test_normalize_numeric_token_no_toca_tokens_no_numericos():
+    """✅/❌/SÍ/NO/tickers no matchean `_NUMERIC_TOKEN_RE` -- pasan
+    intactos por `_normalize_numeric_token`."""
+    for token in ("✅", "❌", "SÍ", "NO", "ADBE"):
+        assert ai_explain._normalize_numeric_token(token) == token
 
 
 # ---------------------------------------------------------------------------
@@ -647,10 +721,13 @@ async def test_handler_query_answer_antes_que_llamada_http():
     assert orden == ["answer", "ollama"]
 
 
-async def test_handler_no_edita_el_mensaje_original_solo_send_message():
-    """H.35/H.36 -- el mock de `update.callback_query` no expone
-    `edit_message_text`/`edit_message_reply_markup`: si el handler
-    intentara llamarlos, este test fallaría con AttributeError."""
+async def test_handler_edita_solo_su_propio_mensaje_de_pensando():
+    """H.35/H.36 -- actualizado por el fix de producción 2026-09-02 (mejora
+    de UX): el handler ahora SÍ edita un mensaje, pero únicamente el de
+    "pensando" que ÉL MISMO mandó (mismo `message_id` que devolvió
+    `send_message`) -- el análisis original sigue sin tocarse, porque el
+    handler nunca recibe su `message_id` (no cambia de esto, ver Decisión
+    de diseño #7 paso 5)."""
     store = ai_explain.ExplanationContextStore()
     cid = store.put(_texto_libre_context())
     client = _client_with_handler(_ok_handler("Corto."))
@@ -658,9 +735,14 @@ async def test_handler_no_edita_el_mensaje_original_solo_send_message():
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
     update, query, context = _fake_callback_update(f"xp:{cid}:vf")
-    await callback(update, context)  # no debe lanzar AttributeError
+    await callback(update, context)
 
-    context.bot.send_message.assert_awaited_once()
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=777, text=ai_explain.EXPLAIN_PENDING_MSG
+    )
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert kwargs["message_id"] == _PENSANDO_MESSAGE_ID
 
 
 @pytest.mark.parametrize(
@@ -697,7 +779,9 @@ async def test_handler_context_id_no_encontrado_expired_cero_llamadas_ollama(set
 
 
 async def test_handler_fallo_de_ollama_responde_explain_unavailable():
-    """Camino de fallback completo a través del handler (integra G+H)."""
+    """Camino de fallback completo a través del handler (integra G+H) -- el
+    mensaje de "pensando" se edita con `EXPLAIN_UNAVAILABLE_MSG` (fix de
+    producción 2026-09-02, mejora de UX)."""
     store = ai_explain.ExplanationContextStore()
     cid = store.put(_texto_libre_context())
 
@@ -711,7 +795,10 @@ async def test_handler_fallo_de_ollama_responde_explain_unavailable():
     await callback(update, context)
 
     context.bot.send_message.assert_awaited_once_with(
-        chat_id=777, text=ai_explain.EXPLAIN_UNAVAILABLE_MSG
+        chat_id=777, text=ai_explain.EXPLAIN_PENDING_MSG
+    )
+    context.bot.edit_message_text.assert_awaited_once_with(
+        chat_id=777, message_id=_PENSANDO_MESSAGE_ID, text=ai_explain.EXPLAIN_UNAVAILABLE_MSG
     )
 
 
@@ -791,6 +878,74 @@ async def test_log_de_guard_fallido_sanitiza_saltos_de_linea_y_control(caplog):
         mensaje = record.getMessage()
         assert "\n" not in mensaje
         assert "\x07" not in mensaje
+
+
+# ---------------------------------------------------------------------------
+# N. Reproducción exacta de los 2 bugs de producción (log VPS 2026-09-02)
+# ---------------------------------------------------------------------------
+
+
+async def test_handler_bug1_produccion_simbolo_pesos_ya_no_se_rechaza():
+    """Reproduce EXACTO el caso real de producción (log VPS 2026-09-02
+    17:28:45, pregunta "vf"): Ollama responde con "$405.63"/"$282.03" (con
+    signo) sobre datos que en el JSON no llevan "$" -- antes del fix se
+    rechazaba como alucinación falsa (`EXPLAIN_UNAVAILABLE_MSG`), ahora
+    pasa."""
+    ctx = _texto_libre_context(
+        escenario_elegido="conservador",
+        precio_actual=282.03,
+        scenarios={
+            "conservador": {
+                "valor_justo_multiplos": 400.0,
+                "valor_justo_graham": 410.0,
+                "valor_justo_dcf": 405.63,
+                "valor_justo_total": 405.63,
+            }
+        },
+    )
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta_real = (
+        "El valor justo estimado para el escenario conservador es de $405.63, que se "
+        "encuentra por encima del precio actual de $282.03. Este resultado muestra que "
+        "la empresa tiene un potencial de crecimiento significativo."
+    )
+    client = _client_with_handler(_ok_handler(respuesta_real))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:vf")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert respuesta_real in kwargs["text"]
+    assert kwargs["text"] != ai_explain.EXPLAIN_UNAVAILABLE_MSG
+
+
+async def test_handler_bug2_produccion_4_pilares_ya_no_se_rechaza():
+    """Reproduce EXACTO el caso real de producción (log VPS 2026-09-02
+    17:28:55, pregunta "pil"): Ollama menciona "los 4 pilares" (constante
+    del marco conceptual, no data del ticker) -- antes del fix se
+    rechazaba, ahora `total_pilares` en el payload lo cubre."""
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    respuesta_real = (
+        "Los 4 pilares de una 'buena empresa' son ingresos crecientes, utilidades "
+        "crecientes, deuda controlada y precio razonable. Este ticker cumple con los "
+        "pilares de ingresos crecientes y precio razonable."
+    )
+    client = _client_with_handler(_ok_handler(respuesta_real))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:pil")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert respuesta_real in kwargs["text"]
+    assert kwargs["text"] != ai_explain.EXPLAIN_UNAVAILABLE_MSG
 
 
 # ---------------------------------------------------------------------------

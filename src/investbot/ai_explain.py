@@ -70,6 +70,12 @@ RATE_LIMITED_MSG = "Estás consultando muy rápido — esperá un minuto antes d
 
 EXPLAIN_UNAVAILABLE_MSG = "📋 Ollama no está disponible en este momento — probá de nuevo en un rato."
 EXPLAIN_EXPIRED_MSG = "Este botón ya venció — pedí el análisis de nuevo para ver explicaciones."
+# Fix de producción 2026-09-02 (mejora de UX): Ollama puede tardar varios
+# segundos (4-8s medido en producción) en responder -- este mensaje se manda
+# INMEDIATO al apretar el botón, antes de esperar la respuesta, y después se
+# edita in-place (nunca el análisis original, ver Decisión de diseño #7 paso
+# 5 -- acá se edita el mensaje que ESTE handler mandó, no otro).
+EXPLAIN_PENDING_MSG = "🤔 Pensando la explicación…"
 # `callback_data` malformado, o `question_code` sintácticamente válido pero
 # ausente de las tablas conocidas (hallazgo 5 de `security`) — mismo camino,
 # distinto de "vencido" (acá el botón nunca fue válido, no es un problema de
@@ -300,6 +306,16 @@ def _validated_sector(sector: Optional[str]) -> str:
 # --- Sub-dict por pregunta (Decisión de diseño #4a) -------------------------
 
 
+# Bug 2 de producción (fix 2026-09-02): la pregunta fija de "mod"
+# (QUESTIONS_AVANZADO["mod"]) menciona "los 5" modelos -- constante del
+# marco conceptual del bot (nunca cambia por ticker), no un dato calculado.
+# Sin este número en el payload, el guard de integridad rechazaba cualquier
+# respuesta de Ollama que citara "5" como alucinación falsa. Nombrada, no un
+# número mágico repetido -- si el bot alguna vez suma/quita un modelo, el
+# texto de la pregunta y este conteo se actualizan juntos.
+_TOTAL_MODELOS_AVANZADO = 5
+
+
 def _build_explain_payload(context: ExplanationContext, question_code: str) -> dict:
     """Arma `datos_del_contexto` -- SOLO el sub-dict que la pregunta puntual
     necesita, nunca el `ExplanationContext` completo (superficie mínima).
@@ -308,7 +324,16 @@ def _build_explain_payload(context: ExplanationContext, question_code: str) -> d
     BLOQUEANTE de `security`, ver docstring del módulo) -- `asset_light` ya
     comunica lo esencial para `mod`, la única pregunta que podría
     necesitarlo. `sector` solo viaja validado contra la allow-list GICS
-    cerrada (`_validated_sector`)."""
+    cerrada (`_validated_sector`).
+
+    `total_pilares`/`total_modelos`/`total_factores` (Bug 2 de producción,
+    fix 2026-09-02): 3 preguntas fijas mencionan un número fijo del marco
+    conceptual del bot (4 pilares, 5 modelos, 4 factores AQR) que nunca es
+    data del ticker -- sin incluirlo acá el guard de integridad rechazaba
+    cualquier respuesta legítima de Ollama que citara ese número, tratándolo
+    como alucinación. Se deriva del propio dict cuando existe una
+    estructura de la que contarlo (pilares/factores, ambos con conteo fijo
+    de claves), en vez de otro número mágico nuevo."""
     if question_code == "vf":
         escenario = (context.scenarios or {}).get(context.escenario_elegido) or {}
         return {
@@ -320,7 +345,10 @@ def _build_explain_payload(context: ExplanationContext, question_code: str) -> d
             "valor_justo_total": escenario.get("valor_justo_total"),
         }
     if question_code == "pil":
-        return {"pillars": context.pillars}
+        return {
+            "pillars": context.pillars,
+            "total_pilares": len(context.pillars) if context.pillars else 4,
+        }
     if question_code == "ver":
         escenario = (context.scenarios or {}).get(context.escenario_elegido) or {}
         return {
@@ -330,7 +358,11 @@ def _build_explain_payload(context: ExplanationContext, question_code: str) -> d
             "valor_justo_total": escenario.get("valor_justo_total"),
         }
     if question_code == "mod":
-        return {"sector": _validated_sector(context.sector), "asset_light": context.asset_light}
+        return {
+            "sector": _validated_sector(context.sector),
+            "asset_light": context.asset_light,
+            "total_modelos": _TOTAL_MODELOS_AVANZADO,
+        }
     if question_code == "alt":
         return {"altman": context.altman, "altman_pp": context.altman_pp}
     if question_code == "pio":
@@ -338,7 +370,10 @@ def _build_explain_payload(context: ExplanationContext, question_code: str) -> d
     if question_code == "mag":
         return {"magic": context.magic}
     if question_code == "aqr":
-        return {"factors": context.factors}
+        return {
+            "factors": context.factors,
+            "total_factores": len(context.factors) if context.factors else 4,
+        }
     # Inalcanzable desde `build_explain_handler` (que ya valida
     # `question_code` contra `_ALL_QUESTIONS` antes de llegar acá) -- red de
     # seguridad para cualquier llamador directo futuro.
@@ -378,13 +413,55 @@ def _enforce_brevity(texto: str) -> str:
     return texto[: corte + 1] if corte > 0 else texto[:_MAX_EXPLANATION_CHARS] + "…"
 
 
+# Bug 1 de producción (fix 2026-09-02): subconjunto del regex heredado de
+# `ai_rewrite._PROTECTED_TOKEN_RE` que matchea SOLO la rama numérica
+# (`[+-]?\$?\d[\d.,]*%?`) -- usado acá para reconocer, entre los tokens que
+# ya extrajo `protected_tokens`, cuáles son numéricos y les toca
+# normalización de formato (nunca a ✅/❌/SÍ/NO/tickers, que pasan intactos).
+_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?\$?\d[\d.,]*%?$")
+
+
+def _normalize_numeric_token(token: str) -> str:
+    """Normaliza el FORMATO de un token numérico -- Bug 1 de producción
+    (log VPS 2026-09-02 17:28:45): `json.dumps` de un float como 405.63
+    produce el string "405.63" (sin "$"), pero Ollama, al explicar montos en
+    español financiero, escribe "$405.63" (con el signo) -- mismo VALOR,
+    formato distinto, y el guard los trataba como tokens distintos
+    (rechazo garantizado, no una alucinación real).
+
+    Quita "$"/"+"/"-" líder y separadores de miles ("," dentro del número)
+    para comparar el valor numérico canónico, no el string exacto con
+    formato. También recorta "." o "," de CIERRE (puntuación de la oración
+    que el mismo `[\\d.,]*` heredado de `_PROTECTED_TOKEN_RE` engancha al
+    número cuando cae justo antes -- "$282.03." o "$405.63," en el caso
+    real de producción -- un número bien formado nunca TERMINA en "." o
+    ",", así que recortarlo es seguro). Nunca afloja la comparación de
+    VALOR: "$999.99" normalizado ("999.99") sigue sin matchear un dato real
+    "405.63" -- son números distintos, no solo formato distinto (caso
+    adversarial cubierto en tests). Un token no numérico (✅/❌/SÍ/NO/
+    tickers) pasa sin cambios."""
+    if not _NUMERIC_TOKEN_RE.match(token):
+        return token
+    percent = token.endswith("%")
+    body = token[:-1] if percent else token
+    body = body.lstrip("+-").lstrip("$").rstrip(".,").replace(",", "")
+    return body + "%" if percent else body
+
+
 def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
     """La respuesta puede usar cualquier subconjunto de los tokens que le
     pasamos (números, %, tickers, ✅/❌, SÍ/NO) -- pero NINGÚN token
     protegido en la respuesta puede estar ausente de los datos originales.
     Bloquea la alucinación de un número/ticker nuevo sin exigir que el
-    modelo repita TODOS los datos que le dimos (Decisión de diseño #4c)."""
-    return set(ai_rewrite.protected_tokens(respuesta)) <= datos_tokens
+    modelo repita TODOS los datos que le dimos (Decisión de diseño #4c).
+
+    `datos_tokens` ya llega normalizado por el llamador (mismo criterio
+    aplicado a ambos lados, Bug 1) -- acá solo se normaliza el lado de la
+    respuesta antes de comparar."""
+    respuesta_tokens = {
+        _normalize_numeric_token(token) for token in ai_rewrite.protected_tokens(respuesta)
+    }
+    return respuesta_tokens <= datos_tokens
 
 
 class _ExplainUnavailable(Exception):
@@ -526,14 +603,25 @@ def build_explain_handler(clients, rate_limiter, store: ExplanationContextStore)
             return
 
         datos_del_contexto = _build_explain_payload(stored, question_code)
-        datos_tokens = set(
-            ai_rewrite.protected_tokens(
+        # Bug 1 (fix 2026-09-02): mismo criterio de normalización aplicado acá
+        # (lado de los datos) que en `_no_new_protected_tokens` (lado de la
+        # respuesta) -- comparar el VALOR numérico canónico, no el string
+        # exacto con formato.
+        datos_tokens = {
+            _normalize_numeric_token(token)
+            for token in ai_rewrite.protected_tokens(
                 json.dumps(datos_del_contexto, ensure_ascii=False, default=str)
             )
-        )
+        }
         config = clients.ollama_config or ai_rewrite.OllamaConfig(
             enabled=False, base_url="", model="", timeout_seconds=0.0
         )
+
+        # Mejora de UX (fix 2026-09-02): Ollama puede tardar varios segundos
+        # -- mensaje de "pensando" INMEDIATO, visible en el chat (distinto de
+        # `query.answer()` arriba, que solo saca el reloj del botón), editado
+        # después con la respuesta final o el fallback.
+        pensando = await context.bot.send_message(chat_id=chat_id, text=EXPLAIN_PENDING_MSG)
 
         try:
             respuesta = await _fetch_explanation(
@@ -544,12 +632,17 @@ def build_explain_handler(clients, rate_limiter, store: ExplanationContextStore)
                 datos_tokens=datos_tokens,
             )
         except _ExplainUnavailable:
-            await context.bot.send_message(chat_id=chat_id, text=EXPLAIN_UNAVAILABLE_MSG)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=pensando.message_id, text=EXPLAIN_UNAVAILABLE_MSG
+            )
             return
 
-        # Decisión de diseño #7, paso 5: SIEMPRE un mensaje nuevo, nunca
-        # editando el análisis original -- los botones no se quitan.
+        # Decisión de diseño #7, paso 5: nunca se edita el análisis original
+        # (los botones no se quitan) -- lo que se edita acá es el mensaje de
+        # "pensando" que ESTE handler mandó recién arriba, no otro.
         texto = f"{ai_rewrite.TRANSPARENCY_USED}\n\n{respuesta}\n\n{DISCLAIMER_NO_ASESORAMIENTO}"
-        await context.bot.send_message(chat_id=chat_id, text=texto)
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=pensando.message_id, text=texto
+        )
 
     return CallbackQueryHandler(handle_explain, pattern=r"^xp:")
