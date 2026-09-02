@@ -108,7 +108,9 @@ def _router(empresa_completa, empresa_asset_light, etf_profile, request_log=None
     return handler
 
 
-def _make_clients(empresa_completa, empresa_asset_light, etf_profile, request_log=None) -> query_handler.Clients:
+def _make_clients(
+    empresa_completa, empresa_asset_light, etf_profile, request_log=None, ollama_config=None
+) -> query_handler.Clients:
     fmp_http = httpx.AsyncClient(
         transport=httpx.MockTransport(_router(empresa_completa, empresa_asset_light, etf_profile, request_log))
     )
@@ -119,6 +121,7 @@ def _make_clients(empresa_completa, empresa_asset_light, etf_profile, request_lo
         treasury_gov_http=httpx.AsyncClient(transport=empty_transport),
         fmp_api_key="test-key",
         fred_api_key="test-key",
+        ollama_config=ollama_config,
     )
 
 
@@ -140,8 +143,10 @@ def _fake_avanzado_update(args, chat_id=ALLOWED_CHAT_ID):
     return update, context
 
 
-def _handler_callback(clients, rate_limiter):
-    return advanced_command.build_advanced_command_handler(clients, rate_limiter).callback
+def _handler_callback(clients, rate_limiter, explanation_store=None):
+    return advanced_command.build_advanced_command_handler(
+        clients, rate_limiter, explanation_store
+    ).callback
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +491,122 @@ def test_ticker_invalido_se_loguea_saneado(caplog):
 
     for record in caplog.records:
         assert "\n" not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# SDD_explicaciones_interactivas_ollama.md — línea de transparencia fija +
+# botones de explicación en /avanzado (grupo J, casos 42-44 de QA).
+# ---------------------------------------------------------------------------
+
+
+def _enabled_ollama_config():
+    from investbot import ai_rewrite
+
+    return ai_rewrite.OllamaConfig(
+        enabled=True, base_url="http://100.101.102.103:11434",
+        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+    )
+
+
+async def test_transparencia_fija_con_botones_habilitados(empresa_completa, empresa_asset_light, etf_profile):
+    """J.42a: con `clients.ollama_config.enabled=True`, el mensaje empieza
+    con `TRANSPARENCY_FIXED_WITH_BUTTONS`."""
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+    )
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    assert mensaje.startswith(advanced_command.TRANSPARENCY_FIXED_WITH_BUTTONS)
+    from investbot import ai_rewrite
+    assert ai_rewrite.TRANSPARENCY_USED not in mensaje
+    assert ai_rewrite.TRANSPARENCY_NOT_USED not in mensaje
+
+
+async def test_transparencia_fija_sin_botones_deshabilitado(empresa_completa, empresa_asset_light, etf_profile):
+    """J.42b: sin la feature habilitada (default `ollama_config=None`),
+    `TRANSPARENCY_FIXED_NO_BUTTONS`."""
+    clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    assert mensaje.startswith(advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS)
+
+
+async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_recalculados(
+    empresa_completa, empresa_asset_light, etf_profile
+):
+    """J.43: `ExplanationContext(kind="avanzado", ...)` guardado contiene
+    los mismos `altman`/`altman_pp`/`piotroski`/`beneish`/`magic`/`factors`/
+    `asset_light` que ya se usaron para el texto del mensaje -- no
+    recalculados (se verifica que el store recibió exactamente 1 `put`, con
+    los campos poblados, para un ticker asset-light que sí calcula Z'')."""
+    from investbot import ai_explain
+
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+    )
+    store = ai_explain.ExplanationContextStore()
+    callback = _handler_callback(clients, FakeRateLimiter(), store)
+
+    update, context = _fake_avanzado_update(["TCH"])
+    await callback(update, context)
+
+    assert len(store._entries) == 1
+    ((context_id, entry),) = store._entries.items()
+    ctx = entry.context
+    assert ctx.kind == "avanzado"
+    assert ctx.ticker == "TCH"
+    assert ctx.asset_light is True
+    assert ctx.altman is not None
+    assert ctx.altman_pp is not None  # asset-light -> Z'' calculado
+    assert ctx.piotroski is not None
+    assert ctx.beneish is not None
+    assert ctx.magic is not None
+    assert ctx.factors is not None
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    assert f"[Z'': {ctx.altman_pp['z']:.2f}" in mensaje
+
+
+async def test_reply_markup_con_5_botones_solo_en_ultimo_chunk(
+    empresa_completa, empresa_asset_light, etf_profile
+):
+    """J.44: con botones habilitados, el teclado (5 botones) se adjunta
+    únicamente al último chunk entregado -- acá `/avanzado` nunca parte en
+    2+ en la práctica, así que el único chunk es también el último."""
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+    )
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    update.message.reply_text.assert_awaited_once()
+    _, kwargs = update.message.reply_text.call_args
+    keyboard = kwargs["reply_markup"]
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5
+
+
+async def test_sin_botones_habilitados_ningun_reply_markup(empresa_completa, empresa_asset_light, etf_profile):
+    """Regresión: con la feature deshabilitada, ningún chunk lleva
+    `reply_markup` -- comportamiento idéntico al pre-spec salvo la primera
+    línea de transparencia fija."""
+    clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    for call in update.message.reply_text.call_args_list:
+        assert "reply_markup" not in call.kwargs
 
 
 # ---------------------------------------------------------------------------

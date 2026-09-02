@@ -257,6 +257,92 @@ def test_nuevos_handlers_esc_vent_no_interceptan_onboarding(tmp_path):
         assert re.match(pattern, onb_callback_data) is None
 
 
+# ---------------------------------------------------------------------------
+# SDD_explicaciones_interactivas_ollama.md -- wiring del ExplanationContextStore
+# compartido + registro del CallbackQueryHandler `xp:` (Decisión de diseño #3/#8).
+# ---------------------------------------------------------------------------
+
+
+def test_build_application_registra_handler_xp_en_group_0(tmp_path):
+    """El `CallbackQueryHandler` de `xp:` se registra en `group=0` (default),
+    DESPUÉS del gate (`group=-1`) -- mismo criterio que `esc:`/`vent:`/`avanzado`."""
+    db_path = str(tmp_path / "bot_test_xp.db")
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+    )
+    import re
+
+    patrones_xp = [
+        getattr(h, "pattern", None)
+        for h in application.handlers.get(0, [])
+        if getattr(h, "pattern", None) is not None and h.pattern.pattern == r"^xp:"
+    ]
+    assert len(patrones_xp) == 1
+    assert re.match(patrones_xp[0], "xp:a1b2c3d4:vf") is not None
+    assert re.match(patrones_xp[0], "onb:0:10") is None
+    assert -1 in application.handlers  # el gate sigue en su propio grupo, antes
+
+
+def test_build_application_comparte_una_sola_instancia_de_explanation_store(tmp_path, monkeypatch):
+    """SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3/#8: un
+    solo `ExplanationContextStore()` construido en `build_application`, MISMA
+    instancia inyectada en `query_handler`, `advanced_command` y el
+    `CallbackQueryHandler` compartido de `xp:` -- verificado por identidad de
+    objeto, con espías sobre los 3 builders. Mismos `clients`/`rate_limiter`
+    en los 3 también (mismo criterio ya exigido para `/avanzado`)."""
+    from investbot import ai_explain, advanced_command, query_handler
+
+    captured: dict = {}
+
+    original_build_query_handlers = query_handler.build_query_handlers
+
+    def spy_build_query_handlers(get_conn, clients, rate_limiter, explanation_store=None):
+        captured["qh_store"] = explanation_store
+        captured["qh_clients"] = clients
+        captured["qh_rate_limiter"] = rate_limiter
+        return original_build_query_handlers(get_conn, clients, rate_limiter, explanation_store)
+
+    monkeypatch.setattr(query_handler, "build_query_handlers", spy_build_query_handlers)
+
+    original_build_advanced = advanced_command.build_advanced_command_handler
+
+    def spy_build_advanced(clients, rate_limiter, explanation_store=None):
+        captured["adv_store"] = explanation_store
+        captured["adv_clients"] = clients
+        captured["adv_rate_limiter"] = rate_limiter
+        return original_build_advanced(clients, rate_limiter, explanation_store)
+
+    monkeypatch.setattr(advanced_command, "build_advanced_command_handler", spy_build_advanced)
+
+    original_build_explain = ai_explain.build_explain_handler
+
+    def spy_build_explain(clients, rate_limiter, store):
+        captured["xp_store"] = store
+        captured["xp_clients"] = clients
+        captured["xp_rate_limiter"] = rate_limiter
+        return original_build_explain(clients, rate_limiter, store)
+
+    monkeypatch.setattr(ai_explain, "build_explain_handler", spy_build_explain)
+
+    db_path = str(tmp_path / "bot_test_shared_store.db")
+    bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=db_path,
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+    )
+
+    assert isinstance(captured["xp_store"], ai_explain.ExplanationContextStore)
+    assert captured["qh_store"] is captured["adv_store"] is captured["xp_store"]
+    assert captured["qh_clients"] is captured["adv_clients"] is captured["xp_clients"]
+    assert captured["qh_rate_limiter"] is captured["adv_rate_limiter"] is captured["xp_rate_limiter"]
+
+
 def test_main_arranca_con_finnhub_y_sec_edgar_configuradas(monkeypatch, tmp_path):
     """Caso feliz: con ambas variables configuradas, main() también llega
     hasta run_polling sin abortar."""

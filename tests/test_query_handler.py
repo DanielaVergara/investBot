@@ -17,7 +17,7 @@ import httpx
 import pytest
 from telegram.error import TelegramError
 
-from investbot import db, query_handler, rules, sec_edgar_client
+from investbot import ai_explain, ai_rewrite, db, query_handler, rules, sec_edgar_client
 from investbot.fmp_client import FMPError
 
 ALLOWED_CHAT_ID = 555
@@ -888,7 +888,12 @@ async def test_run_analysis_multichunk_feliz_edit_y_send_message_en_orden(conn_f
     loading_msg = query_vent.edit_message_text.return_value
     loading_msg.edit_text.assert_awaited_once()
     edit_args, edit_kwargs = loading_msg.edit_text.call_args
-    assert edit_args[0].startswith("Parte1")
+    # SDD_explicaciones_interactivas_ollama.md, Decisión #5: línea de
+    # transparencia siempre primera línea del camino exitoso -- acá
+    # `_empty_clients()` no habilita Ollama, así que es la variante
+    # "no disponible".
+    assert edit_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert "Parte1" in edit_args[0]
     assert edit_kwargs.get("parse_mode") == "Markdown"
 
     assert loading_msg.chat.send_message.await_count == 2
@@ -923,7 +928,8 @@ async def test_run_analysis_loading_msg_none_multichunk_reply_fn_y_send_message(
 
     assert query_vent.edit_message_text.await_count == 2
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
-    assert final_args[0].startswith("Parte1")
+    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert "Parte1" in final_args[0]
     assert final_kwargs.get("parse_mode") == "Markdown"
 
     assert final_msg.chat.send_message.await_count == 2
@@ -958,7 +964,8 @@ async def test_run_analysis_falla_edit_text_multichunk_fallback_a_reply_fn(
     assert query_vent.edit_message_text.await_count == 2
     loading_msg.edit_text.assert_awaited_once()
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
-    assert final_args[0].startswith("Parte1")
+    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert "Parte1" in final_args[0]
     assert final_kwargs.get("parse_mode") == "Markdown"
 
     assert loading_msg.chat.send_message.await_count == 2
@@ -1124,11 +1131,13 @@ async def test_fetch_and_analyze_propaga_per_individual_y_motivo_end_to_end(adob
 def test_fetch_and_analyze_firma_publica_sin_cambios():
     """Q2 (SDD_peers_dinamicos...): `fetch_and_analyze` no cambia de firma.
 
-    `fetch_and_analyze_parts` sí gana 2 parámetros nuevos *keyword-only con
-    default retrocompatible* (`escenario_elegido`/`ventana_trimestres`,
-    SDD_eps_ttm_real.md Decisión #24) — actualizado a propósito, no una
-    regresión: todo llamador que use la firma posicional de 3 argumentos
-    (`ticker, clients, perfil`) sigue funcionando idéntico (ver
+    `fetch_and_analyze_parts` gana 3 parámetros *keyword-only con default
+    retrocompatible*: `escenario_elegido`/`ventana_trimestres`
+    (SDD_eps_ttm_real.md Decisión #24) y `explain_context_sink`
+    (SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3) —
+    actualizados a propósito, no una regresión: todo llamador que use la
+    firma posicional de 3 argumentos (`ticker, clients, perfil`) sigue
+    funcionando idéntico (ver
     test_fetch_and_analyze_parts_call_sites_posicionales_siguen_funcionando)."""
     import inspect
 
@@ -1138,11 +1147,14 @@ def test_fetch_and_analyze_firma_publica_sin_cambios():
     sig_parts = inspect.signature(query_handler.fetch_and_analyze_parts)
     assert list(sig_parts.parameters) == [
         "ticker", "clients", "perfil", "escenario_elegido", "ventana_trimestres",
+        "explain_context_sink",
     ]
     assert sig_parts.parameters["escenario_elegido"].default == "conservador"
     assert sig_parts.parameters["escenario_elegido"].kind == inspect.Parameter.KEYWORD_ONLY
     assert sig_parts.parameters["ventana_trimestres"].default == query_handler.VENTANA_TRIMESTRES_LARGO
     assert sig_parts.parameters["ventana_trimestres"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert sig_parts.parameters["explain_context_sink"].default is None
+    assert sig_parts.parameters["explain_context_sink"].kind == inspect.Parameter.KEYWORD_ONLY
 
 
 async def test_fetch_and_analyze_parts_call_sites_posicionales_siguen_funcionando(adobe_fixtures):
@@ -2421,7 +2433,7 @@ async def test_run_analysis_llama_ai_rewrite_exactamente_una_vez_camino_exitoso(
 
     async def fake_rewrite(parts, config, *, http_client=None):
         calls.append(parts)
-        return rewritten_parts
+        return ai_rewrite.RewriteOutcome(parts=rewritten_parts, used_ollama=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
@@ -2432,7 +2444,11 @@ async def test_run_analysis_llama_ai_rewrite_exactamente_una_vez_camino_exitoso(
     loading_msg = query_vent.edit_message_text.return_value
     loading_msg.edit_text.assert_awaited_once()
     args, kwargs = loading_msg.edit_text.call_args
-    assert args[0] == "\n\n".join(rewritten_parts)
+    # SDD_explicaciones_interactivas_ollama.md, Decisión #5: línea de
+    # transparencia antepuesta a `final_parts[0]`, no un elemento nuevo.
+    expected_parts = list(rewritten_parts)
+    expected_parts[0] = f"{ai_rewrite.TRANSPARENCY_USED}\n\n{expected_parts[0]}"
+    assert args[0] == "\n\n".join(expected_parts)
     assert "reescrito" in args[0]
     assert "original" not in args[0]
     assert kwargs.get("parse_mode") == "Markdown"
@@ -2507,8 +2523,208 @@ async def test_run_analysis_feature_deshabilitada_comportamiento_identico_a_pre_
     loading_msg = query_vent.edit_message_text.return_value
     loading_msg.edit_text.assert_awaited_once()
     args, kwargs = loading_msg.edit_text.call_args
-    assert args[0] == "\n\n".join(parts)
+    # Único cambio observable respecto al comportamiento pre-spec: la nueva
+    # primera línea de transparencia (Decisión #5) -- el resto es idéntico.
+    expected_parts = list(parts)
+    expected_parts[0] = f"{ai_rewrite.TRANSPARENCY_NOT_USED}\n\n{expected_parts[0]}"
+    assert args[0] == "\n\n".join(expected_parts)
     assert kwargs.get("parse_mode") == "Markdown"
+
+
+# ---------------------------------------------------------------------------
+# SDD_explicaciones_interactivas_ollama.md -- botones de explicación +
+# ExplanationContext en el flujo de texto libre (grupo I, casos 38-41 de QA).
+# ---------------------------------------------------------------------------
+
+
+def _clients_with_ollama(enabled=True) -> query_handler.Clients:
+    empty_transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    return query_handler.Clients(
+        fmp_http=httpx.AsyncClient(transport=empty_transport),
+        fred_http=httpx.AsyncClient(transport=empty_transport),
+        treasury_gov_http=httpx.AsyncClient(transport=empty_transport),
+        fmp_api_key="test-key",
+        fred_api_key="test-key",
+        ollama_config=ai_rewrite.OllamaConfig(
+            enabled=enabled, base_url="http://100.101.102.103:11434",
+            model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+        ),
+    )
+
+
+def _patch_parts_search_and_sink(monkeypatch, parts: list[str], sink_values: Optional[dict] = None) -> None:
+    """Mismo criterio que `_patch_parts_and_search`, pero además puebla
+    `explain_context_sink` (si se pasa) -- simula lo que hace
+    `fetch_and_analyze_parts` real (Decisión de diseño #3)."""
+
+    async def fake_parts(ticker, clients_arg, perfil, **kwargs):
+        sink = kwargs.get("explain_context_sink")
+        if sink is not None and sink_values is not None:
+            sink.update(sink_values)
+        return parts
+
+    async def fake_search(client, key, q):
+        return [{"symbol": "ADBE", "name": "Adobe Inc."}]
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", fake_parts)
+    monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
+
+
+def _sink_values_texto_libre(**overrides) -> dict:
+    defaults = dict(
+        company_name="Adobe Inc.",
+        escenario_elegido="conservador",
+        precio_actual=550.0,
+        scenarios={
+            "conservador": {
+                "valor_justo_multiplos": 500.0, "valor_justo_graham": 480.0,
+                "valor_justo_dcf": 510.0, "valor_justo_total": 496.0,
+            }
+        },
+        pillars={"ingresos_crecientes": True},
+        veredicto_barata=True,
+    )
+    defaults.update(overrides)
+    return defaults
+
+
+async def test_reply_markup_solo_en_ultimo_chunk_texto_libre_con_botones(conn_factory, monkeypatch):
+    """Caso 38: con `clients.ollama_config.enabled=True`, el `reply_markup`
+    aparece SOLO en el último chunk enviado -- 0 en los intermedios."""
+    _complete_onboarding(conn_factory)
+    parts = _multichunk_parts()
+    _patch_parts_search_and_sink(monkeypatch, parts, _sink_values_texto_libre())
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    clients = _clients_with_ollama(enabled=True)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    edit_args, edit_kwargs = loading_msg.edit_text.call_args
+    assert "reply_markup" not in edit_kwargs  # chunk 1/3, no es el último
+
+    assert loading_msg.chat.send_message.await_count == 2
+    call2, call3 = loading_msg.chat.send_message.call_args_list
+    assert "reply_markup" not in call2.kwargs  # chunk 2/3, intermedio
+    assert "reply_markup" in call3.kwargs  # chunk 3/3, el último
+    keyboard = call3.kwargs["reply_markup"]
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 3
+
+
+async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_factory, monkeypatch):
+    """Rama de `_deliver_all` cuando `loading_msg` es `None` (falló el envío
+    del mensaje de carga) y el resultado final entra en un solo chunk: el
+    `reply_markup` se adjunta en la primera (y única) llamada a `reply_fn`."""
+    _complete_onboarding(conn_factory)
+    parts = ["*Adobe (ADBE)*", "Cuerpo 15.0%"]
+    _patch_parts_search_and_sink(monkeypatch, parts, _sink_values_texto_libre())
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    clients = _clients_with_ollama(enabled=True)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+
+    update_esc, _ = _fake_callback_update("esc:ADBE:conservador")
+    await handlers[2].callback(update_esc, context=SimpleNamespace())
+
+    final_msg = _fake_message()
+    edit_message_text = AsyncMock(side_effect=[TelegramError("boom carga"), final_msg])
+    update_vent, query_vent = _fake_callback_update(
+        "vent:ADBE:conservador:20", edit_message_text=edit_message_text
+    )
+    await handlers[3].callback(update_vent, context=SimpleNamespace())
+
+    assert query_vent.edit_message_text.await_count == 2
+    final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
+    assert "reply_markup" in final_kwargs
+    keyboard = final_kwargs["reply_markup"]
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 3
+
+
+async def test_explanation_context_texto_libre_mismos_objetos_no_recalculados(conn_factory, monkeypatch):
+    """Caso 39: el `ExplanationContext` guardado contiene los MISMOS objetos
+    (identidad, no solo igualdad) ya producidos por `fetch_and_analyze_parts`
+    -- verificado con `monkeypatch` que inspecciona identidad."""
+    _complete_onboarding(conn_factory)
+    parts = ["*Adobe (ADBE)*", "Cuerpo 15.0%"]
+    scenarios_dict = {"conservador": {"valor_justo_total": 496.0}}
+    pillars_dict = {"ingresos_crecientes": True}
+    sink_values = _sink_values_texto_libre(scenarios=scenarios_dict, pillars=pillars_dict)
+    _patch_parts_search_and_sink(monkeypatch, parts, sink_values)
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    store = ai_explain.ExplanationContextStore()
+    clients = _clients_with_ollama(enabled=True)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter(), store)
+    await _drive_esc_vent(handlers, "ADBE")
+
+    assert len(store._entries) == 1
+    ((context_id, entry),) = store._entries.items()
+    ctx = entry.context
+    assert ctx.kind == "texto_libre"
+    assert ctx.ticker == "ADBE"
+    assert ctx.scenarios is scenarios_dict
+    assert ctx.pillars is pillars_dict
+    assert ctx.escenario_elegido == sink_values["escenario_elegido"]
+    assert ctx.precio_actual == sink_values["precio_actual"]
+    assert ctx.veredicto_barata == sink_values["veredicto_barata"]
+
+
+@pytest.mark.parametrize("used_ollama", [True, False])
+async def test_final_parts_0_transparency_line_correcta_y_titulo_intacto(
+    conn_factory, monkeypatch, used_ollama
+):
+    """Caso 40: `final_parts[0]` empieza con `TRANSPARENCY_USED`/
+    `TRANSPARENCY_NOT_USED` según `outcome.used_ollama`, seguido de "\\n\\n"
+    y el título original sin alterar."""
+    _complete_onboarding(conn_factory)
+    titulo = "*Adobe (ADBE)*"
+    parts = [titulo, "Cuerpo 15.0%"]
+    _patch_parts_and_search(monkeypatch, parts)
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=used_ollama)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    args, kwargs = loading_msg.edit_text.call_args
+    esperado = ai_rewrite.TRANSPARENCY_USED if used_ollama else ai_rewrite.TRANSPARENCY_NOT_USED
+    assert args[0].startswith(f"{esperado}\n\n{titulo}")
+
+
+async def test_feature_deshabilitada_nunca_hay_keyboard_aunque_sink_este_poblado(
+    conn_factory, monkeypatch
+):
+    """Caso 41: con `clients.ollama_config` ausente/`enabled=False`, nunca
+    hay `InlineKeyboardMarkup` -- ni siquiera si `explain_context_sink`
+    quedó poblado (defensivo: la condición del botón exige ambas cosas)."""
+    _complete_onboarding(conn_factory)
+    parts = ["*Adobe (ADBE)*", "Cuerpo 15.0%"]
+    _patch_parts_search_and_sink(monkeypatch, parts, _sink_values_texto_libre())
+
+    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    args, kwargs = loading_msg.edit_text.call_args
+    assert "reply_markup" not in kwargs
 
 
 def test_clients_acepta_ollama_http_y_ollama_config_sin_romper_call_sites_existentes(

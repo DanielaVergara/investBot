@@ -24,6 +24,7 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from investbot import (
+    ai_explain,
     ai_rewrite,
     corporate_events,
     db,
@@ -161,6 +162,7 @@ async def fetch_and_analyze_parts(
     *,
     escenario_elegido: str = "conservador",
     ventana_trimestres: int = VENTANA_TRIMESTRES_LARGO,
+    explain_context_sink: Optional[dict] = None,
 ) -> list[str]:
     """Trae los datos de un ticker resuelto y arma la respuesta completa,
     devuelta como lista de secciones sin unir (`summary.build_summary_parts`)
@@ -174,6 +176,19 @@ async def fetch_and_analyze_parts(
     income-statement/cash-flow-statement (Decisiones #8/#10); `escenario_elegido`
     solo llega hasta `summary.build_summary_parts` para presentación (resalta,
     no oculta, los 3 escenarios) — no cambia ningún cálculo.
+
+    `explain_context_sink` (`SDD_explicaciones_interactivas_ollama.md`,
+    Decisión de diseño #3): keyword-only opcional, mismo criterio
+    retrocompatible que los 2 parámetros de arriba. Si se pasa un `dict`, se
+    lo puebla in-place con los campos que `ExplanationContext` necesita
+    (`company_name`/`escenario_elegido`/`precio_actual`/`scenarios`/
+    `pillars`/`veredicto_barata`) — los mismos objetos ya calculados acá, no
+    recalculados — para que `_run_analysis` arme el contexto de explicación
+    sin que esta función cambie su tipo de retorno (`list[str]`, usado
+    ampliamente por el resto de la suite y por `fetch_and_analyze`). Con el
+    abort-check de datos insuficientes (más abajo) el sink queda sin poblar
+    a propósito — no hay contexto útil que ofrecer en botones para un
+    análisis que no se pudo completar.
     """
     quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
     profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
@@ -537,6 +552,21 @@ async def fetch_and_analyze_parts(
     vix_result = market_context.extract_vix_context(vix_quote)
     vix_dict = {"valor": vix_result.valor, "disponible": vix_result.disponible}
 
+    if explain_context_sink is not None:
+        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3 —
+        # los mismos objetos ya calculados arriba, nunca recalculados.
+        explain_context_sink.update(
+            company_name=company_name,
+            escenario_elegido=escenario_elegido,
+            precio_actual=precio_actual or 0.0,
+            scenarios=scenarios.as_dict(),
+            pillars=pillars_dict,
+            # `pillars.precio_razonable` ES la clasificación "barata"/"cara"
+            # (rules.evaluate_pillars la refleja verbatim) -- mismo valor,
+            # no recalculado.
+            veredicto_barata=pillars.precio_razonable,
+        )
+
     return summary.build_summary_parts(
         ticker=ticker,
         company_name=company_name,
@@ -659,23 +689,37 @@ def _hard_truncate_with_marker(parts: list[str]) -> str:
     return full[: TELEGRAM_MESSAGE_LIMIT - len(marker)] + marker
 
 
-async def _deliver_all(reply_fn, first_msg, remaining_or_all, ticker, **kwargs) -> None:
+async def _deliver_all(
+    reply_fn, first_msg, remaining_or_all, ticker, *, last_reply_markup=None, **kwargs
+) -> None:
     """Entrega los chunks restantes. Si `first_msg` es `None`,
     `remaining_or_all` incluye el chunk 0 y se manda por `reply_fn` (mismo
     comportamiento que hoy cuando no hay `loading_msg`); el resto se manda
     con `.chat.send_message` sobre el `Message` que devuelve esa primera
-    llamada."""
+    llamada.
+
+    `last_reply_markup` (`SDD_explicaciones_interactivas_ollama.md`,
+    Decisión de diseño #1) — opcional, default `None` sin efecto en las
+    llamadas intermedias: si se pasa, se adjunta ÚNICAMENTE al último chunk
+    efectivamente entregado dentro de esta función (nunca a los anteriores)."""
     chunks = remaining_or_all
     if first_msg is None:
-        first_msg = await reply_fn(chunks[0], **kwargs)
+        first_kwargs = dict(kwargs)
+        if len(chunks) == 1 and last_reply_markup is not None:
+            first_kwargs["reply_markup"] = last_reply_markup
+        first_msg = await reply_fn(chunks[0], **first_kwargs)
         chunks = chunks[1:]
-    for i, chunk in enumerate(chunks, start=2):
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks):
         try:
-            await first_msg.chat.send_message(chunk, **kwargs)
+            chunk_kwargs = dict(kwargs)
+            if idx == total - 1 and last_reply_markup is not None:
+                chunk_kwargs["reply_markup"] = last_reply_markup
+            await first_msg.chat.send_message(chunk, **chunk_kwargs)
         except TelegramError as exc:
             logger.error(
                 "No se pudo enviar la parte %d del análisis de %s — esa parte no "
-                "llegó a Telegram: %s", i, ticker, exc,
+                "llegó a Telegram: %s", idx + 2, ticker, exc,
             )
 
 
@@ -721,10 +765,21 @@ def build_query_handlers(
     get_conn: Callable[[], sqlite3.Connection],
     clients: Clients,
     rate_limiter,
+    explanation_store: Optional[ai_explain.ExplanationContextStore] = None,
 ) -> list:
     """Devuelve los handlers de texto libre + los 3 callbacks encadenados
     (`tk:` desambiguación → `esc:` escenario → `vent:` ventana, Decisión #19
-    — diseño stateless, todo el estado viaja en `callback_data`)."""
+    — diseño stateless, todo el estado viaja en `callback_data`).
+
+    `explanation_store` (`SDD_explicaciones_interactivas_ollama.md`,
+    Decisión de diseño #3): keyword-only opcional con default `None` — mismo
+    criterio retrocompatible que `ollama_http`/`ollama_config` en `Clients`,
+    para no romper los call-sites existentes de este builder. En producción,
+    `bot.py::build_application` siempre pasa la MISMA instancia ya
+    compartida con `ai_explain.build_explain_handler`; sin ella, se
+    construye una local (solo relevante para tests que no ejercitan el
+    wiring de botones de explicación)."""
+    explanation_store = explanation_store or ai_explain.ExplanationContextStore()
 
     async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn = get_conn()
@@ -910,11 +965,14 @@ def build_query_handlers(
                 sanitize_for_log(ticker), exc,
             )
 
+        keyboard = None
         try:
+            explain_context_sink: dict = {}
             parts = await fetch_and_analyze_parts(
                 ticker, clients, perfil,
                 escenario_elegido=escenario_elegido,
                 ventana_trimestres=ventana_trimestres,
+                explain_context_sink=explain_context_sink,
             )
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
             final_parts, kwargs = [str(exc)], {}
@@ -933,10 +991,38 @@ def build_query_handlers(
             ollama_config = clients.ollama_config or ai_rewrite.OllamaConfig(
                 enabled=False, base_url="", model="", timeout_seconds=0.0
             )
-            parts = await ai_rewrite.rewrite_parts(
+            outcome = await ai_rewrite.rewrite_parts(
                 parts, ollama_config, http_client=clients.ollama_http
             )
-            final_parts, kwargs = parts, {"parse_mode": "Markdown"}
+            # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño
+            # #5 — línea de transparencia SIEMPRE primera línea del camino
+            # exitoso, reemplaza `AI_REWRITE_INDICATOR` (retirado). Copia de
+            # la lista para no mutar `outcome.parts`/`parts` compartidos con
+            # otros llamadores (ej. tests que inspeccionan el original).
+            final_parts = list(outcome.parts)
+            final_parts[0] = (
+                f"{ai_rewrite.transparency_line(outcome.used_ollama)}\n\n{final_parts[0]}"
+            )
+            kwargs = {"parse_mode": "Markdown"}
+
+            # Botones de explicación (Decisión de diseño #1/#3) — solo si la
+            # feature está habilitada Y el análisis fue un éxito real (el
+            # sink queda vacío en el camino de "no pude obtener suficientes
+            # datos", que no lanza excepción pero tampoco tiene contexto
+            # útil que ofrecer en botones).
+            if ollama_config.enabled and explain_context_sink:
+                explanation_context = ai_explain.ExplanationContext(
+                    kind="texto_libre",
+                    ticker=ticker,
+                    company_name=explain_context_sink["company_name"],
+                    escenario_elegido=explain_context_sink["escenario_elegido"],
+                    precio_actual=explain_context_sink["precio_actual"],
+                    scenarios=explain_context_sink["scenarios"],
+                    pillars=explain_context_sink["pillars"],
+                    veredicto_barata=explain_context_sink["veredicto_barata"],
+                )
+                context_id = explanation_store.put(explanation_context)
+                keyboard = ai_explain.build_keyboard("texto_libre", context_id)
 
         try:
             chunks = chunk_for_telegram(final_parts)
@@ -949,19 +1035,24 @@ def build_query_handlers(
         chunks = _with_continuation_prefixes(chunks)
 
         if loading_msg is None:
-            await _deliver_all(reply_fn, None, chunks, ticker, **kwargs)
+            await _deliver_all(reply_fn, None, chunks, ticker, last_reply_markup=keyboard, **kwargs)
             return
 
         try:
-            await loading_msg.edit_text(chunks[0], **kwargs)
+            first_kwargs = dict(kwargs)
+            if len(chunks) == 1 and keyboard is not None:
+                first_kwargs["reply_markup"] = keyboard
+            await loading_msg.edit_text(chunks[0], **first_kwargs)
         except TelegramError as exc:
             logger.warning(
                 "No se pudo editar el mensaje final para %s — %s", ticker, exc
             )
-            await _deliver_all(reply_fn, None, chunks, ticker, **kwargs)
+            await _deliver_all(reply_fn, None, chunks, ticker, last_reply_markup=keyboard, **kwargs)
             return
 
-        await _deliver_all(reply_fn, loading_msg, chunks[1:], ticker, **kwargs)
+        await _deliver_all(
+            reply_fn, loading_msg, chunks[1:], ticker, last_reply_markup=keyboard, **kwargs
+        )
 
     return [
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),

@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, TypeHandler
 
-from investbot import advanced_command, ai_rewrite, db, onboarding, query_handler, security
+from investbot import advanced_command, ai_explain, ai_rewrite, db, onboarding, query_handler, security
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +89,34 @@ def build_application(
         ollama_config=ollama_config,
     )
     rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
-    for handler in query_handler.build_query_handlers(get_conn, clients, rate_limiter):
+
+    # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3 — un
+    # solo `ExplanationContextStore()` construido acá, MISMA instancia
+    # inyectada en ambos flujos y en el `CallbackQueryHandler` compartido de
+    # `xp:` (Decisión de diseño #8), igual criterio que `clients`/`rate_limiter`.
+    explanation_store = ai_explain.ExplanationContextStore()
+
+    for handler in query_handler.build_query_handlers(
+        get_conn, clients, rate_limiter, explanation_store
+    ):
         application.add_handler(handler)
 
     # SDD_analisis_fundamental_avanzado.md — MISMA instancia de `clients`/
     # `rate_limiter` ya construida arriba, reusada sin cambios (hallazgo 2 de
     # `security`: el balde de rate-limit debe ser el mismo balde compartido,
     # nunca uno nuevo/namespaceado).
-    application.add_handler(advanced_command.build_advanced_command_handler(clients, rate_limiter))
+    application.add_handler(
+        advanced_command.build_advanced_command_handler(clients, rate_limiter, explanation_store)
+    )
+
+    # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #8 — un
+    # solo `CallbackQueryHandler` para el prefijo `xp:`, compartido por
+    # ambos flujos (el `ExplanationContext.kind` guardado decide el prompt/
+    # datos, no el módulo que lo generó). MISMOS `clients`/`rate_limiter` ya
+    # construidos arriba — ninguna instancia nueva.
+    application.add_handler(
+        ai_explain.build_explain_handler(clients, rate_limiter, explanation_store)
+    )
 
     application.add_error_handler(_on_error)
 

@@ -77,12 +77,30 @@ MAX_OUTPUT_TOKENS = 2000
 
 _TRUTHY_VALUES = {"true", "1", "yes"}
 
-# Indicador visible en el mensaje final (Pregunta abierta 1, resuelta por
-# Daniela: sí lo quiere). Criterio de `security`, sección 7: no debe revelar
-# ningún detalle de infraestructura (nombre de proveedor, IP, modelo,
-# timeout, estado de la PC) — solo comunica que hubo un paso adicional de
-# IA local, nada más específico.
+# Indicador visible en el mensaje final — RETIRADO (SDD_explicaciones_
+# interactivas_ollama.md, Decisión de diseño #5/D2): ya no se agrega a
+# ningún mensaje bajo ningún escenario, reemplazado por la línea de
+# transparencia nueva (`transparency_line`, siempre primera línea del
+# mensaje). Se mantiene la constante (sin uso en la lógica) únicamente para
+# que el test de regresión pueda seguir confirmando su ausencia por nombre
+# — no para volver a agregarla en ningún call-site.
 AI_REWRITE_INDICATOR = "_(redacción asistida por IA local)_"
+
+# Línea de transparencia nueva (SDD_explicaciones_interactivas_ollama.md,
+# Decisión de diseño #5, D1 resuelta por Daniela 2026-09-01: sí mencionar
+# "Ollama" por nombre — revierte parcialmente el criterio de `security` de
+# `AI_REWRITE_INDICATOR` de arriba, ya evaluado y aceptado por `security` en
+# esta nueva spec, sección 7). Siempre la primera línea de todo mensaje de
+# análisis exitoso (ambos flujos), nunca en mensajes de error/uso/intermedios.
+TRANSPARENCY_USED = "🤖 Con ayuda de Ollama"
+TRANSPARENCY_NOT_USED = "📋 Ollama no disponible esta vez"
+
+
+def transparency_line(used_ollama: bool) -> str:
+    """Texto exacto de la primera línea del mensaje de análisis — nunca
+    revela detalles de infraestructura más allá del nombre "Ollama" (mismo
+    estándar ya exigido por `security` para `AI_REWRITE_INDICATOR`)."""
+    return TRANSPARENCY_USED if used_ollama else TRANSPARENCY_NOT_USED
 
 
 @dataclass(frozen=True)
@@ -144,6 +162,13 @@ _PROTECTED_TOKEN_RE = re.compile(
 
 def _protected_tokens(text: str) -> list[str]:
     return sorted(_PROTECTED_TOKEN_RE.findall(text))
+
+
+# Alias público (SDD_explicaciones_interactivas_ollama.md, Artefactos): mismo
+# símbolo, misma implementación — `ai_explain.py` lo reusa para su guard de
+# subconjunto (`_no_new_protected_tokens`) sin importar un nombre privado de
+# otro módulo.
+protected_tokens = _protected_tokens
 
 
 def _is_safe_rewrite(original: str, rewritten: str) -> bool:
@@ -294,17 +319,33 @@ def _parse_json_sections(raw_text: str, expected_count: int) -> Optional[list[st
 # --- Llamada de red + orquestación ------------------------------------------
 
 
+@dataclass(frozen=True)
+class RewriteOutcome:
+    """Resultado de `rewrite_parts` (SDD_explicaciones_interactivas_ollama.md,
+    Decisión de diseño #5) — reemplaza el `list[str]` que devolvía antes.
+    `used_ollama` es el booleano que `_run_analysis` necesita para construir
+    la línea de transparencia; antes se calculaba adentro de la función y se
+    descartaba apenas se decidía si agregar `AI_REWRITE_INDICATOR`."""
+
+    parts: list[str]
+    used_ollama: bool
+
+
 async def rewrite_parts(
     parts: list[str],
     config: OllamaConfig,
     *,
     http_client: Optional[httpx.AsyncClient] = None,
-) -> list[str]:
+) -> RewriteOutcome:
     """Recibe la misma forma de datos que fluye entre
     `fetch_and_analyze_parts` y `chunk_for_telegram` (`list[str]`, índice 0
-    = título) y devuelve una lista de la misma longitud: cada sección es o
-    bien la reescritura de Ollama (si pasó el guard de 2 capas) o el texto
-    original sin cambios.
+    = título) y devuelve un `RewriteOutcome` cuyo `.parts` es una lista de
+    la misma longitud: cada sección es o bien la reescritura de Ollama (si
+    pasó el guard de 2 capas) o el texto original sin cambios.
+    `.used_ollama` es `True` solo si `config.enabled` y al menos una sección
+    resultó efectivamente distinta del original tras el guard — `False` en
+    cualquier otro caso (deshabilitado, timeout, guard falló en todas las
+    secciones, etc.).
 
     El título (`parts[0]`) nunca se envía a Ollama ni se reescribe, bajo
     ningún escenario (Restricción de `architect`). Con la feature
@@ -312,11 +353,11 @@ async def rewrite_parts(
     inmediato — ni siquiera se resuelve `config.base_url` en una conexión.
     """
     if not config.enabled:
-        return parts
+        return RewriteOutcome(parts=parts, used_ollama=False)
 
     body_parts = parts[1:]
     if not body_parts:
-        return parts
+        return RewriteOutcome(parts=parts, used_ollama=False)
 
     placeholder_sections: list[str] = []
     line_maps: list[dict[str, str]] = []
@@ -366,7 +407,7 @@ async def rewrite_parts(
             "Ollama no disponible o timeout — fallback a redacción original (%s)",
             type(exc).__name__,
         )
-        return parts
+        return RewriteOutcome(parts=parts, used_ollama=False)
 
     try:
         sections = _parse_json_sections(raw_text, len(body_parts))
@@ -376,7 +417,7 @@ async def rewrite_parts(
                 "(%d secciones esperadas) — fallback completo a redacción original",
                 len(body_parts),
             )
-            return parts
+            return RewriteOutcome(parts=parts, used_ollama=False)
 
         result_body: list[str] = []
         any_rewritten = False
@@ -404,9 +445,11 @@ async def rewrite_parts(
             "Fallo inesperado reconstruyendo la respuesta de Ollama — "
             "fallback completo a redacción original", exc_info=True,
         )
-        return parts
+        return RewriteOutcome(parts=parts, used_ollama=False)
 
     result = [parts[0], *result_body]
-    if any_rewritten:
-        result[-1] = result[-1] + "\n\n" + AI_REWRITE_INDICATOR
-    return result
+    # AI_REWRITE_INDICATOR RETIRADO (Decisión de diseño #5/D2) — ya no se
+    # agrega ningún sufijo acá. `any_rewritten` sigue calculándose para
+    # informar `used_ollama`, que ahora es responsabilidad del llamador
+    # (`_run_analysis`) usar para construir la línea de transparencia.
+    return RewriteOutcome(parts=result, used_ollama=any_rewritten)

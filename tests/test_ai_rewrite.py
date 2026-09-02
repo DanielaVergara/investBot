@@ -163,7 +163,7 @@ async def test_rewrite_parts_disabled_es_noop_sin_llamadas(caplog):
     0 requests HTTP (verificado con un espía que explota si se lo llama)."""
     parts = ["*Adobe (ADBE)*", "Cuerpo 15.0%"]
     spy = _CountingClient()
-    result = await ai_rewrite.rewrite_parts(parts, _disabled_config(), http_client=spy)
+    result = (await ai_rewrite.rewrite_parts(parts, _disabled_config(), http_client=spy)).parts
     assert result == parts
     assert spy.call_count == 0
 
@@ -173,7 +173,7 @@ async def test_rewrite_parts_solo_titulo_es_noop():
     no-op inmediato, 0 requests."""
     parts = ["No pude obtener suficientes datos de XYZ para analizarlo ahora mismo."]
     spy = _CountingClient()
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=spy)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=spy)).parts
     assert result == parts
     assert spy.call_count == 0
 
@@ -196,7 +196,7 @@ async def test_rewrite_parts_connect_error_fallback_silencioso_info(caplog):
     parts = _one_section_parts()
     client = _client_with_handler(handler)
     with caplog.at_level(logging.INFO):
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
     assert any(r.levelno == logging.INFO for r in caplog.records)
 
@@ -209,7 +209,7 @@ async def test_rewrite_parts_timeout_exception_fallback_silencioso_info(caplog):
     parts = _one_section_parts()
     client = _client_with_handler(handler)
     with caplog.at_level(logging.INFO):
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
     assert any(r.levelno == logging.INFO for r in caplog.records)
 
@@ -222,7 +222,7 @@ async def test_rewrite_parts_http_500_fallback_silencioso(caplog):
     parts = _one_section_parts()
     client = _client_with_handler(handler)
     with caplog.at_level(logging.INFO):
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
     assert any(r.levelno == logging.INFO for r in caplog.records)
 
@@ -236,7 +236,7 @@ async def test_rewrite_parts_cuerpo_no_json_fallback_silencioso():
 
     parts = _one_section_parts()
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
 
 
@@ -249,7 +249,7 @@ async def test_rewrite_parts_json_sin_clave_response_fallback_silencioso():
 
     parts = _one_section_parts()
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
 
 
@@ -322,7 +322,7 @@ async def test_rewrite_parts_fallo_en_reconstruccion_cae_a_fallback_completo(mon
 
     client = _client_with_handler(handler)
     with caplog.at_level(logging.WARNING):
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
@@ -346,7 +346,7 @@ async def test_rewrite_parts_matriz_completa_de_fallos_nunca_rompe(make_handler)
     handler = make_handler()
     parts = _one_section_parts()
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
 
 
@@ -755,13 +755,15 @@ async def test_rewrite_parts_end_to_end_mezcla_prosa_y_datos_protegidos():
         return httpx.Response(200, json={"response": _section_response([response_a, response_b])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
     assert result[0] == parts[0]  # título sin cambios
     assert "✅ Ingresos que crecen (según el boletín)" in result[1]
     assert "reescrita con más fluidez" in result[1]
     assert "Sección B: 15.0% de crecimiento" in result[2]
-    assert ai_rewrite.AI_REWRITE_INDICATOR in result[-1]
+    # AI_REWRITE_INDICATOR retirado (SDD_explicaciones_interactivas_ollama.md,
+    # Decisión #5/D2) -- nunca se agrega, ni siquiera cuando hubo reescritura.
+    assert ai_rewrite.AI_REWRITE_INDICATOR not in result[-1]
 
 
 async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_granular():
@@ -782,7 +784,7 @@ async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_gran
         return httpx.Response(200, json={"response": _section_response([response_a, response_b])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
     assert result[1] == section_a  # placeholder-only, reconstruye igual al original
     assert result[2] == section_b  # fallback: sección B vuelve al original
@@ -813,7 +815,7 @@ async def test_rewrite_parts_end_to_end_estructura_json_invalida_fallback_comple
 
     client = _client_with_handler(handler)
     with caplog.at_level(logging.WARNING):
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
@@ -855,7 +857,7 @@ async def test_rewrite_parts_end_to_end_mismo_numero_de_lineas_tras_restitucion(
         return httpx.Response(200, json={"response": _section_response([response_text])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     # Este es el único body part -> el indicador (caso 58-60) se le anexa
     # como sufijo; se descarta antes de contar líneas de la sección en sí.
     section_result = result[1].split("\n\n" + ai_rewrite.AI_REWRITE_INDICATOR)[0]
@@ -896,17 +898,17 @@ async def test_rewrite_parts_titulo_nunca_modificado(scenario):
     parts = [titulo, "✅ Dato protegido"]
 
     if scenario == "disabled":
-        result = await ai_rewrite.rewrite_parts(parts, _disabled_config())
+        result = (await ai_rewrite.rewrite_parts(parts, _disabled_config())).parts
     elif scenario == "http_error":
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.TimeoutException("timeout", request=request)
         client = _client_with_handler(handler)
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     else:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"response": _section_response(["⟦PH0⟧"])})
         client = _client_with_handler(handler)
-        result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+        result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
     assert result[0] == titulo
 
@@ -969,7 +971,7 @@ async def test_indicador_no_aparece_con_feature_deshabilitada():
     """Caso 60: con la feature deshabilitada, el indicador no aparece en
     ningún elemento del resultado."""
     parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
-    result = await ai_rewrite.rewrite_parts(parts, _disabled_config())
+    result = (await ai_rewrite.rewrite_parts(parts, _disabled_config())).parts
     assert all(ai_rewrite.AI_REWRITE_INDICATOR not in p for p in result)
 
 
@@ -1114,7 +1116,7 @@ async def test_rewrite_parts_condensa_notas_de_transparencia_reales_preserva_amb
         return httpx.Response(200, json={"response": _section_response([condensado])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
     assert summary.DISCLAIMER_WACC_DCF in result[1]
     assert summary.DISCLAIMER_NO_ASESORAMIENTO in result[1]
@@ -1143,7 +1145,7 @@ async def test_rewrite_parts_adversarial_omite_placeholder_de_disclaimer_cae_a_f
         return httpx.Response(200, json={"response": _section_response([respuesta_con_omision])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
     # Fallback completo de la sección: texto 100% original, no una mezcla.
     assert result[1] == section
@@ -1197,5 +1199,117 @@ async def test_rewrite_parts_condensacion_de_prosa_libre_sin_disclaimers_no_regr
         return httpx.Response(200, json={"response": _section_response([intro_condensada])})
 
     client = _client_with_handler(handler)
-    result = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result[1].startswith(intro_condensada)
+
+
+# ---------------------------------------------------------------------------
+# N. Contrato RewriteOutcome + transparency_line
+# (SDD_explicaciones_interactivas_ollama.md, casos 48-51)
+# ---------------------------------------------------------------------------
+
+
+async def test_rewrite_parts_devuelve_rewrite_outcome():
+    """Caso 48: `rewrite_parts` devuelve un `RewriteOutcome(parts, used_ollama)`,
+    no un `list[str]` desnudo."""
+    parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
+    outcome = await ai_rewrite.rewrite_parts(parts, _disabled_config())
+    assert isinstance(outcome, ai_rewrite.RewriteOutcome)
+    assert outcome.parts == parts
+    assert outcome.used_ollama is False
+
+
+async def test_used_ollama_false_con_feature_deshabilitada():
+    """Caso 49a: deshabilitada -> `used_ollama=False`."""
+    parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
+    outcome = await ai_rewrite.rewrite_parts(parts, _disabled_config())
+    assert outcome.used_ollama is False
+
+
+async def test_used_ollama_false_con_timeout():
+    """Caso 49b: habilitada pero Ollama no responde -> `used_ollama=False`
+    (ninguna sección se reescribió efectivamente)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("timeout", request=request)
+
+    parts = _one_section_parts()
+    client = _client_with_handler(handler)
+    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert outcome.used_ollama is False
+
+
+async def test_used_ollama_true_con_al_menos_una_seccion_reescrita():
+    """Caso 49c: al menos 1 sección resultó distinta del original tras el
+    guard -> `used_ollama=True`."""
+    section = "Sección con ✅ dato protegido y prosa libre reescribible."
+    parts = ["*Adobe (ADBE)*", section]
+    _, line_map = ai_rewrite._classify_lines(section)
+    ph = next(iter(line_map))
+    response = f"Prosa reescrita distinta.\n{ph}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": _section_response([response])})
+
+    client = _client_with_handler(handler)
+    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert outcome.used_ollama is True
+    assert outcome.parts[1] != section
+
+
+async def test_used_ollama_false_si_guard_falla_en_todas_las_secciones():
+    """Caso 49d: habilitada, Ollama responde, pero el guard rechaza todas
+    las secciones (todas vuelven al original) -> `used_ollama=False`."""
+    section_a = "✅ Ingresos que crecen"
+    section_b = "❌ Utilidades crecientes"
+    parts = ["*Adobe (ADBE)*", section_a, section_b]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Ninguna respuesta trae los placeholders esperados -> guard falla
+        # para ambas secciones, cada una vuelve a su original.
+        return httpx.Response(
+            200, json={"response": _section_response(["sin placeholder a", "sin placeholder b"])}
+        )
+
+    client = _client_with_handler(handler)
+    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert outcome.used_ollama is False
+    assert outcome.parts[1] == section_a
+    assert outcome.parts[2] == section_b
+
+
+def test_transparency_line_used():
+    """Caso 51a: `transparency_line(True) == TRANSPARENCY_USED`."""
+    assert ai_rewrite.transparency_line(True) == ai_rewrite.TRANSPARENCY_USED
+    assert ai_rewrite.TRANSPARENCY_USED == "🤖 Con ayuda de Ollama"
+
+
+def test_transparency_line_not_used():
+    """Caso 51b: `transparency_line(False) == TRANSPARENCY_NOT_USED`."""
+    assert ai_rewrite.transparency_line(False) == ai_rewrite.TRANSPARENCY_NOT_USED
+    assert ai_rewrite.TRANSPARENCY_NOT_USED == "📋 Ollama no disponible esta vez"
+
+
+async def test_ai_rewrite_indicator_nunca_se_agrega_ni_con_used_ollama_true():
+    """Caso 50: `AI_REWRITE_INDICATOR` no se agrega a ningún `result[-1]`
+    bajo ningún escenario, incluido `used_ollama=True` -- retiro deliberado
+    (Decisión #5)."""
+    section = "Sección con ✅ dato protegido y prosa libre reescribible."
+    parts = ["*Adobe (ADBE)*", section]
+    _, line_map = ai_rewrite._classify_lines(section)
+    ph = next(iter(line_map))
+    response = f"Prosa reescrita distinta.\n{ph}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": _section_response([response])})
+
+    client = _client_with_handler(handler)
+    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+    assert outcome.used_ollama is True
+    assert all(ai_rewrite.AI_REWRITE_INDICATOR not in p for p in outcome.parts)
+
+
+def test_protected_tokens_alias_publico_misma_implementacion():
+    """`protected_tokens` (alias público) devuelve lo mismo que `_protected_tokens`
+    -- reusado por `ai_explain.py` sin importar un símbolo privado."""
+    text = "El PER es de 15.0% y el veredicto es ✅"
+    assert ai_rewrite.protected_tokens(text) == ai_rewrite._protected_tokens(text)

@@ -23,6 +23,7 @@ la clave del balde compartido es `str(update.effective_chat.id)`, idéntica a
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from typing import Optional
@@ -30,7 +31,7 @@ from typing import Optional
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
 
-from investbot import fmp_client, market_context, query_handler, rules
+from investbot import ai_explain, fmp_client, market_context, query_handler, rules
 from investbot.advanced_scoring import (
     calculate_altman_z,
     calculate_altman_z_prime_prime,
@@ -59,6 +60,16 @@ NOT_APPLICABLE_MSG = (
     "Este análisis no aplica a ETFs, fondos ni criptomonedas — solo a "
     "empresas individuales con balance, estado de resultados y flujo de "
     "caja propios."
+)
+
+# Línea de transparencia fija (SDD_explicaciones_interactivas_ollama.md,
+# Decisión de diseño #6) — `/avanzado` nunca usa Ollama para su mensaje base
+# (decisión ya cerrada, no se reabre), así que esto no depende de ningún
+# resultado de red: solo de si la feature de botones de explicación está
+# habilitada, para no invitar a apretar un botón que siempre va a fallar.
+TRANSPARENCY_FIXED_NO_BUTTONS = "📋 Análisis con formato fijo (sin IA)."
+TRANSPARENCY_FIXED_WITH_BUTTONS = (
+    "📋 Análisis con formato fijo — pedí una explicación con los botones de abajo."
 )
 
 
@@ -119,11 +130,19 @@ def _build_message(
     income_statements: list[dict],
     balance_sheets: list[dict],
     cash_flows: list[dict],
+    explain_context_sink: Optional[dict] = None,
 ) -> str:
     """Arma el único mensaje de Telegram (Decisión de diseño #5), texto
     plano — nunca `parse_mode="Markdown"` (hallazgo 4 de `security`: el
     nombre de la empresa es dato de terceros vía FMP, no sanitizado para
-    Markdown)."""
+    Markdown).
+
+    `explain_context_sink` (`SDD_explicaciones_interactivas_ollama.md`,
+    Decisión de diseño #3): mismo criterio del sink de
+    `query_handler.fetch_and_analyze_parts` — keyword-only opcional, si se
+    pasa un `dict` se lo puebla in-place con los mismos resultados
+    (`altman`/`altman_pp`/`piotroski`/`beneish`/`magic`/`factors`/
+    `asset_light`/`sector`) ya calculados acá, nunca recalculados."""
     income_reciente = income_statements[0]
     income_anterior = income_statements[1] if len(income_statements) > 1 else {}
     balance_reciente = balance_sheets[0]
@@ -252,14 +271,44 @@ def _build_message(
         f"más recientes disponibles, período fiscal {fecha_periodo}"
     )
 
+    if explain_context_sink is not None:
+        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3 —
+        # los mismos objetos ya calculados arriba, nunca recalculados.
+        # `sector`/`industry` viajan crudos hasta acá (dato de terceros de
+        # FMP) — `ai_explain._build_explain_payload` es quien los valida
+        # contra la allow-list GICS / los excluye antes de tocar el prompt
+        # (hallazgo 1 BLOQUEANTE de `security`), no este módulo.
+        explain_context_sink.update(
+            company_name=company_name,
+            sector=sector,
+            industry=industry,
+            asset_light=asset_light,
+            altman=dataclasses.asdict(altman),
+            altman_pp=dataclasses.asdict(altman_pp) if altman_pp is not None else None,
+            piotroski=dataclasses.asdict(piotroski),
+            beneish=dataclasses.asdict(beneish),
+            magic=dataclasses.asdict(magic),
+            factors=dataclasses.asdict(factors),
+        )
+
     return "\n".join(lineas)
 
 
-def build_advanced_command_handler(clients, rate_limiter) -> CommandHandler:
+def build_advanced_command_handler(
+    clients, rate_limiter, explanation_store: Optional[ai_explain.ExplanationContextStore] = None
+) -> CommandHandler:
     """Construye el `CommandHandler("avanzado", ...)`. `clients` es la MISMA
     instancia de `query_handler.Clients` ya construida en `bot.py`;
     `rate_limiter` es la MISMA instancia de `security.InMemoryRateLimiter`
-    ya compartida con el resto del bot — ninguno de los dos se crea acá."""
+    ya compartida con el resto del bot — ninguno de los dos se crea acá.
+
+    `explanation_store` (`SDD_explicaciones_interactivas_ollama.md`,
+    Decisión de diseño #3): keyword-only opcional con default `None` — mismo
+    criterio retrocompatible que `query_handler.build_query_handlers`. En
+    producción, `bot.py::build_application` siempre pasa la MISMA instancia
+    ya compartida con `ai_explain.build_explain_handler` y con
+    `query_handler.build_query_handlers`."""
+    explanation_store = explanation_store or ai_explain.ExplanationContextStore()
 
     async def avanzado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ticker = _parse_ticker(context.args)
@@ -306,6 +355,7 @@ def build_advanced_command_handler(clients, rate_limiter) -> CommandHandler:
                 await update.message.reply_text(NOT_APPLICABLE_MSG)
                 return
 
+            explain_context_sink: dict = {}
             message = _build_message(
                 ticker=ticker,
                 profile=profile,
@@ -313,6 +363,7 @@ def build_advanced_command_handler(clients, rate_limiter) -> CommandHandler:
                 income_statements=income_statements,
                 balance_sheets=balance_sheets,
                 cash_flows=cash_flows,
+                explain_context_sink=explain_context_sink,
             )
         except fmp_client.FMPError as exc:
             await update.message.reply_text(str(exc))
@@ -327,11 +378,47 @@ def build_advanced_command_handler(clients, rate_limiter) -> CommandHandler:
             await update.message.reply_text(query_handler.GENERIC_ERROR_MSG)
             return
 
+        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #6 —
+        # línea de transparencia FIJA (nunca depende de Ollama, `/avanzado`
+        # no lo usa para su mensaje base): variante "con botones" solo si la
+        # feature está efectivamente habilitada, para no invitar a apretar
+        # un botón que siempre va a fallar.
+        ollama_enabled = bool(clients.ollama_config and clients.ollama_config.enabled)
+        transparency = (
+            TRANSPARENCY_FIXED_WITH_BUTTONS if ollama_enabled else TRANSPARENCY_FIXED_NO_BUTTONS
+        )
+        message = f"{transparency}\n\n{message}"
+
+        keyboard = None
+        if ollama_enabled and explain_context_sink:
+            explanation_context = ai_explain.ExplanationContext(
+                kind="avanzado",
+                ticker=ticker,
+                company_name=explain_context_sink["company_name"],
+                sector=explain_context_sink["sector"],
+                industry=explain_context_sink["industry"],
+                asset_light=explain_context_sink["asset_light"],
+                altman=explain_context_sink["altman"],
+                altman_pp=explain_context_sink["altman_pp"],
+                piotroski=explain_context_sink["piotroski"],
+                beneish=explain_context_sink["beneish"],
+                magic=explain_context_sink["magic"],
+                factors=explain_context_sink["factors"],
+            )
+            context_id = explanation_store.put(explanation_context)
+            keyboard = ai_explain.build_keyboard("avanzado", context_id)
+
         # Defensivo (Decisión de diseño #5): un solo ticker no debería
         # acercarse al límite de Telegram, a diferencia del análisis
         # completo — pero se reusa el mismo partidor por las dudas. Nunca
-        # `parse_mode="Markdown"` (hallazgo 4 de `security`).
-        for chunk in query_handler.chunk_for_telegram([message]):
-            await update.message.reply_text(chunk)
+        # `parse_mode="Markdown"` (hallazgo 4 de `security`). El teclado
+        # (si corresponde) se adjunta ÚNICAMENTE al último chunk.
+        chunks = query_handler.chunk_for_telegram([message])
+        last_index = len(chunks) - 1
+        for idx, chunk in enumerate(chunks):
+            if idx == last_index and keyboard is not None:
+                await update.message.reply_text(chunk, reply_markup=keyboard)
+            else:
+                await update.message.reply_text(chunk)
 
     return CommandHandler("avanzado", avanzado)
