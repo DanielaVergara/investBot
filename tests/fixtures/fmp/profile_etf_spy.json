@@ -1,0 +1,12 @@
+{
+  "symbol": "SPY",
+  "companyName": "SPDR S&P 500 ETF Trust",
+  "sector": "",
+  "industry": "",
+  "beta": 1.0,
+  "price": 550.0,
+  "marketCap": null,
+  "isEtf": true,
+  "isFund": false,
+  "isActivelyTrading": true
+}

@@ -42,3 +42,48 @@ documentado en el reporte de cierre de `implementer`).
   para este endpoint también (sin 402); campos (`operatingCashFlow`,
   `capitalExpenditure`, `freeCashFlow`, `netIncome`) idénticos a la
   respuesta anual.
+
+## `SDD_analisis_fundamental_avanzado.md` — fixtures de `/avanzado`
+
+**Origen: sintético** para todos los fixtures de esta sección, escritos a
+mano imitando la forma real ya confirmada de `balance_/income_/cash_flow_
+quarterly_nvda_real.json` de arriba (mismos nombres de campo, `period=
+"annual"` en vez de `"quarter"`, 2 elementos por array — año más reciente
+primero, mismo orden que devuelve FMP). Usados por
+`tests/test_advanced_command.py` (integration, `httpx.MockTransport`).
+
+- `profile_empresa_completa.json` + `quote_empresa_completa.json` +
+  `balance_/income_/cash_flow_annual_empresa_completa.json` — caso "todo
+  disponible", empresa manufacturera clásica (`sector="Industrials"`, fuera
+  de la lista asset-light de D4) — happy path de los 5 modelos con Altman Z
+  **original** (sin Z''), Piotroski 9/9, Magic Formula y los 4 factores AQR
+  todos calculables.
+- `profile_empresa_asset_light.json` + `quote_empresa_asset_light.json` +
+  `balance_/income_/cash_flow_annual_empresa_asset_light.json` — empresa de
+  software (`sector="Technology"`, matchea D4) — mismo happy path, pero
+  dispara el cálculo adicional de Z'' (Altman Z original **y** Z'', ambos
+  mostrados).
+- `profile_etf_spy.json` — **ticker SPY**, con `isEtf=true` (campo propuesto
+  por `architect` para D6). **Pendiente de verificar con `curl` real** contra
+  `/profile?symbol=SPY` — no se pudo confirmar en este entorno de
+  implementación (mismo bloqueo de red ya documentado en la spec: `site.
+  financialmodelingprep.com` devolvió HTTP 403 a fetch/búsqueda automatizada
+  durante la investigación de la spec). Si el campo real de FMP no es
+  `isEtf`, `advanced_command._is_etf_or_fund` deja de detectar este caso por
+  el campo de `/profile`, pero la red de seguridad del paso 4 (estados
+  financieros vacíos) sigue rechazando el ticker igual — el comando sigue
+  siendo correcto, solo más costoso en requests para este caso puntual (ver
+  Decisión de diseño #2 de la spec).
+
+Los demás casos de la spec ("ticker inexistente" = `/profile` vacío, "sin
+estados financieros propios" = balance/income/cash-flow vacíos para un
+ticker sin flag de ETF/fondo) se simulan inline en
+`tests/test_advanced_command.py` con un router que devuelve `[]`/`None` —
+no requieren un fixture propio (mismo criterio que
+`test_fetch_and_analyze_datos_incompletos_mensaje_claro` en
+`tests/test_query_handler.py`). Las variantes con un campo faltante para
+cada modelo (Altman/Piotroski/Magic Formula/factores AQR) tampoco requieren
+fixture: son funciones puras de `advanced_scoring.py` testeadas con dicts
+armados a mano en `tests/test_advanced_scoring.py` (mismo criterio que
+`tests/test_rules.py`/`tests/test_valuation.py`, sin fixtures de archivo
+para tests unitarios de funciones puras).

@@ -1,0 +1,36 @@
+[
+  {
+    "date": "2025-12-31",
+    "totalAssets": 1000000000,
+    "totalLiabilities": 400000000,
+    "totalCurrentAssets": 300000000,
+    "totalCurrentLiabilities": 150000000,
+    "retainedEarnings": 200000000,
+    "totalEquity": 600000000,
+    "totalStockholdersEquity": 600000000,
+    "longTermDebt": 250000000,
+    "shortTermDebt": 50000000,
+    "totalDebt": 300000000,
+    "accountsReceivables": 80000000,
+    "netReceivables": 80000000,
+    "cashAndCashEquivalents": 100000000,
+    "propertyPlantEquipmentNet": 400000000
+  },
+  {
+    "date": "2024-12-31",
+    "totalAssets": 900000000,
+    "totalLiabilities": 380000000,
+    "totalCurrentAssets": 250000000,
+    "totalCurrentLiabilities": 140000000,
+    "retainedEarnings": 150000000,
+    "totalEquity": 520000000,
+    "totalStockholdersEquity": 520000000,
+    "longTermDebt": 260000000,
+    "shortTermDebt": 40000000,
+    "totalDebt": 300000000,
+    "accountsReceivables": 70000000,
+    "netReceivables": 70000000,
+    "cashAndCashEquivalents": 80000000,
+    "propertyPlantEquipmentNet": 380000000
+  }
+]

@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, TypeHandler
 
-from investbot import ai_rewrite, db, onboarding, query_handler, security
+from investbot import advanced_command, ai_rewrite, db, onboarding, query_handler, security
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,12 @@ def build_application(
     rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
     for handler in query_handler.build_query_handlers(get_conn, clients, rate_limiter):
         application.add_handler(handler)
+
+    # SDD_analisis_fundamental_avanzado.md — MISMA instancia de `clients`/
+    # `rate_limiter` ya construida arriba, reusada sin cambios (hallazgo 2 de
+    # `security`: el balde de rate-limit debe ser el mismo balde compartido,
+    # nunca uno nuevo/namespaceado).
+    application.add_handler(advanced_command.build_advanced_command_handler(clients, rate_limiter))
 
     application.add_error_handler(_on_error)
 

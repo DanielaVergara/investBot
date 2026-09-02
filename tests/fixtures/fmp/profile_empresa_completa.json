@@ -1,0 +1,12 @@
+{
+  "symbol": "MFG",
+  "companyName": "Manufacturing Co Inc.",
+  "sector": "Industrials",
+  "industry": "Farm & Heavy Construction Machinery",
+  "beta": 1.0,
+  "price": 50.0,
+  "marketCap": 5000000000,
+  "isEtf": false,
+  "isFund": false,
+  "isActivelyTrading": true
+}

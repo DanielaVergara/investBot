@@ -1,0 +1,32 @@
+[
+  {
+    "date": "2025-12-31",
+    "revenue": 400000000,
+    "costOfRevenue": 100000000,
+    "grossProfit": 300000000,
+    "ebit": 120000000,
+    "netIncome": 90000000,
+    "sellingGeneralAndAdministrativeExpenses": 100000000,
+    "depreciationAndAmortization": 10000000,
+    "weightedAverageShsOut": 50000000,
+    "weightedAverageShsOutDil": 50500000,
+    "interestExpense": 2000000,
+    "incomeTaxExpense": 18000000,
+    "incomeBeforeTax": 108000000
+  },
+  {
+    "date": "2024-12-31",
+    "revenue": 340000000,
+    "costOfRevenue": 90000000,
+    "grossProfit": 250000000,
+    "ebit": 95000000,
+    "netIncome": 70000000,
+    "sellingGeneralAndAdministrativeExpenses": 85000000,
+    "depreciationAndAmortization": 9000000,
+    "weightedAverageShsOut": 50000000,
+    "weightedAverageShsOutDil": 50200000,
+    "interestExpense": 2000000,
+    "incomeTaxExpense": 14000000,
+    "incomeBeforeTax": 84000000
+  }
+]

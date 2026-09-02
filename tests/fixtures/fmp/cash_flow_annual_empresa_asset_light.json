@@ -1,0 +1,16 @@
+[
+  {
+    "date": "2025-12-31",
+    "operatingCashFlow": 110000000,
+    "netIncome": 90000000,
+    "capitalExpenditure": -15000000,
+    "freeCashFlow": 95000000
+  },
+  {
+    "date": "2024-12-31",
+    "operatingCashFlow": 80000000,
+    "netIncome": 70000000,
+    "capitalExpenditure": -12000000,
+    "freeCashFlow": 68000000
+  }
+]

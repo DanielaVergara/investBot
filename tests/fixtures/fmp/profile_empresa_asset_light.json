@@ -1,0 +1,12 @@
+{
+  "symbol": "TCH",
+  "companyName": "Tech Software Inc.",
+  "sector": "Technology",
+  "industry": "Software - Application",
+  "beta": 1.3,
+  "price": 80.0,
+  "marketCap": 4000000000,
+  "isEtf": false,
+  "isFund": false,
+  "isActivelyTrading": true
+}
