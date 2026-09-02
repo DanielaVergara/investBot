@@ -2293,3 +2293,109 @@ def test_build_summary_parts_short_no_incluye_secciones_completas():
         "Encaje con tu perfil de riesgo", "Notas de transparencia", "Tienda de Limonada",
     ):
         assert seccion_prohibida not in texto
+
+
+# ---------------------------------------------------------------------------
+# Fix urgente 2026-09-02: BadRequest "Can't parse entities" en producción —
+# company_name (y nombres de peers dinámicos de Finnhub) vienen sin
+# sanitizar de terceros (FMP/Finnhub) y se interpolaban crudos dentro de
+# texto con parse_mode="Markdown". Un solo "*"/"_"/"`"/"[" sin parear en
+# esos campos rompía el parseo del mensaje completo y el usuario no recibía
+# absolutamente nada. Ver _escape_markdown_legacy.
+# ---------------------------------------------------------------------------
+
+
+def _contar_sin_escapar(texto: str, char: str) -> int:
+    """Cuenta ocurrencias de `char` en `texto` que NO están precedidas por un
+    "\\" de escape — usado para confirmar que ningún caracter especial de
+    Markdown legado quedó sin escapar en un segmento de texto de terceros."""
+    count = 0
+    for i, c in enumerate(texto):
+        if c == char and (i == 0 or texto[i - 1] != "\\"):
+            count += 1
+    return count
+
+
+_COMPANY_NAME_ADVERSARIAL = "Acme* Corp_ [Test]`"
+
+
+def test_escape_markdown_legacy_escapa_los_4_caracteres_especiales():
+    escapado = summary._escape_markdown_legacy(_COMPANY_NAME_ADVERSARIAL)
+    assert escapado == "Acme\\* Corp\\_ \\[Test]\\`"
+    for char in ("_", "*", "`", "["):
+        assert _contar_sin_escapar(escapado, char) == 0
+
+
+def test_escape_markdown_legacy_texto_sin_caracteres_especiales_no_cambia():
+    assert summary._escape_markdown_legacy("Adobe Inc.") == "Adobe Inc."
+
+
+def test_escape_markdown_legacy_string_vacio():
+    assert summary._escape_markdown_legacy("") == ""
+
+
+def test_build_summary_parts_company_name_con_caracteres_markdown_no_rompe_titulo():
+    parts = summary.build_summary_parts(
+        ticker="ADBE",
+        company_name=_COMPANY_NAME_ADVERSARIAL,
+        precio_actual=333.0,
+        ratios=_base_ratios(),
+        pillars=_base_pillars(),
+        scenarios=_base_scenarios(),
+        n_peers_validos=3,
+        momentum=_base_momentum(),
+        peer_comparison=_base_peer_comparison(),
+        risk_fit=_base_risk_fit(),
+    )
+    titulo = parts[0]
+    assert titulo == "*Acme\\* Corp\\_ \\[Test]\\` (ADBE)*"
+    # El único "*" sin escapar en todo el título es el par de negrita que el
+    # propio bot arma a propósito (uno al inicio, uno al final) — nada del
+    # company_name interpolado quedó sin escapar.
+    interior = titulo[1:-1]  # saca el "*" de apertura y cierre intencionales
+    for char in ("_", "*", "`", "["):
+        assert _contar_sin_escapar(interior, char) == 0
+
+
+def test_build_summary_parts_short_company_name_con_caracteres_markdown_no_rompe_titulo():
+    parts = summary.build_summary_parts_short(
+        ticker="ADBE",
+        company_name=_COMPANY_NAME_ADVERSARIAL,
+        precio_actual=550.0,
+        pillars=_base_pillars(),
+        risk_fit=_base_risk_fit(),
+        scenarios={"conservador": {"valor_justo_total": 600.0}},
+        escenario_elegido="conservador",
+    )
+    titulo = parts[0]
+    assert titulo == "*Acme\\* Corp\\_ \\[Test]\\` (ADBE)*"
+    interior = titulo[1:-1]
+    for char in ("_", "*", "`", "["):
+        assert _contar_sin_escapar(interior, char) == 0
+
+
+def test_build_peer_pe_breakdown_line_escapa_nombre_de_peer_con_caracteres_markdown():
+    """Peers dinámicos de Finnhub (fuente_peers == PEERS_FUENTE_FINNHUB) no
+    están garantizados a ser tickers limpios — mismo riesgo que company_name.
+    Nota: la línea completa envuelve todo en "_..._" (cursiva intencional del
+    bot), así que la verificación de "cero sin escapar" se hace sobre los
+    nombres de peers interpolados puntualmente, no sobre la línea entera."""
+    line = summary._build_peer_pe_breakdown_line(
+        {"AC*ME_CORP": 24.3}, {"BA[D`PEER": "sin_dato"}
+    )
+    nombre_1_escapado = "AC\\*ME\\_CORP"
+    nombre_2_escapado = "BA\\[D\\`PEER"
+    assert f"{nombre_1_escapado} 24.3" in line
+    assert nombre_2_escapado in line
+    for char in ("_", "*", "`", "["):
+        assert _contar_sin_escapar(nombre_1_escapado, char) == 0
+        assert _contar_sin_escapar(nombre_2_escapado, char) == 0
+
+
+def test_market_context_section_escapa_peers_usados_con_caracteres_markdown():
+    peer_comparison = _base_peer_comparison()
+    peer_comparison["peers_usados"] = ["AC*ME_CORP", "ORCL"]
+    text = summary.build_market_context_section(
+        precio_actual=187.0, momentum=_base_momentum(), peer_comparison=peer_comparison
+    )
+    assert "AC\\*ME\\_CORP, ORCL" in text

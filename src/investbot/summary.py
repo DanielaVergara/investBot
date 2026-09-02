@@ -22,6 +22,32 @@ from typing import Optional
 from investbot import peers, rules
 from investbot.valuation import MIN_PEERS_VALIDOS_PARA_MULTIPLOS, classify_scenario
 
+# Caracteres especiales del modo "Markdown" legado de Telegram (no el más
+# nuevo "MarkdownV2", que tiene una lista mucho más larga) — documentados por
+# la propia API de Telegram como los únicos 4 que hay que escapar con "\"
+# para que un texto se muestre literal sin que el parser lo interprete como
+# sintaxis de formato: https://core.telegram.org/bots/api#markdown-style
+_MARKDOWN_LEGACY_ESPECIALES = ("_", "*", "`", "[")
+
+
+def _escape_markdown_legacy(texto: str) -> str:
+    """Escapa los 4 caracteres especiales del Markdown legado de Telegram en
+    texto de terceros (FMP/Finnhub) antes de interpolarlo dentro de una
+    sección que ya usa `parse_mode="Markdown"` (bug real en producción,
+    2026-09-02: un `companyName` de FMP con un `*`/`_`/`` ` ``/`[` sin parear
+    rompía el parseo completo del mensaje con `BadRequest: Can't parse
+    entities`, y el usuario no recibía absolutamente nada).
+
+    Aplica solo a texto que NO es parte de la sintaxis de formato que el bot
+    arma a propósito (headers en negrita, cursivas de nota, etc.) — o sea,
+    nunca se le aplica a los f-strings que ya traen `*`/`_` intencionales,
+    solo al valor de terceros que se interpola adentro de ellos."""
+    if not texto:
+        return texto
+    for char in _MARKDOWN_LEGACY_ESPECIALES:
+        texto = texto.replace(char, f"\\{char}")
+    return texto
+
 MODELO_LABELS = {
     "multiplos": "el modelo de Múltiplos",
     "graham": "el modelo Graham (EPS Model)",
@@ -147,10 +173,15 @@ def _build_peer_pe_breakdown_line(
     if not peers_pe and not peers_no_usados:
         return None
 
+    # Los nombres/tickers de peers pueden venir de Finnhub (peers dinámicos,
+    # fuente_peers == PEERS_FUENTE_FINNHUB, ver peers.py) — texto de tercero
+    # sin sanitizar, mismo riesgo que company_name: se escapa antes de
+    # interpolarlo en esta sección con parse_mode="Markdown".
     clausulas: list[str] = []
     if peers_pe:
         listado = ", ".join(
-            f"{nombre} {_fmt_ratio(valor)}" for nombre, valor in peers_pe.items()
+            f"{_escape_markdown_legacy(nombre)} {_fmt_ratio(valor)}"
+            for nombre, valor in peers_pe.items()
         )
         clausulas.append(f"PER de tus comparables: {listado}")
 
@@ -159,7 +190,8 @@ def _build_peer_pe_breakdown_line(
         texto_motivo = _MOTIVO_PEER_LABELS.get(motivo, {}).get(
             forma, "no tiene un PER válido esta consulta"
         )
-        clausulas.append(f"{_join_con_y(nombres)} {texto_motivo}")
+        nombres_escapados = [_escape_markdown_legacy(n) for n in nombres]
+        clausulas.append(f"{_join_con_y(nombres_escapados)} {texto_motivo}")
 
     texto = " — ".join(clausulas) + "."
     return (
@@ -407,7 +439,12 @@ def build_market_context_section(
         texto = MOTIVO_NO_COMPARABLE_LABELS.get(motivo, "no se pudo comparar con tus peers.")
         bloque_peers.append(f"- Comparada con sus comparables del sector: {texto}")
     else:
-        peers_str = ", ".join(peer_comparison.get("peers_usados") or [])
+        # peers_usados puede venir de Finnhub (peers dinámicos) sin
+        # sanitizar — mismo escape que el resto de nombres de peers en este
+        # módulo, ver _escape_markdown_legacy.
+        peers_str = ", ".join(
+            _escape_markdown_legacy(p) for p in (peer_comparison.get("peers_usados") or [])
+        )
         posicion_txt = POSICION_LABELS.get(posicion, posicion)
         per_propio = peer_comparison.get("per_propio")
         per_min = peer_comparison.get("per_minimo_peers")
@@ -864,7 +901,9 @@ def build_summary_parts_short(
     riesgo/Notas de transparencia) queda detrás de los botones de
     `ai_explain.py` — ninguna sección se recalcula acá, ninguna se pierde,
     solo se muestra bajo demanda."""
-    titulo = f"*{company_name} ({ticker})*"
+    # company_name viene sin sanitizar de FMP (profile.get("companyName")) —
+    # escapado obligatorio, ver _escape_markdown_legacy.
+    titulo = f"*{_escape_markdown_legacy(company_name)} ({ticker})*"
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
     teaser_line = build_valor_justo_teaser_line(scenarios, escenario_elegido, precio_actual)
     invite = "👇 Elegí qué querés que te explique."
@@ -908,7 +947,9 @@ def build_summary_parts(
     explicaciones dummy) → Notas de transparencia (incluye WACC expandido +
     disclaimer general).
     """
-    titulo = f"*{company_name} ({ticker})*"
+    # company_name viene sin sanitizar de FMP (profile.get("companyName")) —
+    # escapado obligatorio, ver _escape_markdown_legacy.
+    titulo = f"*{_escape_markdown_legacy(company_name)} ({ticker})*"
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
 
     intro = build_intro_section()
