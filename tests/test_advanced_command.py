@@ -539,6 +539,45 @@ async def test_transparencia_fija_sin_botones_deshabilitado(empresa_completa, em
     assert mensaje.startswith(advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS)
 
 
+async def test_mensaje_corto_con_ollama_habilitado_omite_desglose_completo(
+    empresa_completa, empresa_asset_light, etf_profile
+):
+    """SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — con
+    Ollama habilitado, el primer (único) mensaje de `/avanzado` contiene
+    SOLO título + síntesis de 1-2 líneas + invitación, nunca el desglose
+    completo de los 5 modelos ni "Fuente de los datos"."""
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+    )
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    assert "👇 Elegí qué modelo querés ver en detalle." in mensaje
+    assert "Fuente de los datos" not in mensaje
+    assert "Factores: Value [" not in mensaje
+    assert "Piotroski F-Score: " not in mensaje or "evaluables (" not in mensaje
+
+
+async def test_mensaje_completo_con_ollama_deshabilitado_sin_cambios(
+    empresa_completa, empresa_asset_light, etf_profile
+):
+    """Regla de no-regresión D3 — sin Ollama habilitado, el desglose
+    completo de siempre, byte-idéntico al comportamiento pre-spec."""
+    clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    assert "Fuente de los datos" in mensaje
+    assert "Factores: Value [" in mensaje
+    assert "👇 Elegí qué modelo querés ver en detalle." not in mensaje
+
+
 async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_recalculados(
     empresa_completa, empresa_asset_light, etf_profile
 ):
@@ -571,8 +610,13 @@ async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_re
     assert ctx.magic is not None
     assert ctx.factors is not None
 
+    # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — con
+    # Ollama habilitado el mensaje base queda corto (el desglose de Z'' se
+    # movió detrás del botón `azp`); el dato en sí sigue disponible, sin
+    # recalcular, en el `ExplanationContext` guardado (ya verificado arriba).
     (mensaje,), _ = update.message.reply_text.call_args_list[0]
-    assert f"[Z'': {ctx.altman_pp['z']:.2f}" in mensaje
+    assert "👇 Elegí qué modelo querés ver en detalle." in mensaje
+    assert f"[Z'':" not in mensaje
 
 
 async def test_reply_markup_con_5_botones_solo_en_ultimo_chunk(
@@ -592,7 +636,8 @@ async def test_reply_markup_con_5_botones_solo_en_ultimo_chunk(
     update.message.reply_text.assert_awaited_once()
     _, kwargs = update.message.reply_text.call_args
     keyboard = kwargs["reply_markup"]
-    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5
+    # Nivel 1 de /avanzado: mod/alt/pio/ben/mag/aqr (6 botones).
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 6
 
 
 async def test_sin_botones_habilitados_ningun_reply_markup(empresa_completa, empresa_asset_light, etf_profile):

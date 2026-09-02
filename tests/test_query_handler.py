@@ -168,6 +168,44 @@ async def test_fetch_and_analyze_adobe_end_to_end(adobe_fixtures):
     assert "el boletín" in text
 
 
+async def test_fetch_and_analyze_parts_short_summary_solo_secciones_permitidas(adobe_fixtures):
+    """SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 —
+    `use_short_summary=True` devuelve SOLO título/veredicto/teaser/invitación
+    -- nunca Ratios/Extras/tabla completa de Valor Justo/Pilares/Contexto de
+    mercado/Eventos corporativos/Encaje de riesgo/Notas de transparencia."""
+    clients = _make_clients(adobe_fixtures)
+    parts = await query_handler.fetch_and_analyze_parts(
+        "ADBE", clients, perfil="moderado", use_short_summary=True
+    )
+    texto = "\n\n".join(parts)
+    assert "Adobe" in texto
+    assert "Veredicto" in texto
+    assert "Valor Justo Total" in texto
+    assert "👇 Elegí qué querés que te explique." in texto
+    for seccion_prohibida in (
+        "Ratios clave", "Rentabilidad, deuda de largo plazo",
+        "Rango de Valor Justo estimado", "Pilares de buena empresa",
+        "Contexto de mercado", "Encaje con tu perfil de riesgo",
+        "Notas de transparencia", "Tienda de Limonada",
+    ):
+        assert seccion_prohibida not in texto
+
+
+async def test_fetch_and_analyze_parts_full_summary_por_default(adobe_fixtures):
+    """Regla de no-regresión D3: sin pasar `use_short_summary` (default
+    `False`), el reporte completo de siempre -- todas las secciones."""
+    clients = _make_clients(adobe_fixtures)
+    parts = await query_handler.fetch_and_analyze_parts("ADBE", clients, perfil="moderado")
+    texto = "\n\n".join(parts)
+    for seccion in (
+        "Ratios clave", "Rango de Valor Justo estimado", "Pilares de buena empresa",
+        "Contexto de mercado", "Encaje con tu perfil de riesgo", "Notas de transparencia",
+        "Tienda de Limonada",
+    ):
+        assert seccion in texto
+    assert "👇 Elegí qué querés que te explique." not in texto
+
+
 async def test_fetch_and_analyze_datos_incompletos_mensaje_claro():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[])
@@ -1147,7 +1185,7 @@ def test_fetch_and_analyze_firma_publica_sin_cambios():
     sig_parts = inspect.signature(query_handler.fetch_and_analyze_parts)
     assert list(sig_parts.parameters) == [
         "ticker", "clients", "perfil", "escenario_elegido", "ventana_trimestres",
-        "explain_context_sink",
+        "explain_context_sink", "use_short_summary",
     ]
     assert sig_parts.parameters["escenario_elegido"].default == "conservador"
     assert sig_parts.parameters["escenario_elegido"].kind == inspect.Parameter.KEYWORD_ONLY
@@ -2583,6 +2621,21 @@ def _sink_values_texto_libre(**overrides) -> dict:
         },
         pillars={"ingresos_crecientes": True},
         veredicto_barata=True,
+        # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #8 — 12
+        # campos nuevos, siempre poblados juntos por el `.update()` real de
+        # `fetch_and_analyze_parts`.
+        ratios={"per": 20.0},
+        risk_fit={"encaja": True, "perfil": "moderado", "beta": 1.1, "etiqueta_activo": "acción"},
+        momentum={"etiqueta": "impulso_positivo"},
+        peer_comparison={"per_propio": 20.0, "posicion": "en_linea"},
+        extras={"roe": 0.25},
+        vix={"valor": 15.0, "disponible": True},
+        corporate_events=[],
+        treasury_source="FRED",
+        balance_sheet_fuente="trimestral",
+        income_statement_fuente="trimestral",
+        cash_flow_fuente="trimestral",
+        peers_note="nota de peers de prueba",
     )
     defaults.update(overrides)
     return defaults
@@ -2614,7 +2667,7 @@ async def test_reply_markup_solo_en_ultimo_chunk_texto_libre_con_botones(conn_fa
     assert "reply_markup" not in call2.kwargs  # chunk 2/3, intermedio
     assert "reply_markup" in call3.kwargs  # chunk 3/3, el último
     keyboard = call3.kwargs["reply_markup"]
-    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 3
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5  # Nivel 1: ver/val/cal/rie/inf
 
 
 async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_factory, monkeypatch):
@@ -2647,7 +2700,42 @@ async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_f
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
     assert "reply_markup" in final_kwargs
     keyboard = final_kwargs["reply_markup"]
-    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 3
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5  # Nivel 1: ver/val/cal/rie/inf
+
+
+async def test_run_analysis_ollama_habilitado_mensaje_corto_end_to_end(adobe_fixtures, conn_factory, monkeypatch):
+    """Integración real (sin mockear el sink) — con Ollama habilitado, el
+    primer chunk entregado por `_run_analysis` es la versión corta (Decisión
+    de diseño #9), lleva teclado de Nivel 1, y el `ExplanationContext`
+    guardado lleva el `chat_id` real (Hallazgo 9 de `security`)."""
+    _complete_onboarding(conn_factory)
+    clients = dataclasses.replace(
+        _make_clients(adobe_fixtures),
+        ollama_config=ai_rewrite.OllamaConfig(
+            enabled=True, base_url="http://100.101.102.103:11434",
+            model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+        ),
+    )
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+
+    store = ai_explain.ExplanationContextStore()
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter(), store)
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    texto = loading_msg.edit_text.call_args.args[0]
+    assert "👇 Elegí qué querés que te explique." in texto
+    assert "Ratios clave" not in texto
+    _, edit_kwargs = loading_msg.edit_text.call_args
+    assert edit_kwargs["reply_markup"] is not None
+
+    assert len(store._entries) == 1
+    ((_, entry),) = store._entries.items()
+    assert entry.context.chat_id == int(ALLOWED_CHAT_ID)
 
 
 async def test_explanation_context_texto_libre_mismos_objetos_no_recalculados(conn_factory, monkeypatch):

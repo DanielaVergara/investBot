@@ -2201,3 +2201,95 @@ def test_canario_disclaimers_aparecen_como_linea_completa_exacta(overrides):
         "ya no aparece como línea completa exacta en la sección de "
         "transparencia de build_summary_parts."
     )
+
+
+# ---------------------------------------------------------------------------
+# SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 —
+# build_summary_parts_short / build_valor_justo_teaser_line /
+# build_intro_section / build_transparency_section.
+# ---------------------------------------------------------------------------
+
+
+def test_build_valor_justo_teaser_line_camino_feliz():
+    scenarios = {"conservador": {"valor_justo_total": 182.40}}
+    linea = summary.build_valor_justo_teaser_line(scenarios, "conservador", 150.0)
+    assert linea == "Valor Justo Total (Conservador): $182.40 — tu precio actual: $150.00."
+
+
+def test_build_valor_justo_teaser_line_escenario_no_calculable_no_rompe():
+    """Caso límite (QA): `valor_justo_total is None` -- no rompe, no
+    muestra "None" visible."""
+    scenarios = {"conservador": {"valor_justo_total": None}}
+    linea = summary.build_valor_justo_teaser_line(scenarios, "conservador", 150.0)
+    assert "None" not in linea
+    assert "no calculable" in linea
+    assert "$150.00" in linea
+
+
+def test_build_valor_justo_teaser_line_escenario_ausente_del_dict():
+    linea = summary.build_valor_justo_teaser_line({}, "conservador", 150.0)
+    assert "None" not in linea
+
+
+def test_build_intro_section_menciona_tienda_de_limonada():
+    assert "Tienda de Limonada" in summary.build_intro_section()
+
+
+def test_build_transparency_section_reutilizada_por_build_summary_parts():
+    """La función extraída produce EXACTAMENTE la misma sección que ya
+    arma `build_summary_parts` internamente -- mismo texto, cero
+    duplicación de lógica."""
+    kwargs = _disclaimer_kwargs()
+    parts = summary.build_summary_parts(**kwargs)
+    transparency_part = next(p for p in parts if p.startswith("*Notas de transparencia:*"))
+
+    peer_comparison = kwargs["peer_comparison"]
+    standalone = summary.build_transparency_section(
+        peers_note=summary._build_peers_note(peer_comparison.get("fuente_peers")),
+        treasury_source=kwargs.get("treasury_source"),
+        income_statement_fuente=kwargs.get("income_statement_fuente"),
+        balance_sheet_fuente=kwargs.get("balance_sheet_fuente"),
+        cash_flow_fuente=kwargs.get("cash_flow_fuente"),
+    )
+    assert standalone == transparency_part
+
+
+def test_build_summary_parts_short_solo_4_secciones():
+    parts = summary.build_summary_parts_short(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=550.0,
+        pillars={
+            "ingresos_crecientes": True, "utilidades_crecientes": True,
+            "deuda_controlada": True, "precio_razonable": True,
+        },
+        risk_fit={"encaja": True, "perfil": "moderado", "beta": 1.1, "etiqueta_activo": "acción"},
+        scenarios={"conservador": {"valor_justo_total": 600.0}},
+        escenario_elegido="conservador",
+    )
+    assert len(parts) == 4
+    assert parts[0] == "*Adobe Inc. (ADBE)*"
+    assert "Veredicto" in parts[1]
+    assert "Valor Justo Total" in parts[2]
+    assert parts[3] == "👇 Elegí qué querés que te explique."
+
+
+def test_build_summary_parts_short_no_incluye_secciones_completas():
+    parts = summary.build_summary_parts_short(
+        ticker="ADBE",
+        company_name="Adobe Inc.",
+        precio_actual=550.0,
+        pillars={
+            "ingresos_crecientes": True, "utilidades_crecientes": True,
+            "deuda_controlada": True, "precio_razonable": True,
+        },
+        risk_fit={"encaja": True, "perfil": "moderado", "beta": 1.1, "etiqueta_activo": "acción"},
+        scenarios={"conservador": {"valor_justo_total": 600.0}},
+        escenario_elegido="conservador",
+    )
+    texto = "\n\n".join(parts)
+    for seccion_prohibida in (
+        "Ratios clave", "Pilares de buena empresa", "Contexto de mercado",
+        "Encaje con tu perfil de riesgo", "Notas de transparencia", "Tienda de Limonada",
+    ):
+        assert seccion_prohibida not in texto

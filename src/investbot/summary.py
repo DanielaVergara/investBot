@@ -764,6 +764,113 @@ def _build_peers_note(fuente_peers: Optional[str]) -> str:
     return _PEERS_NOTE_FIJO
 
 
+def build_intro_section() -> str:
+    """Intro "Tienda de Limonada" (Decisión de diseño #9 de
+    `SDD_menu_por_capas_explicaciones.md`: hoisteada a función propia para
+    que, con Ollama habilitado, pase a formar parte de la primera línea del
+    leaf `inf` — texto byte-idéntico al que antes vivía inline acá, cero
+    cambio de comportamiento en `build_summary_parts`)."""
+    return (
+        "*Cómo leer este análisis:*\n"
+        "Pensá en una empresa como una Tienda de Limonada: el *boletín* "
+        "(Estado de Resultados) te dice cuánto vendió y ganó, *la foto* "
+        "(Balance General) te dice qué tiene y qué debe en un momento dado, "
+        "y *el extracto* (Flujo de Efectivo) te dice cuánta plata de verdad "
+        "entró y salió de la caja."
+    )
+
+
+def build_transparency_section(
+    *,
+    peers_note: str,
+    treasury_source: Optional[str],
+    income_statement_fuente: Optional[str],
+    balance_sheet_fuente: Optional[str],
+    cash_flow_fuente: Optional[str],
+) -> str:
+    """Sección "Notas de transparencia" (Decisión de diseño #9 de
+    `SDD_menu_por_capas_explicaciones.md`: hoisteada a función propia para
+    que el leaf determinístico `inf` de `ai_explain.py` la reutilice sin
+    recalcular nada — texto byte-idéntico al que antes se armaba inline en
+    `build_summary_parts`, cero cambio de comportamiento ahí).
+
+    `peers_note` ya viene resuelto (el llamador decide si usa el que le
+    pasaron o calcula el default con `_build_peers_note`) — esta función no
+    conoce `peer_comparison`, solo el string final."""
+    transparency_lines = [
+        "*Notas de transparencia:*",
+        "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
+        "obtenidos de Financial Modeling Prep (FMP)._",
+        f"_Nota de transparencia: {peers_note}_",
+    ]
+    if treasury_source:
+        transparency_lines.append(
+            f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
+        )
+    income_statement_note = _build_income_statement_note(income_statement_fuente)
+    if income_statement_note:
+        transparency_lines.append(f"_{income_statement_note}_")
+    balance_sheet_note = _build_balance_sheet_note(balance_sheet_fuente)
+    if balance_sheet_note:
+        transparency_lines.append(f"_{balance_sheet_note}_")
+    cash_flow_note = _build_cash_flow_note(cash_flow_fuente)
+    if cash_flow_note:
+        transparency_lines.append(f"_{cash_flow_note}_")
+    transparency_lines.append(DISCLAIMER_WACC_DCF)
+    transparency_lines.append(DISCLAIMER_NO_ASESORAMIENTO)
+    return "\n\n".join(transparency_lines)
+
+
+def build_valor_justo_teaser_line(
+    scenarios: dict, escenario_elegido: Optional[str], precio_actual: float
+) -> str:
+    """1 línea: Valor Justo Total del escenario elegido + precio actual —
+    Decisión de diseño #9 (D1 resuelta por Daniela: sí lleva teaser) de
+    `SDD_menu_por_capas_explicaciones.md`. Extrae solo el total ya
+    calculado, nunca recalcula nada. Caso límite (escenario no calculable,
+    `valor_justo_total is None`): no rompe ni muestra "None" — degrada a un
+    texto explícito."""
+    escenario = (scenarios.get(escenario_elegido) if escenario_elegido else None) or {}
+    total = escenario.get("valor_justo_total")
+    titulo = _ESCENARIO_TITULOS.get(escenario_elegido, escenario_elegido or "elegido")
+    if total is None:
+        return (
+            f"Valor Justo Total ({titulo}): no calculable con los datos "
+            f"disponibles esta consulta — tu precio actual: {_fmt_money(precio_actual)}."
+        )
+    return (
+        f"Valor Justo Total ({titulo}): {_fmt_money(total)} — tu precio "
+        f"actual: {_fmt_money(precio_actual)}."
+    )
+
+
+def build_summary_parts_short(
+    *,
+    ticker: str,
+    company_name: str,
+    precio_actual: float,
+    pillars: dict,
+    risk_fit: dict,
+    scenarios: dict,
+    escenario_elegido: Optional[str] = None,
+) -> list[str]:
+    """Versión acortada del primer mensaje (Decisión de diseño #9 de
+    `SDD_menu_por_capas_explicaciones.md`) — SOLO se usa cuando Ollama está
+    habilitado (regla de no-regresión D3: deshabilitado -> siempre
+    `build_summary_parts`, el reporte completo de siempre). Título +
+    Veredicto (ya corto, sin cambios) + teaser de Valor Justo + invitación a
+    usar los botones. Todo lo demás (Ratios/Extras/tabla completa de Valor
+    Justo/Pilares/Contexto de mercado/Eventos corporativos/Encaje de
+    riesgo/Notas de transparencia) queda detrás de los botones de
+    `ai_explain.py` — ninguna sección se recalcula acá, ninguna se pierde,
+    solo se muestra bajo demanda."""
+    titulo = f"*{company_name} ({ticker})*"
+    veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
+    teaser_line = build_valor_justo_teaser_line(scenarios, escenario_elegido, precio_actual)
+    invite = "👇 Elegí qué querés que te explique."
+    return [titulo, veredicto_section, teaser_line, invite]
+
+
 def build_summary_parts(
     *,
     ticker: str,
@@ -804,14 +911,7 @@ def build_summary_parts(
     titulo = f"*{company_name} ({ticker})*"
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
 
-    intro = (
-        "*Cómo leer este análisis:*\n"
-        "Pensá en una empresa como una Tienda de Limonada: el *boletín* "
-        "(Estado de Resultados) te dice cuánto vendió y ganó, *la foto* "
-        "(Balance General) te dice qué tiene y qué debe en un momento dado, "
-        "y *el extracto* (Flujo de Efectivo) te dice cuánta plata de verdad "
-        "entró y salió de la caja."
-    )
+    intro = build_intro_section()
 
     ratios_lines = [
         "*Ratios clave:*",
@@ -863,27 +963,13 @@ def build_summary_parts(
     peers_note_final = peers_note if peers_note is not None else _build_peers_note(
         peer_comparison.get("fuente_peers")
     )
-    transparency_lines = [
-        "*Notas de transparencia:*",
-        "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
-        "obtenidos de Financial Modeling Prep (FMP)._",
-        f"_Nota de transparencia: {peers_note_final}_",
-    ]
-    if treasury_source:
-        transparency_lines.append(
-            f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
-        )
-    income_statement_note = _build_income_statement_note(income_statement_fuente)
-    if income_statement_note:
-        transparency_lines.append(f"_{income_statement_note}_")
-    balance_sheet_note = _build_balance_sheet_note(balance_sheet_fuente)
-    if balance_sheet_note:
-        transparency_lines.append(f"_{balance_sheet_note}_")
-    cash_flow_note = _build_cash_flow_note(cash_flow_fuente)
-    if cash_flow_note:
-        transparency_lines.append(f"_{cash_flow_note}_")
-    transparency_lines.append(DISCLAIMER_WACC_DCF)
-    transparency_lines.append(DISCLAIMER_NO_ASESORAMIENTO)
+    transparency_section = build_transparency_section(
+        peers_note=peers_note_final,
+        treasury_source=treasury_source,
+        income_statement_fuente=income_statement_fuente,
+        balance_sheet_fuente=balance_sheet_fuente,
+        cash_flow_fuente=cash_flow_fuente,
+    )
 
     parts = [
         titulo,
@@ -896,7 +982,7 @@ def build_summary_parts(
         market_context_section,
         corporate_events_section,
         risk_section,
-        "\n\n".join(transparency_lines),
+        transparency_section,
     ]
     return [part for part in parts if part is not None]
 

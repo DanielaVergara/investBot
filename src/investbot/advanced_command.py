@@ -131,6 +131,7 @@ def _build_message(
     balance_sheets: list[dict],
     cash_flows: list[dict],
     explain_context_sink: Optional[dict] = None,
+    short: bool = False,
 ) -> str:
     """Arma el único mensaje de Telegram (Decisión de diseño #5), texto
     plano — nunca `parse_mode="Markdown"` (hallazgo 4 de `security`: el
@@ -142,7 +143,13 @@ def _build_message(
     `query_handler.fetch_and_analyze_parts` — keyword-only opcional, si se
     pasa un `dict` se lo puebla in-place con los mismos resultados
     (`altman`/`altman_pp`/`piotroski`/`beneish`/`magic`/`factors`/
-    `asset_light`/`sector`) ya calculados acá, nunca recalculados."""
+    `asset_light`/`sector`/`roe`/`gross_margin`/`beta`) ya calculados acá,
+    nunca recalculados.
+
+    `short` (`SDD_menu_por_capas_explicaciones.md`, Decisión de diseño #9):
+    default `False` (comportamiento idéntico al de siempre — desglose
+    completo de los 5 modelos). `True` solo cuando el llamador ya confirmó
+    que Ollama está habilitado — regla de no-regresión D3."""
     income_reciente = income_statements[0]
     income_anterior = income_statements[1] if len(income_statements) > 1 else {}
     balance_reciente = balance_sheets[0]
@@ -217,6 +224,37 @@ def _build_message(
         beta=beta,
     )
 
+    if short:
+        # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — el
+        # desglose completo de cada modelo (Altman con zona, Piotroski con
+        # criterios, Magic Formula con ROIC/EY, Factores con las 4
+        # etiquetas) y la línea de "Fuente de los datos" quedan detrás de
+        # los botones (la tabla `FUENTES` de la Decisión #7 ya los cubre).
+        lineas = [
+            f"{ticker} — {company_name}",
+            _build_short_synthesis_line(
+                altman=altman, piotroski=piotroski, magic=magic, beneish=beneish
+            ),
+            "👇 Elegí qué modelo querés ver en detalle.",
+        ]
+        if explain_context_sink is not None:
+            explain_context_sink.update(
+                company_name=company_name,
+                sector=sector,
+                industry=industry,
+                asset_light=asset_light,
+                altman=dataclasses.asdict(altman),
+                altman_pp=dataclasses.asdict(altman_pp) if altman_pp is not None else None,
+                piotroski=dataclasses.asdict(piotroski),
+                beneish=dataclasses.asdict(beneish),
+                magic=dataclasses.asdict(magic),
+                factors=dataclasses.asdict(factors),
+                roe=roe,
+                gross_margin=gross_margin,
+                beta=beta,
+            )
+        return "\n".join(lineas)
+
     lineas = [f"{ticker} — {company_name}"]
 
     if altman.disponible:
@@ -272,12 +310,15 @@ def _build_message(
     )
 
     if explain_context_sink is not None:
-        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3 —
-        # los mismos objetos ya calculados arriba, nunca recalculados.
-        # `sector`/`industry` viajan crudos hasta acá (dato de terceros de
-        # FMP) — `ai_explain._build_explain_payload` es quien los valida
-        # contra la allow-list GICS / los excluye antes de tocar el prompt
-        # (hallazgo 1 BLOQUEANTE de `security`), no este módulo.
+        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3,
+        # extendido por SDD_menu_por_capas_explicaciones.md Decisión de
+        # diseño #8 (`roe`/`gross_margin`/`beta`, ya calculados arriba para
+        # `factors`, hoy descartados) — los mismos objetos ya calculados
+        # arriba, nunca recalculados. `sector`/`industry` viajan crudos
+        # hasta acá (dato de terceros de FMP) — `ai_explain._build_explain_
+        # payload` es quien los valida contra la allow-list GICS / los
+        # excluye antes de tocar el prompt (hallazgo 1 BLOQUEANTE de
+        # `security`), no este módulo.
         explain_context_sink.update(
             company_name=company_name,
             sector=sector,
@@ -289,9 +330,32 @@ def _build_message(
             beneish=dataclasses.asdict(beneish),
             magic=dataclasses.asdict(magic),
             factors=dataclasses.asdict(factors),
+            roe=roe,
+            gross_margin=gross_margin,
+            beta=beta,
         )
 
     return "\n".join(lineas)
+
+
+# --- Mensaje corto (Decisión de diseño #9 de
+# `SDD_menu_por_capas_explicaciones.md`) -------------------------------
+
+
+def _build_short_synthesis_line(*, altman, piotroski, magic, beneish) -> str:
+    """1-2 líneas: síntesis de qué modelos son calculables — nunca el
+    desglose completo (eso queda detrás de los botones)."""
+    altman_txt = f"zona {altman.zona}" if altman.disponible else "no calculable"
+    if piotroski.criterios_evaluables == piotroski.criterios_totales:
+        piotroski_txt = f"{piotroski.puntaje}/{piotroski.criterios_totales}"
+    else:
+        piotroski_txt = f"{piotroski.puntaje}/{piotroski.criterios_evaluables} evaluables"
+    magic_txt = "calculable" if magic.disponible else "no calculable"
+    beneish_txt = "no calculable con este plan" if not beneish.disponible else "calculable"
+    return (
+        f"Altman Z: {altman_txt} · Piotroski {piotroski_txt} · "
+        f"Magic Formula {magic_txt} · Beneish: {beneish_txt}."
+    )
 
 
 def build_advanced_command_handler(
@@ -326,6 +390,11 @@ def build_advanced_command_handler(
         if not rate_limiter.allow(chat_key):
             await update.message.reply_text(query_handler.RATE_LIMITED_MSG)
             return
+
+        # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 —
+        # calculado ANTES de `_build_message` (regla de no-regresión D3: el
+        # acortamiento del mensaje solo aplica con Ollama habilitado).
+        ollama_enabled = bool(clients.ollama_config and clients.ollama_config.enabled)
 
         try:
             profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
@@ -364,6 +433,7 @@ def build_advanced_command_handler(
                 balance_sheets=balance_sheets,
                 cash_flows=cash_flows,
                 explain_context_sink=explain_context_sink,
+                short=ollama_enabled,
             )
         except fmp_client.FMPError as exc:
             await update.message.reply_text(str(exc))
@@ -383,7 +453,6 @@ def build_advanced_command_handler(
         # no lo usa para su mensaje base): variante "con botones" solo si la
         # feature está efectivamente habilitada, para no invitar a apretar
         # un botón que siempre va a fallar.
-        ollama_enabled = bool(clients.ollama_config and clients.ollama_config.enabled)
         transparency = (
             TRANSPARENCY_FIXED_WITH_BUTTONS if ollama_enabled else TRANSPARENCY_FIXED_NO_BUTTONS
         )
@@ -392,6 +461,7 @@ def build_advanced_command_handler(
         keyboard = None
         if ollama_enabled and explain_context_sink:
             explanation_context = ai_explain.ExplanationContext(
+                chat_id=update.effective_chat.id,
                 kind="avanzado",
                 ticker=ticker,
                 company_name=explain_context_sink["company_name"],
@@ -404,6 +474,9 @@ def build_advanced_command_handler(
                 beneish=explain_context_sink["beneish"],
                 magic=explain_context_sink["magic"],
                 factors=explain_context_sink["factors"],
+                roe=explain_context_sink["roe"],
+                gross_margin=explain_context_sink["gross_margin"],
+                beta=explain_context_sink["beta"],
             )
             context_id = explanation_store.put(explanation_context)
             keyboard = ai_explain.build_keyboard("avanzado", context_id)

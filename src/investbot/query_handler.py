@@ -163,6 +163,7 @@ async def fetch_and_analyze_parts(
     escenario_elegido: str = "conservador",
     ventana_trimestres: int = VENTANA_TRIMESTRES_LARGO,
     explain_context_sink: Optional[dict] = None,
+    use_short_summary: bool = False,
 ) -> list[str]:
     """Trae los datos de un ticker resuelto y arma la respuesta completa,
     devuelta como lista de secciones sin unir (`summary.build_summary_parts`)
@@ -178,17 +179,23 @@ async def fetch_and_analyze_parts(
     no oculta, los 3 escenarios) — no cambia ningún cálculo.
 
     `explain_context_sink` (`SDD_explicaciones_interactivas_ollama.md`,
-    Decisión de diseño #3): keyword-only opcional, mismo criterio
+    Decisión de diseño #3, extendido por `SDD_menu_por_capas_explicaciones.md`
+    Decisión de diseño #8): keyword-only opcional, mismo criterio
     retrocompatible que los 2 parámetros de arriba. Si se pasa un `dict`, se
-    lo puebla in-place con los campos que `ExplanationContext` necesita
-    (`company_name`/`escenario_elegido`/`precio_actual`/`scenarios`/
-    `pillars`/`veredicto_barata`) — los mismos objetos ya calculados acá, no
-    recalculados — para que `_run_analysis` arme el contexto de explicación
-    sin que esta función cambie su tipo de retorno (`list[str]`, usado
-    ampliamente por el resto de la suite y por `fetch_and_analyze`). Con el
-    abort-check de datos insuficientes (más abajo) el sink queda sin poblar
-    a propósito — no hay contexto útil que ofrecer en botones para un
-    análisis que no se pudo completar.
+    lo puebla in-place con los campos que `ExplanationContext` necesita —
+    los mismos objetos ya calculados acá, no recalculados — para que
+    `_run_analysis` arme el contexto de explicación sin que esta función
+    cambie su tipo de retorno (`list[str]`, usado ampliamente por el resto
+    de la suite y por `fetch_and_analyze`). Con el abort-check de datos
+    insuficientes (más abajo) el sink queda sin poblar a propósito — no hay
+    contexto útil que ofrecer en botones para un análisis que no se pudo
+    completar.
+
+    `use_short_summary` (`SDD_menu_por_capas_explicaciones.md`, Decisión de
+    diseño #9): keyword-only, default `False` (comportamiento idéntico al
+    de siempre — `summary.build_summary_parts`, el reporte completo). `True`
+    solo cuando `_run_analysis` ya confirmó `ollama_config.enabled` — regla
+    de no-regresión D3: sin Ollama habilitado, nunca se acorta el mensaje.
     """
     quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
     profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
@@ -553,8 +560,12 @@ async def fetch_and_analyze_parts(
     vix_dict = {"valor": vix_result.valor, "disponible": vix_result.disponible}
 
     if explain_context_sink is not None:
-        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3 —
-        # los mismos objetos ya calculados arriba, nunca recalculados.
+        # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3,
+        # extendido por SDD_menu_por_capas_explicaciones.md Decisión de
+        # diseño #8 — los mismos objetos ya calculados arriba, nunca
+        # recalculados. `peers_note` se saca acá (mismo cálculo que
+        # `summary._build_peers_note` haría internamente) para que el leaf
+        # determinístico `inf` lo reuse sin recalcular.
         explain_context_sink.update(
             company_name=company_name,
             escenario_elegido=escenario_elegido,
@@ -565,6 +576,33 @@ async def fetch_and_analyze_parts(
             # (rules.evaluate_pillars la refleja verbatim) -- mismo valor,
             # no recalculado.
             veredicto_barata=pillars.precio_razonable,
+            ratios=ratios_dict,
+            risk_fit=risk_fit_dict,
+            momentum=momentum_dict,
+            peer_comparison=peer_comparison_dict,
+            extras=extras_dict,
+            vix=vix_dict,
+            corporate_events=corporate_events_list,
+            treasury_source=treasury_source,
+            balance_sheet_fuente=balance_fuente,
+            income_statement_fuente=income_statements_fuente,
+            cash_flow_fuente=cash_flow_fuente,
+            peers_note=summary._build_peers_note(peer_comparison_dict["fuente_peers"]),
+        )
+
+    if use_short_summary:
+        # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — solo
+        # se llega acá con Ollama habilitado (regla de no-regresión D3, ver
+        # `_run_analysis`). Ningún dato nuevo: mismos dicts ya calculados
+        # arriba, versión corta del mensaje.
+        return summary.build_summary_parts_short(
+            ticker=ticker,
+            company_name=company_name,
+            precio_actual=precio_actual or 0.0,
+            pillars=pillars_dict,
+            risk_fit=risk_fit_dict,
+            scenarios=scenarios.as_dict(),
+            escenario_elegido=escenario_elegido,
         )
 
     return summary.build_summary_parts(
@@ -965,6 +1003,17 @@ def build_query_handlers(
                 sanitize_for_log(ticker), exc,
             )
 
+        # SDD_redaccion_ia_ollama.md — con la feature deshabilitada
+        # (`clients.ollama_config` ausente o `enabled=False`) `rewrite_parts`
+        # es un no-op inmediato, sin latencia ni llamadas HTTP —
+        # comportamiento idéntico al bot de hoy. Se calcula ACÁ (antes de
+        # `fetch_and_analyze_parts`) porque `SDD_menu_por_capas_explicaciones.md`
+        # Decisión de diseño #9 necesita el flag para decidir si arma el
+        # mensaje corto o el reporte completo — regla de no-regresión D3.
+        ollama_config = clients.ollama_config or ai_rewrite.OllamaConfig(
+            enabled=False, base_url="", model="", timeout_seconds=0.0
+        )
+
         keyboard = None
         try:
             explain_context_sink: dict = {}
@@ -973,6 +1022,7 @@ def build_query_handlers(
                 escenario_elegido=escenario_elegido,
                 ventana_trimestres=ventana_trimestres,
                 explain_context_sink=explain_context_sink,
+                use_short_summary=ollama_config.enabled,
             )
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
             final_parts, kwargs = [str(exc)], {}
@@ -984,13 +1034,7 @@ def build_query_handlers(
         else:
             # SDD_redaccion_ia_ollama.md — única llamada a `ai_rewrite`,
             # solo en el camino exitoso (nunca sobre los mensajes de error
-            # de 1 línea de los 2 `except` de arriba). Con la feature
-            # deshabilitada (`clients.ollama_config` ausente o
-            # `enabled=False`) esto es un no-op inmediato, sin latencia ni
-            # llamadas HTTP — comportamiento idéntico al bot de hoy.
-            ollama_config = clients.ollama_config or ai_rewrite.OllamaConfig(
-                enabled=False, base_url="", model="", timeout_seconds=0.0
-            )
+            # de 1 línea de los 2 `except` de arriba).
             outcome = await ai_rewrite.rewrite_parts(
                 parts, ollama_config, http_client=clients.ollama_http
             )
@@ -1012,6 +1056,7 @@ def build_query_handlers(
             # útil que ofrecer en botones).
             if ollama_config.enabled and explain_context_sink:
                 explanation_context = ai_explain.ExplanationContext(
+                    chat_id=int(chat_id),
                     kind="texto_libre",
                     ticker=ticker,
                     company_name=explain_context_sink["company_name"],
@@ -1020,6 +1065,18 @@ def build_query_handlers(
                     scenarios=explain_context_sink["scenarios"],
                     pillars=explain_context_sink["pillars"],
                     veredicto_barata=explain_context_sink["veredicto_barata"],
+                    ratios=explain_context_sink["ratios"],
+                    risk_fit=explain_context_sink["risk_fit"],
+                    momentum=explain_context_sink["momentum"],
+                    peer_comparison=explain_context_sink["peer_comparison"],
+                    extras=explain_context_sink["extras"],
+                    vix=explain_context_sink["vix"],
+                    corporate_events=explain_context_sink["corporate_events"],
+                    treasury_source=explain_context_sink["treasury_source"],
+                    balance_sheet_fuente=explain_context_sink["balance_sheet_fuente"],
+                    income_statement_fuente=explain_context_sink["income_statement_fuente"],
+                    cash_flow_fuente=explain_context_sink["cash_flow_fuente"],
+                    peers_note=explain_context_sink["peers_note"],
                 )
                 context_id = explanation_store.put(explanation_context)
                 keyboard = ai_explain.build_keyboard("texto_libre", context_id)
