@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -90,14 +91,26 @@ def _texto_libre_context(**overrides) -> ai_explain.ExplanationContext:
             "pesimista": {
                 "valor_justo_multiplos": 460.0, "valor_justo_graham": 440.0,
                 "valor_justo_dcf": 470.0, "valor_justo_total": 456.7,
+                "graham_g_aplicado": 0.06,
+                "dcf_wacc": 0.10, "dcf_g_fcf": 0.053, "dcf_fcf_base": 100.0,
+                "dcf_valor_presente_flujos": 400.0, "dcf_valor_terminal_descontado": 900.0,
+                "dcf_equity_value": 1300.0,
             },
             "conservador": {
                 "valor_justo_multiplos": 500.0, "valor_justo_graham": 480.0,
                 "valor_justo_dcf": 510.0, "valor_justo_total": 496.0,
+                "graham_g_aplicado": 0.094,
+                "dcf_wacc": 0.091, "dcf_g_fcf": 0.083, "dcf_fcf_base": 109.0,
+                "dcf_valor_presente_flujos": 612.0, "dcf_valor_terminal_descontado": 2100.0,
+                "dcf_equity_value": 2712.0,
             },
             "optimista": {
                 "valor_justo_multiplos": 540.0, "valor_justo_graham": 520.0,
                 "valor_justo_dcf": 550.0, "valor_justo_total": 536.7,
+                "graham_g_aplicado": 0.124,
+                "dcf_wacc": 0.081, "dcf_g_fcf": 0.113, "dcf_fcf_base": 118.0,
+                "dcf_valor_presente_flujos": 800.0, "dcf_valor_terminal_descontado": 3200.0,
+                "dcf_equity_value": 4000.0,
             },
         },
         pillars={
@@ -138,6 +151,23 @@ def _texto_libre_context(**overrides) -> ai_explain.ExplanationContext:
         income_statement_fuente="trimestral",
         cash_flow_fuente="trimestral",
         peers_note="nota de peers de prueba",
+        # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- 15 campos
+        # nuevos para el bloque "🧮 Cuenta" de "paso a paso".
+        eps_ttm=8.2,
+        y_value=0.042,
+        current_assets=100.0,
+        current_liabilities=50.0,
+        revenue=1000.0,
+        cost_of_revenue=400.0,
+        market_cap=2_000_000.0,
+        revenue_reciente=1000.0,
+        revenue_antiguo=800.0,
+        net_income_reciente=200.0,
+        net_income_antiguo=150.0,
+        year_high=600.0,
+        year_low=400.0,
+        price_avg_50=540.0,
+        price_avg_200=520.0,
     )
     defaults.update(overrides)
     return ai_explain.ExplanationContext(**defaults)
@@ -152,26 +182,57 @@ def _avanzado_context(**overrides) -> ai_explain.ExplanationContext:
         sector="Technology",
         industry="Software - Infrastructure",
         asset_light=True,
-        altman={"disponible": True, "z": 3.5, "zona": "segura", "campos_faltantes": []},
-        altman_pp={"disponible": True, "z": 5.2, "zona": "segura", "campos_faltantes": []},
+        altman={
+            "disponible": True, "z": 3.5, "zona": "segura", "campos_faltantes": [],
+            "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "e": 0.87,
+        },
+        altman_pp={
+            "disponible": True, "z": 5.2, "zona": "segura", "campos_faltantes": [],
+            "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "e": None,
+        },
         piotroski={
             "puntaje": 7,
             "criterios_evaluables": 9,
             "criterios_totales": 9,
             "criterios": [
-                {"nombre": "roa_positivo", "cumplido": True},
-                {"nombre": "cfo_positivo", "cumplido": True},
-                {"nombre": "roa_creciente", "cumplido": True},
-                {"nombre": "cfo_mayor_utilidad", "cumplido": False},
-                {"nombre": "apalancamiento_decreciente", "cumplido": True},
-                {"nombre": "liquidez_creciente", "cumplido": False},
-                {"nombre": "sin_dilucion", "cumplido": True},
-                {"nombre": "margen_bruto_creciente", "cumplido": True},
-                {"nombre": "rotacion_activos_creciente", "cumplido": False},
+                {"nombre": "roa_positivo", "cumplido": True, "valores": {"net_income_t": 118.0}},
+                {"nombre": "cfo_positivo", "cumplido": True, "valores": {"cfo_t": 118.0}},
+                {
+                    "nombre": "roa_creciente", "cumplido": True,
+                    "valores": {"roa_t": 0.18, "roa_t1": 0.15},
+                },
+                {
+                    "nombre": "cfo_mayor_utilidad", "cumplido": False,
+                    "valores": {"cfo_t": 118.0, "net_income_t": 97.0},
+                },
+                {
+                    "nombre": "apalancamiento_decreciente", "cumplido": True,
+                    "valores": {"apalancamiento_t": 0.2, "apalancamiento_t1": 0.3},
+                },
+                {
+                    "nombre": "liquidez_creciente", "cumplido": False,
+                    "valores": {"liquidez_t": 1.1, "liquidez_t1": 1.3},
+                },
+                {
+                    "nombre": "sin_dilucion", "cumplido": True,
+                    "valores": {"shares_t": 100.0, "shares_t1": 102.0},
+                },
+                {
+                    "nombre": "margen_bruto_creciente", "cumplido": True,
+                    "valores": {"margen_t": 0.43, "margen_t1": 0.40},
+                },
+                {
+                    "nombre": "rotacion_activos_creciente", "cumplido": False,
+                    "valores": {"rotacion_t": 0.9, "rotacion_t1": 0.95},
+                },
             ],
         },
         beneish={"disponible": False, "motivo": "no_calculable_con_datos_disponibles"},
-        magic={"disponible": True, "roic": 0.2, "earnings_yield": 0.08, "campos_faltantes": []},
+        magic={
+            "disponible": True, "roic": 0.2, "earnings_yield": 0.08, "campos_faltantes": [],
+            "ebit": 114_000.0, "capital_invertido": 570_000.0, "ev": 1_425_000.0,
+            "market_cap": 1_400_000.0, "total_debt": 100_000.0, "cash": 75_000.0,
+        },
         factors={"value": "alto", "quality": "alto", "momentum": "medio", "low_vol": "bajo"},
         roe=0.22,
         gross_margin=0.55,
@@ -553,11 +614,15 @@ async def test_handler_question_code_incompatible_con_kind_expired(context_kind,
 def test_payload_pil_contiene_pillars_y_total_pilares():
     ctx = _texto_libre_context()
     payload = ai_explain._build_explain_payload(ctx, "pil")
-    assert payload == {
-        "modelo": ai_explain._MODELO_PIL,
-        "pillars": ctx.pillars,
-        "total_pilares": len(ctx.pillars),
-    }
+    assert payload["modelo"] == ai_explain._MODELO_PIL
+    assert payload["pillars"] == ctx.pillars
+    assert payload["total_pilares"] == len(ctx.pillars)
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- campos nuevos
+    # para la cuenta resuelta.
+    assert payload["revenue_reciente"] == ctx.revenue_reciente
+    assert payload["revenue_antiguo"] == ctx.revenue_antiguo
+    assert payload["net_income_reciente"] == ctx.net_income_reciente
+    assert payload["net_income_antiguo"] == ctx.net_income_antiguo
 
 
 def test_payload_ver_contiene_veredicto_y_valor_justo_total():
@@ -583,6 +648,8 @@ def test_payload_rat_solo_contiene_ratios_relevantes():
     assert set(payload) == {
         "modelo", "ratio_liquidez", "liquidez_sin_pasivos_circulantes",
         "margen_bruto", "per", "per_no_aplicable", "ps",
+        "current_assets", "current_liabilities", "revenue", "cost_of_revenue",
+        "market_cap", "eps_ttm", "precio_actual",
     }
 
 
@@ -595,7 +662,12 @@ def test_payload_ren_solo_contiene_extras():
 def test_payload_rsk_solo_contiene_risk_fit():
     ctx = _texto_libre_context()
     payload = ai_explain._build_explain_payload(ctx, "rsk")
-    assert set(payload) == {"modelo", "encaja", "perfil", "beta", "etiqueta_activo"}
+    assert set(payload) == {
+        "modelo", "encaja", "perfil", "beta", "etiqueta_activo",
+        "beta_umbral_bajo", "beta_umbral_alto",
+    }
+    assert payload["beta_umbral_bajo"] == ai_explain.risk_fit.BETA_UMBRAL_BAJO
+    assert payload["beta_umbral_alto"] == ai_explain.risk_fit.BETA_UMBRAL_ALTO
 
 
 def test_payload_mom_contiene_momentum_y_vix():
@@ -612,6 +684,7 @@ def test_payload_cmp_solo_contiene_peer_comparison_relevante():
     assert set(payload) == {
         "modelo", "per_propio", "per_minimo_peers", "per_promedio_peers",
         "per_maximo_peers", "peers_usados", "posicion", "motivo_no_comparable",
+        "eps_ttm", "precio_actual",
     }
 
 
@@ -670,7 +743,12 @@ def test_payload_aqq_superficie_minima_dedicada():
     completo ni ningún otro campo."""
     ctx = _avanzado_context()
     payload = ai_explain._build_explain_payload(ctx, "aqq")
-    assert set(payload) == {"modelo", "quality", "roe", "gross_margin", "piotroski_ratio"}
+    assert set(payload) == {
+        "modelo", "quality", "roe", "gross_margin", "piotroski_ratio",
+        "roe_umbral_alto", "roe_umbral_bajo",
+        "gross_margin_umbral_alto", "gross_margin_umbral_bajo",
+        "piotroski_ratio_umbral_alto", "piotroski_ratio_umbral_bajo",
+    }
     assert payload["roe"] == ctx.roe
     assert payload["gross_margin"] == ctx.gross_margin
     assert payload["piotroski_ratio"] == pytest.approx(ctx.piotroski["puntaje"] / ctx.piotroski["criterios_evaluables"])
@@ -678,24 +756,28 @@ def test_payload_aqq_superficie_minima_dedicada():
 
 def test_payload_aqv_aqm_aql_superficie_minima():
     ctx = _avanzado_context()
-    assert set(ai_explain._build_explain_payload(ctx, "aqv")) == {"modelo", "value"}
+    aqv = ai_explain._build_explain_payload(ctx, "aqv")
+    assert set(aqv) == {"modelo", "value", "earnings_yield", "umbral_alto", "umbral_bajo"}
     assert set(ai_explain._build_explain_payload(ctx, "aqm")) == {"modelo", "momentum"}
     aql = ai_explain._build_explain_payload(ctx, "aql")
-    assert set(aql) == {"modelo", "low_vol", "beta"}
+    assert set(aql) == {"modelo", "low_vol", "beta", "beta_umbral_bajo", "beta_umbral_alto"}
     assert aql["beta"] == ctx.beta
 
 
 def test_payload_mgr_mge_solo_contienen_su_metrica():
     ctx = _avanzado_context()
     mgr = ai_explain._build_explain_payload(ctx, "mgr")
-    assert set(mgr) == {"modelo", "roic", "disponible"}
+    assert set(mgr) == {"modelo", "roic", "disponible", "ebit", "capital_invertido"}
     mge = ai_explain._build_explain_payload(ctx, "mge")
-    assert set(mge) == {"modelo", "earnings_yield", "disponible"}
+    assert set(mge) == {
+        "modelo", "earnings_yield", "disponible", "ebit", "ev", "market_cap", "total_debt", "cash",
+    }
 
 
 @pytest.mark.parametrize(
     "question_code",
-    [c for c, spec in ai_explain_content.QUESTIONS_TEXTO_LIBRE.items() if spec.requires_ollama],
+    [c for c, spec in ai_explain_content.QUESTIONS_TEXTO_LIBRE.items()
+     if spec.variant != ai_explain_content.VARIANT_DETERMINISTICO],
 )
 def test_payload_texto_libre_toda_pregunta_ollama_no_lanza_excepcion(question_code):
     """`evt`/`inf` (deterministic) quedan afuera -- nunca pasan por
@@ -722,11 +804,13 @@ def test_evt_inf_no_pasan_por_build_explain_payload():
 
 @pytest.mark.parametrize(
     "question_code",
-    [c for c, spec in ai_explain_content.QUESTIONS_TEXTO_LIBRE.items() if spec.requires_ollama],
+    [c for c, spec in ai_explain_content.QUESTIONS_TEXTO_LIBRE.items()
+     if spec.variant != ai_explain_content.VARIANT_DETERMINISTICO],
 )
 def test_payload_texto_libre_pregunta_ollama_incluye_modelo(question_code):
-    """Regla 5 de `SYSTEM_PROMPT_EXPLAIN`: toda pregunta que llama a Ollama
-    trae la clave "modelo" (síntesis narrativas "ver" incluida)."""
+    """Regla 5 de `SYSTEM_PROMPT_EXPLAIN`/`SYSTEM_PROMPT_PASO_A_PASO`: toda
+    pregunta que llama a Ollama (narrativa o paso a paso) trae la clave
+    "modelo" (síntesis narrativas "ver" incluida)."""
     ctx = _texto_libre_context()
     payload = ai_explain._build_explain_payload(ctx, question_code)
     assert "modelo" in payload
@@ -734,7 +818,8 @@ def test_payload_texto_libre_pregunta_ollama_incluye_modelo(question_code):
 
 @pytest.mark.parametrize(
     "question_code",
-    [c for c, spec in ai_explain_content.QUESTIONS_AVANZADO.items() if spec.requires_ollama and c != "mod"],
+    [c for c, spec in ai_explain_content.QUESTIONS_AVANZADO.items()
+     if spec.variant != ai_explain_content.VARIANT_DETERMINISTICO and c != "mod"],
 )
 def test_payload_avanzado_pregunta_ollama_incluye_modelo(question_code):
     ctx = _avanzado_context()
@@ -933,13 +1018,15 @@ async def test_fetch_explanation_num_predict_y_formato_correctos():
 
 
 # ---------------------------------------------------------------------------
-# H. Flujo completo del handler -- leaf con Ollama
+# H. Flujo completo del handler -- leaf con Ollama ("Explicame paso a paso",
+# callback_data=xp:{id}:p:{code})
 # ---------------------------------------------------------------------------
 
 
 async def test_handler_leaf_ollama_camino_feliz_orden_de_bloques():
-    """Formato exacto de la Decisión de diseño #5: header -> Dato ->
-    respuesta -> Fórmula/Fuente -> disclaimer, en ese orden."""
+    """Formato exacto de la Decisión de diseño #5 (extendida por
+    SDD_explicacion_paso_a_paso.md): header -> Dato -> Cuenta -> respuesta ->
+    Fórmula/Fuente -> disclaimer, en ese orden."""
     store = ai_explain.ExplanationContextStore()
     cid = store.put(_texto_libre_context())
     respuesta = "Graham estima un valor conservador cercano al dato mostrado arriba."
@@ -947,7 +1034,7 @@ async def test_handler_leaf_ollama_camino_feliz_orden_de_bloques():
     clients = _make_clients(http_client=client, ollama_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:gra")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:gra")
     await callback(update, context)
 
     query.answer.assert_awaited_once()
@@ -957,14 +1044,19 @@ async def test_handler_leaf_ollama_camino_feliz_orden_de_bloques():
     context.bot.edit_message_text.assert_awaited_once()
     _, kwargs = context.bot.edit_message_text.call_args
     texto = kwargs["text"]
+    assert kwargs["reply_markup"] is not None
 
     idx_header = texto.index(ai_rewrite.TRANSPARENCY_USED)
     idx_dato = texto.index("📌 Dato:")
+    idx_cuenta = texto.index("🧮 Cuenta:")
     idx_respuesta = texto.index(respuesta)
     idx_formula = texto.index("📐 Fórmula:")
     idx_fuente = texto.index("📊 Fuente del dato:")
     idx_disclaimer = texto.index(DISCLAIMER_NO_ASESORAMIENTO)
-    assert idx_header < idx_dato < idx_respuesta < idx_formula < idx_fuente < idx_disclaimer
+    assert (
+        idx_header < idx_dato < idx_cuenta < idx_respuesta
+        < idx_formula < idx_fuente < idx_disclaimer
+    )
     assert "Graham (EPS)" in texto
     assert "Conservador" in texto  # escenario elegido en el bloque Dato
 
@@ -978,7 +1070,7 @@ async def test_handler_leaf_dato_cambia_segun_ticker():
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
     cid_a = store.put(_texto_libre_context(ticker="ADBE"))
-    update_a, _, context_a = _fake_callback_update(f"xp:{cid_a}:vf")
+    update_a, _, context_a = _fake_callback_update(f"xp:{cid_a}:p:vf")
     await callback(update_a, context_a)
     texto_a = context_a.bot.edit_message_text.call_args.kwargs["text"]
 
@@ -987,7 +1079,7 @@ async def test_handler_leaf_dato_cambia_segun_ticker():
         precio_actual=10.0,
         scenarios={"conservador": {"valor_justo_multiplos": 5, "valor_justo_graham": 5, "valor_justo_dcf": 5, "valor_justo_total": 5.0}},
     ))
-    update_b, _, context_b = _fake_callback_update(f"xp:{cid_b}:vf")
+    update_b, _, context_b = _fake_callback_update(f"xp:{cid_b}:p:vf")
     await callback(update_b, context_b)
     texto_b = context_b.bot.edit_message_text.call_args.kwargs["text"]
 
@@ -1103,6 +1195,9 @@ async def test_menu_y_categoria_no_consumen_rate_limiter():
 
 
 async def test_leaf_con_ollama_si_consume_rate_limiter():
+    """"Explicame paso a paso" (`:p:`) SÍ consume el balde compartido --
+    "Ver dato" (`:vf:` a secas) NO lo consume, cubierto en la sección
+    "Ver dato" más abajo."""
     store = ai_explain.ExplanationContextStore()
     cid = store.put(_texto_libre_context())
     spy = _CountingClient()
@@ -1110,7 +1205,7 @@ async def test_leaf_con_ollama_si_consume_rate_limiter():
     limiter = FakeRateLimiter(allow_value=False)
     callback = _build_callback(clients, limiter, store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:vf")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
     await callback(update, context)
 
     context.bot.send_message.assert_awaited_once_with(
@@ -1311,7 +1406,7 @@ async def test_handler_bug1_produccion_simbolo_pesos_ya_no_se_rechaza():
     clients = _make_clients(http_client=client, ollama_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:vf")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
     await callback(update, context)
 
     context.bot.edit_message_text.assert_awaited_once()
@@ -1332,7 +1427,7 @@ async def test_handler_bug2_produccion_4_pilares_ya_no_se_rechaza():
     clients = _make_clients(http_client=client, ollama_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:pil")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:pil")
     await callback(update, context)
 
     context.bot.edit_message_text.assert_awaited_once()
@@ -1357,7 +1452,7 @@ async def test_handler_modelo_dcf_mencionado_por_ollama_no_se_rechaza():
     clients = _make_clients(http_client=client, ollama_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:vf")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
     await callback(update, context)
 
     context.bot.edit_message_text.assert_awaited_once()
@@ -1377,7 +1472,7 @@ async def test_handler_modelo_aqr_mencionado_por_ollama_no_se_rechaza():
     clients = _make_clients(http_client=client, ollama_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
-    update, query, context = _fake_callback_update(f"xp:{cid}:aqv")
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:aqv")
     await callback(update, context)
 
     context.bot.edit_message_text.assert_awaited_once()
@@ -1435,3 +1530,826 @@ def test_level1_cubre_todos_los_leaves_sueltos_y_categorias():
     assert codes_nivel1_tl == {"ver", "val", "cal", "rie", "inf"}
     codes_nivel1_av = {code for _, code in ai_explain_content.LEVEL1_AVANZADO}
     assert codes_nivel1_av == {"mod", "alt", "pio", "ben", "mag", "aqr"}
+
+
+# ---------------------------------------------------------------------------
+# Q. QuestionSpec.variant -- 27 preguntas clasificadas (SDD_explicacion_
+# paso_a_paso.md, Decisión de diseño #1)
+# ---------------------------------------------------------------------------
+
+
+def test_22_preguntas_dato_y_paso_a_paso():
+    todas = {**ai_explain_content.QUESTIONS_TEXTO_LIBRE, **ai_explain_content.QUESTIONS_AVANZADO}
+    con_paso_a_paso = [
+        c for c, s in todas.items() if s.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO
+    ]
+    assert len(con_paso_a_paso) == 22
+    for code in con_paso_a_paso:
+        spec = todas[code]
+        assert spec.pregunta_paso_a_paso
+        assert spec.pregunta_narrativa is None
+
+
+def test_3_preguntas_narrativa_mod_ben_ren():
+    todas = {**ai_explain_content.QUESTIONS_TEXTO_LIBRE, **ai_explain_content.QUESTIONS_AVANZADO}
+    narrativas = {
+        c for c, s in todas.items() if s.variant == ai_explain_content.VARIANT_NARRATIVA
+    }
+    assert narrativas == {"mod", "ben", "ren"}
+    for code in narrativas:
+        assert todas[code].pregunta_narrativa
+        assert todas[code].pregunta_paso_a_paso is None
+
+
+def test_2_preguntas_deterministico_evt_inf():
+    todas = {**ai_explain_content.QUESTIONS_TEXTO_LIBRE, **ai_explain_content.QUESTIONS_AVANZADO}
+    deterministicas = {
+        c for c, s in todas.items() if s.variant == ai_explain_content.VARIANT_DETERMINISTICO
+    }
+    assert deterministicas == {"evt", "inf"}
+
+
+# ---------------------------------------------------------------------------
+# R. 4ª forma de callback_data (xp:{id}:p:{code}) -- regex + dispatch
+# ---------------------------------------------------------------------------
+
+_TODAS_LAS_PREGUNTAS = {
+    **ai_explain_content.QUESTIONS_TEXTO_LIBRE, **ai_explain_content.QUESTIONS_AVANZADO,
+}
+_CODES_DATO_Y_PASO_A_PASO = [
+    c for c, s in _TODAS_LAS_PREGUNTAS.items() if s.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO
+]
+_CODES_NARRATIVA_O_DETERMINISTICO = [
+    c for c, s in _TODAS_LAS_PREGUNTAS.items() if s.variant != ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO
+]
+
+
+@pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
+def test_callback_paso_a_paso_regex_matchea_codes_dato_y_paso_a_paso(code):
+    m = ai_explain._CALLBACK_PASO_A_PASO_RE.fullmatch(f"xp:a1b2c3d4:p:{code}")
+    assert m is not None
+    assert m.group(1) == "a1b2c3d4"
+    assert m.group(2) == code
+
+
+@pytest.mark.parametrize("code", list(_TODAS_LAS_PREGUNTAS))
+def test_callback_paso_a_paso_nunca_matchea_el_regex_de_leaf(code):
+    """`_CALLBACK_PASO_A_PASO_RE` es mutuamente excluyente con
+    `_CALLBACK_LEAF_RE` -- ningún `callback_data` válido matchea las 2 formas
+    a la vez (mismo criterio que la revisión de `security`)."""
+    data_leaf = f"xp:a1b2c3d4:{code}"
+    data_paso_a_paso = f"xp:a1b2c3d4:p:{code}"
+    assert ai_explain._CALLBACK_LEAF_RE.fullmatch(data_leaf) is not None
+    assert ai_explain._CALLBACK_PASO_A_PASO_RE.fullmatch(data_leaf) is None
+    assert ai_explain._CALLBACK_PASO_A_PASO_RE.fullmatch(data_paso_a_paso) is not None
+    assert ai_explain._CALLBACK_LEAF_RE.fullmatch(data_paso_a_paso) is None
+    assert ai_explain._CALLBACK_MENU_RE.fullmatch(data_paso_a_paso) is None
+    assert ai_explain._CALLBACK_CATEGORY_RE.fullmatch(data_paso_a_paso) is None
+
+
+async def test_callback_paso_a_paso_con_code_de_variant_distinta_es_invalido():
+    """`xp:{id}:p:{code}` con un `code` de `variant` distinta a
+    `dato_y_paso_a_paso` (ej. `mod`, narrativa) responde `EXPLAIN_INVALID_MSG`
+    -- mismo camino que un `question_code` desconocido."""
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_avanzado_context())
+    spy = _CountingClient()
+    clients = _make_clients(http_client=spy, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:mod")
+    await callback(update, context)
+
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=_DEFAULT_CHAT_ID, text=ai_explain.EXPLAIN_INVALID_MSG
+    )
+    assert spy.call_count == 0
+
+
+async def test_callback_paso_a_paso_con_code_inexistente_es_invalido():
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    clients = _make_clients(http_client=_CountingClient())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:zzz")
+    await callback(update, context)
+
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=_DEFAULT_CHAT_ID, text=ai_explain.EXPLAIN_INVALID_MSG
+    )
+
+
+@pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
+def test_2_botones_ver_dato_y_paso_a_paso_para_cada_pregunta(code):
+    """Cada pregunta `dato_y_paso_a_paso` muestra 2 botones hermanos:
+    "📊 Ver dato" (`xp:{id}:{code}`) y "🎓 Explicame paso a paso"
+    (`xp:{id}:p:{code}`) -- test explícito por cada una de las 22 preguntas."""
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    spec = ai_explain_content.all_questions(kind)[code]
+    fila = ai_explain._leaf_rows("a1b2c3d4", code, spec)[0]
+    assert len(fila) == 2
+    assert fila[0].text == ai_explain._LABEL_VER_DATO
+    assert fila[0].callback_data == f"xp:a1b2c3d4:{code}"
+    assert fila[1].text == ai_explain._LABEL_PASO_A_PASO
+    assert fila[1].callback_data == f"xp:a1b2c3d4:p:{code}"
+
+
+@pytest.mark.parametrize("code", _CODES_NARRATIVA_O_DETERMINISTICO)
+def test_1_boton_sin_p_para_narrativa_y_deterministico(code):
+    """`mod`/`ben`/`ren`/`evt`/`inf` muestran exactamente 1 botón,
+    `callback_data=xp:{id}:{code}` -- sin botón `:p:`."""
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    spec = ai_explain_content.all_questions(kind)[code]
+    fila = ai_explain._leaf_rows("a1b2c3d4", code, spec)[0]
+    assert len(fila) == 1
+    assert fila[0].callback_data == f"xp:a1b2c3d4:{code}"
+    assert ":p:" not in fila[0].callback_data
+
+
+# ---------------------------------------------------------------------------
+# S. Menú siempre presente -- Decisión de diseño #2
+# ---------------------------------------------------------------------------
+
+
+def test_category_of_exhaustivo_27_preguntas():
+    esperado_texto_libre = {
+        "ver": None, "vf": "val", "gra": "val", "dcf": "val", "mul": "val", "rat": "val",
+        "pil": "cal", "ren": "cal", "rsk": "rie", "mom": "rie", "cmp": "rie", "evt": "rie",
+        "inf": None,
+    }
+    for code, esperado in esperado_texto_libre.items():
+        assert ai_explain_content.category_of("texto_libre", code) == esperado
+
+    esperado_avanzado = {
+        "mod": None, "alz": "alt", "azp": "alt", "pig": "pio", "pir": "pio", "pia": "pio",
+        "pie": "pio", "ben": None, "mgr": "mag", "mge": "mag",
+        "aqv": "aqr", "aqq": "aqr", "aqm": "aqr", "aql": "aqr",
+    }
+    for code, esperado in esperado_avanzado.items():
+        assert ai_explain_content.category_of("avanzado", code) == esperado
+
+
+def test_build_response_keyboard_pregunta_con_categoria_es_nivel2():
+    ctx = _texto_libre_context()
+    markup = ai_explain.build_response_keyboard("texto_libre", "a1b2c3d4", "gra", ctx)
+    codes = [fila[0].callback_data.split(":")[-1] for fila in markup.inline_keyboard]
+    assert codes == ["vf", "gra", "dcf", "mul", "rat", "m"]  # Nivel 2 de "val"
+
+
+def test_build_response_keyboard_pregunta_suelta_es_nivel1():
+    ctx = _texto_libre_context()
+    markup = ai_explain.build_response_keyboard("texto_libre", "a1b2c3d4", "ver", ctx)
+    codes = [fila[0].callback_data.split(":")[-1] for fila in markup.inline_keyboard]
+    assert codes == ["ver", "val", "cal", "rie", "inf"]  # Nivel 1
+
+
+def test_build_response_keyboard_kind_correcto_no_se_cruza():
+    """Caso explícito de `qa`: para las preguntas sueltas, el teclado de
+    Nivel 1 adjunto es el de su `kind` correcto -- nunca se cruza con el
+    teclado del otro `kind`."""
+    markup_tl = ai_explain.build_response_keyboard("texto_libre", "a1b2c3d4", "ver", _texto_libre_context())
+    codes_tl = {fila[0].callback_data.split(":")[-1] for fila in markup_tl.inline_keyboard}
+    assert codes_tl == {"ver", "val", "cal", "rie", "inf"}
+
+    markup_av = ai_explain.build_response_keyboard("avanzado", "a1b2c3d4", "mod", _avanzado_context())
+    codes_av = {fila[0].callback_data.split(":")[-1] for fila in markup_av.inline_keyboard}
+    assert codes_av == {"mod", "alt", "pio", "ben", "mag", "aqr"}
+
+
+async def test_ver_dato_lleva_reply_markup_de_nivel2():
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    clients = _make_clients(http_client=_CountingClient())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:gra")
+    await callback(update, context)
+
+    _, kwargs = context.bot.send_message.call_args
+    assert kwargs["reply_markup"] is not None
+    codes = [fila[0].callback_data.split(":")[-1] for fila in kwargs["reply_markup"].inline_keyboard]
+    assert codes == ["vf", "gra", "dcf", "mul", "rat", "m"]
+
+
+async def test_narrativa_lleva_reply_markup_de_nivel2():
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    client = _client_with_handler(_ok_handler("Corto."))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:ren")
+    await callback(update, context)
+
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert kwargs["reply_markup"] is not None
+    codes = [fila[0].callback_data.split(":")[-1] for fila in kwargs["reply_markup"].inline_keyboard]
+    assert codes == ["pil", "ren", "m"]
+
+
+async def test_evt_inf_llevan_reply_markup():
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    clients = _make_clients(http_client=_CountingClient())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    for code in ("evt", "inf"):
+        update, query, context = _fake_callback_update(f"xp:{cid}:{code}")
+        await callback(update, context)
+        _, kwargs = context.bot.send_message.call_args
+        assert kwargs["reply_markup"] is not None
+
+
+@pytest.mark.parametrize(
+    "kind,category_code,codes_esperados",
+    [
+        ("texto_libre", "val", ["vf", "gra", "dcf", "mul", "rat"]),
+        ("texto_libre", "cal", ["pil", "ren"]),
+        ("texto_libre", "rie", ["rsk", "mom", "cmp", "evt"]),
+        ("avanzado", "alt", ["alz", "azp"]),
+        ("avanzado", "pio", ["pig", "pir", "pia", "pie"]),
+        ("avanzado", "mag", ["mgr", "mge"]),
+        ("avanzado", "aqr", ["aqv", "aqq", "aqm", "aql"]),
+    ],
+)
+async def test_reply_markup_4_categorias_texto_libre_y_4_avanzado(kind, category_code, codes_esperados):
+    """"Ver dato" y "Explicame paso a paso" de cualquier pregunta con
+    categoría llevan el mismo teclado de Nivel 2 -- test por cada una de
+    las 4 categorías de texto libre + 4 de /avanzado."""
+    ctx = _texto_libre_context() if kind == "texto_libre" else _avanzado_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    code_muestra = codes_esperados[0]
+    respuesta = "Respuesta corta de prueba."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    # "Ver dato"
+    update, _, context = _fake_callback_update(f"xp:{cid}:{code_muestra}")
+    await callback(update, context)
+    _, kwargs = context.bot.send_message.call_args
+    codes = [fila[0].callback_data.split(":")[-1] for fila in kwargs["reply_markup"].inline_keyboard]
+    assert codes[:-1] == codes_esperados if kind == "avanzado" else True
+    assert codes[-1] == "m"
+
+    # "Explicame paso a paso"
+    update2, _, context2 = _fake_callback_update(f"xp:{cid}:p:{code_muestra}")
+    await callback(update2, context2)
+    _, kwargs2 = context2.bot.edit_message_text.call_args
+    codes2 = [fila[0].callback_data.split(":")[-1] for fila in kwargs2["reply_markup"].inline_keyboard]
+    assert codes2[-1] == "m"
+
+
+async def test_regresion_negativa_ningun_envio_de_dispatch_leaf_sin_reply_markup():
+    """Test de regresión negativo: TODAS las llamadas a `send_message`/
+    `edit_message_text` de `_dispatch_leaf` incluyen `reply_markup` no-`None`
+    -- barrido de las 3 ramas (determinístico, narrativa, paso a paso)."""
+    store = ai_explain.ExplanationContextStore()
+    cid_tl = store.put(_texto_libre_context())
+    cid_av = store.put(_avanzado_context())
+    client = _client_with_handler(_ok_handler("Respuesta corta de prueba."))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    casos = [
+        (cid_tl, "evt"), (cid_tl, "inf"),          # deterministico
+        (cid_tl, "ren"), (cid_av, "mod"), (cid_av, "ben"),  # narrativa
+        (cid_tl, "gra"), (cid_av, "alz"),          # "Ver dato"
+        (cid_tl, "p:gra"), (cid_av, "p:alz"),      # "paso a paso"
+    ]
+    for cid, suffix in casos:
+        update, _, context = _fake_callback_update(f"xp:{cid}:{suffix}")
+        await callback(update, context)
+        send_calls = context.bot.send_message.call_args_list
+        edit_calls = context.bot.edit_message_text.call_args_list
+        todas = send_calls + edit_calls
+        assert todas, f"sin ninguna llamada para {suffix}"
+        _, kwargs = todas[-1]
+        assert kwargs.get("reply_markup") is not None, f"reply_markup ausente para {suffix}"
+
+
+# ---------------------------------------------------------------------------
+# T. "Ver dato" -- botón determinístico nuevo, generalizado a las 22
+# preguntas dato_y_paso_a_paso (Decisión de diseño #9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
+async def test_ver_dato_nunca_llama_a_ollama_ni_manda_pensando_ni_consume_balde(code):
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    ctx = _texto_libre_context() if kind == "texto_libre" else _avanzado_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    spy = _CountingClient()
+    clients = _make_clients(http_client=spy, ollama_config=_enabled_config())
+    limiter = FakeRateLimiter(allow_value=True)
+    callback = _build_callback(clients, limiter, store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:{code}")
+    await callback(update, context)
+
+    assert spy.call_count == 0
+    context.bot.edit_message_text.assert_not_called()
+    context.bot.send_message.assert_awaited_once()
+    _, kwargs = context.bot.send_message.call_args
+    assert kwargs["text"] != ai_explain.EXPLAIN_PENDING_MSG
+    assert limiter.calls_with_key == []
+
+
+@pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
+async def test_ver_dato_incluye_dato_formula_fuente_nunca_cuenta_ni_disclaimer(code):
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    ctx = _texto_libre_context() if kind == "texto_libre" else _avanzado_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    clients = _make_clients(http_client=_CountingClient())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:{code}")
+    await callback(update, context)
+
+    _, kwargs = context.bot.send_message.call_args
+    texto = kwargs["text"]
+    assert texto.startswith(ai_explain.DETERMINISTIC_PREFIX)
+    assert "📌 Dato:" in texto
+    assert "🧮 Cuenta:" not in texto
+    assert DISCLAIMER_NO_ASESORAMIENTO not in texto
+    formula = ai_explain_content.formulas(kind).get(code)
+    fuente = ai_explain_content.fuentes(kind).get(code)
+    if formula:
+        assert "📐 Fórmula:" in texto
+    if fuente:
+        assert "📊 Fuente del dato:" in texto
+
+
+# ---------------------------------------------------------------------------
+# U. "🧮 Cuenta" -- 100% Python, dispatch de las 22 preguntas
+# (SDD_explicacion_paso_a_paso.md, Decisión de diseño #3/#4)
+# ---------------------------------------------------------------------------
+
+
+def test_build_cuenta_line_es_funcion_pura_sin_io():
+    """Mismo criterio de testabilidad que `_build_dato_line` -- `dict` de
+    entrada -> `Optional[str]`, callable directo sin mockear nada."""
+    import inspect
+    assert not inspect.iscoroutinefunction(ai_explain._build_cuenta_line)
+
+
+def test_cuenta_alz_verificada_termino_a_termino_ejemplo_de_daniela():
+    """Ejemplo textual EXACTO de Daniela (Contexto, punto 1 de la spec)."""
+    a, b, c, d, e = 0.34, 0.12, 0.18, 1.05, 0.87
+    z = 1.2 * a + 1.4 * b + 3.3 * c + 0.6 * d + 1.0 * e
+    datos = {"altman": {"disponible": True, "a": a, "b": b, "c": c, "d": d, "e": e, "z": z}}
+    cuenta = ai_explain._build_cuenta_line("avanzado", "alz", datos)
+    assert cuenta == (
+        "Z = 1.2×0.34 + 1.4×0.12 + 3.3×0.18 + 0.6×1.05 + 1.0×0.87 = "
+        "0.41 + 0.17 + 0.59 + 0.63 + 0.87 = 2.67"
+    )
+
+
+def test_cuenta_azp_verificada_termino_a_termino_ejemplo_de_daniela():
+    a, b, c, d = 0.34, 0.12, 0.18, 1.05
+    z = 6.56 * a + 3.26 * b + 6.72 * c + 1.05 * d
+    datos = {"altman_pp": {"disponible": True, "a": a, "b": b, "c": c, "d": d, "e": None, "z": z}}
+    cuenta = ai_explain._build_cuenta_line("avanzado", "azp", datos)
+    assert cuenta == (
+        "Z'' = 6.56×0.34 + 3.26×0.12 + 6.72×0.18 + 1.05×1.05 = "
+        "2.23 + 0.39 + 1.21 + 1.10 = 4.93"
+    )
+
+
+def test_cuenta_alz_no_calculable_ausente_sin_none_visible():
+    datos = {"altman": {"disponible": False, "campos_faltantes": ["ebit"]}}
+    assert ai_explain._build_cuenta_line("avanzado", "alz", datos) is None
+
+
+def test_cuenta_azp_no_calculable_ausente():
+    datos = {"altman_pp": {"disponible": False, "campos_faltantes": ["ebit"]}}
+    assert ai_explain._build_cuenta_line("avanzado", "azp", datos) is None
+
+
+def test_cuenta_pir_verificada_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "pir")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "pir", datos)
+    assert cuenta == (
+        "Ganancia Neta: $118.00 > 0 → cumplido · CFO: $118.00 > 0 → cumplido · "
+        "ROA: 0.18 > 0.15 → cumplido · CFO > Utilidad: $118.00 > $97.00 → no cumplido"
+    )
+
+
+def test_cuenta_pia_verificada_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "pia")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "pia", datos)
+    assert cuenta == (
+        "Apalancamiento: 0.20 < 0.30 → cumplido · Liquidez: 1.10 > 1.30 → no cumplido · "
+        "Acciones en circulación: 100.00 ≤ 102.00 → cumplido"
+    )
+
+
+def test_cuenta_pie_verificada_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "pie")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "pie", datos)
+    assert cuenta == (
+        "Margen bruto: 43.0% > 40.0% → cumplido · Rotación de activos: 0.90 > 0.95 → no cumplido"
+    )
+
+
+def test_cuenta_pig_conteo_simple():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "pig")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "pig", datos)
+    assert cuenta == "7 de 9 criterios evaluables cumplidos"
+
+
+def test_cuenta_pig_evaluables_0_no_calculable():
+    datos = {"piotroski": {"puntaje": 0, "criterios_evaluables": 0}}
+    assert ai_explain._build_cuenta_line("avanzado", "pig", datos) is None
+
+
+@pytest.mark.parametrize("code", ["pir", "pia", "pie"])
+def test_cuenta_piotroski_criterio_no_evaluable_se_omite_sin_none_visible(code):
+    ctx = _avanzado_context(piotroski={
+        "puntaje": 0, "criterios_evaluables": 0, "criterios_totales": 9,
+        "criterios": [
+            {"nombre": n, "cumplido": None, "valores": None}
+            for n in ("roa_positivo", "cfo_positivo", "roa_creciente", "cfo_mayor_utilidad",
+                      "apalancamiento_decreciente", "liquidez_creciente", "sin_dilucion",
+                      "margen_bruto_creciente", "rotacion_activos_creciente")
+        ],
+    })
+    datos = ai_explain._build_explain_payload(ctx, code)
+    assert ai_explain._build_cuenta_line("avanzado", code, datos) is None
+
+
+def test_cuenta_mgr_verificada_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "mgr")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mgr", datos)
+    assert cuenta == "ROIC = $114,000.00 / $570,000.00 = 0.20 = 20.0%"
+
+
+def test_cuenta_mge_verificada_termino_a_termino_muestra_armado_de_ev():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "mge")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mge", datos)
+    assert cuenta == (
+        "EY = $114,000.00 / ($1,400,000.00 + $100,000.00 − $75,000.00) = "
+        "$114,000.00 / $1,425,000.00 = 0.08 = 8.0%"
+    )
+
+
+def test_cuenta_mgr_mge_no_disponible_ausente():
+    ctx = _avanzado_context(magic={"disponible": False, "campos_faltantes": ["ebit"]})
+    assert ai_explain._build_cuenta_line(
+        "avanzado", "mgr", ai_explain._build_explain_payload(ctx, "mgr")
+    ) is None
+    assert ai_explain._build_cuenta_line(
+        "avanzado", "mge", ai_explain._build_explain_payload(ctx, "mge")
+    ) is None
+
+
+def test_cuenta_aqv_entre_umbrales():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aqv")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aqv", datos)
+    assert "Earnings Yield 8.0%" in cuenta
+    assert "→ alto" in cuenta
+
+
+def test_cuenta_aqq_suma_de_sub_metricas():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aqq")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aqq", datos)
+    assert "ROE 22.0%" in cuenta
+    assert "Margen bruto 55.0%" in cuenta
+    assert "→ alto" in cuenta
+
+
+def test_cuenta_aqm_reutiliza_etiqueta():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aqm")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aqm", datos)
+    assert cuenta == "Factor Momentum: medio"
+
+
+def test_cuenta_aql_beta_bucket():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aql")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aql", datos)
+    assert cuenta == "Beta 1.05 está entre 0.80 y 1.20 → bajo"
+
+
+def test_cuenta_ver_precio_vs_valor_justo():
+    # `_texto_libre_context()` fija `veredicto_barata=True` directamente
+    # (mismo valor ya calculado por `pillars.precio_razonable`, no
+    # recomputado acá) -- la cuenta usa ese veredicto para elegir el
+    # operador/etiqueta, nunca vuelve a comparar precio vs. valor justo.
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "ver", datos)
+    assert cuenta == "Precio actual $550.00 < Valor Justo Total $496.00 → Barata"
+
+
+def test_cuenta_ver_cara_cuando_veredicto_es_false():
+    ctx = _texto_libre_context(veredicto_barata=False)
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "ver", datos)
+    assert cuenta == "Precio actual $550.00 > Valor Justo Total $496.00 → Cara"
+
+
+def test_cuenta_vf_suma_de_modelos_calculables():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "vf")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "vf", datos)
+    assert cuenta == "($500.00 + $480.00 + $510.00) / 3 = $496.00"
+
+
+def test_cuenta_gra_con_numeros_reales():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "gra")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "gra", datos)
+    assert cuenta == "$8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00"
+
+
+def test_cuenta_mul_con_numeros_reales():
+    ctx = _texto_libre_context(peer_comparison={
+        "per_propio": 22.5, "per_minimo_peers": 18.0, "per_promedio_peers": 24.0,
+        "per_maximo_peers": 30.0, "peers_usados": ["MSFT", "CRM"],
+        "posicion": "en_linea", "motivo_no_comparable": None,
+    })
+    datos = ai_explain._build_explain_payload(ctx, "mul")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "mul", datos)
+    assert cuenta == "$8.20 × 24.00 = $500.00"
+
+
+def test_cuenta_rat_4_sub_cuentas():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "rat")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "rat", datos)
+    assert "Liquidez = $100.00 / $50.00 = 1.80" in cuenta
+    assert "Margen bruto = ($1,000.00 − $400.00) / $1,000.00 = 65.0%" in cuenta
+    assert "PER = $550.00 / $8.20 = 22.50" in cuenta
+    assert "P/S = $2,000,000.00 / $1,000.00 = 6.20" in cuenta
+
+
+def test_cuenta_rat_solo_las_sub_cuentas_con_dato():
+    ctx = _texto_libre_context(current_assets=None, current_liabilities=None)
+    datos = ai_explain._build_explain_payload(ctx, "rat")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "rat", datos)
+    assert "Liquidez" not in cuenta
+    assert "Margen bruto" in cuenta
+
+
+def test_cuenta_pil_4_criterios_con_numeros():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "pil")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "pil", datos)
+    assert "Ingresos: $1,000.00 > $800.00 → creciente" in cuenta
+    assert "Utilidades: $200.00 > 0 y > $150.00 → creciente" in cuenta
+    assert "Deuda: liquidez 1.80 > 1 → controlada" in cuenta
+    assert "Precio: → no razonable" in cuenta
+
+
+def test_cuenta_rsk_beta_entre_umbrales():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "rsk")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "rsk", datos)
+    assert cuenta == "Beta 1.15 está entre 0.80 y 1.20 → perfil Moderado"
+
+
+def test_cuenta_mom_hasta_4_sub_cuentas():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "mom")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "mom", datos)
+    assert "vs. máx. 52 sem." in cuenta
+    assert "vs. mín. 52 sem." in cuenta
+    assert "vs. promedio 50d" in cuenta
+    assert "vs. promedio 200d" in cuenta
+
+
+def test_cuenta_cmp_per_propio_y_peers():
+    # `per_propio` ya viaja pre-calculado en `peer_comparison` (22.5 en el
+    # fixture) -- la cuenta lo muestra tal cual, nunca recalcula
+    # precio/eps_ttm (esos 2 números son solo para mostrar el armado).
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "cmp")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "cmp", datos)
+    assert cuenta == "PER propio = $550.00 / $8.20 = 22.50 — PER promedio peers = 24.00"
+
+
+# --- DCF -- cuenta PARCIAL (Decisión de diseño #7) -------------------------
+
+
+def test_cuenta_dcf_wacc_y_g_sustituidos_proyeccion_resumida():
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "dcf")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "dcf", datos)
+    assert "FCF base $109.00" in cuenta
+    assert "g=8.3%" in cuenta
+    assert "WACC=9.1%" in cuenta
+    assert "FCF proyectado año 5" in cuenta
+    assert "$510.00 por acción." in cuenta
+    # No lista los 5 años individualmente -- comportamiento esperado (D1).
+    assert "año 1" not in cuenta and "año 2" not in cuenta and "año 3" not in cuenta
+    assert cuenta.count("año") == 1
+
+
+def test_cuenta_dcf_no_calculable_ausente():
+    ctx = _texto_libre_context(scenarios={
+        "conservador": {"valor_justo_dcf": None, "dcf_wacc": None, "dcf_g_fcf": None},
+    })
+    datos = ai_explain._build_explain_payload(ctx, "dcf")
+    assert ai_explain._build_cuenta_line("texto_libre", "dcf", datos) is None
+
+
+def test_cuenta_dcf_usa_dcfbreakdown_no_recalcula(monkeypatch):
+    """`_build_cuenta_line("texto_libre", "dcf", ...)` no vuelve a llamar
+    `calculate_dcf_fair_value` -- lee únicamente del payload ya armado."""
+    llamadas = []
+    original = ai_explain.valuation.calculate_dcf_fair_value
+
+    def spy(*args, **kwargs):
+        llamadas.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ai_explain.valuation, "calculate_dcf_fair_value", spy)
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "dcf")
+    ai_explain._build_cuenta_line("texto_libre", "dcf", datos)
+    assert llamadas == []
+
+
+# --- Cuenta entra al payload ANTES del guard (Decisión de diseño #4) ------
+
+
+async def test_cuenta_entra_a_datos_del_contexto_antes_del_guard():
+    """Un número presente SOLO en la cuenta (no en ningún otro campo del
+    payload) es aceptado por `_no_new_protected_tokens` si Ollama lo cita."""
+    ctx = _avanzado_context()
+    respuesta = "El primer término de la cuenta, 0.41, refleja el capital de trabajo."
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:alz")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert respuesta in kwargs["text"]
+    assert kwargs["text"] != ai_explain.EXPLAIN_UNAVAILABLE_MSG
+
+
+async def test_guard_extendido_sigue_rechazando_alucinacion_con_cuenta_presente():
+    ctx = _avanzado_context()
+    respuesta = "El resultado final es 987654.0%, un número inventado."
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:alz")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert kwargs["text"] == ai_explain.EXPLAIN_UNAVAILABLE_MSG
+
+
+# --- _MAX_CUENTA_CHARS=400 -- omitir, nunca truncar un número a la mitad
+# (mejora recomendada (c) de `security`) -----------------------------------
+
+
+def test_max_cuenta_chars_cuenta_corta_no_se_toca():
+    corta = "Z = 1.2×0.34 = 0.41"
+    assert ai_explain._enforce_cuenta_length(corta) == corta
+
+
+def test_max_cuenta_chars_cuenta_larga_se_omite_no_trunca(caplog):
+    larga = "X" * (ai_explain._MAX_CUENTA_CHARS + 1)
+    with caplog.at_level(logging.WARNING):
+        resultado = ai_explain._enforce_cuenta_length(larga)
+    assert resultado is None
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_build_cuenta_line_omite_si_la_cuenta_construida_excede_el_limite(monkeypatch):
+    monkeypatch.setitem(ai_explain._CUENTA_TEXTO_LIBRE, "ver", lambda datos: "Y" * 500)
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    assert ai_explain._build_cuenta_line("texto_libre", "ver", datos) is None
+
+
+def test_build_cuenta_line_atrapa_excepciones_como_no_calculable(monkeypatch):
+    def _explota(datos):
+        raise KeyError("boom")
+
+    monkeypatch.setitem(ai_explain._CUENTA_TEXTO_LIBRE, "ver", _explota)
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    assert ai_explain._build_cuenta_line("texto_libre", "ver", datos) is None
+
+
+def test_build_cuenta_line_question_code_sin_cuenta_devuelve_none():
+    assert ai_explain._build_cuenta_line("texto_libre", "ren", {}) is None
+    assert ai_explain._build_cuenta_line("avanzado", "mod", {}) is None
+
+
+# --- SYSTEM_PROMPT_PASO_A_PASO exclusivo del camino dato_y_paso_a_paso ----
+
+
+async def test_system_prompt_paso_a_paso_usado_solo_en_dato_y_paso_a_paso():
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": "Corto."})})
+
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    client = _client_with_handler(handler)
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
+    await callback(update, context)
+    assert captured["body"]["system"] == ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+
+
+async def test_system_prompt_explain_usado_en_narrativa():
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": "Corto."})})
+
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    client = _client_with_handler(handler)
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:ren")
+    await callback(update, context)
+    assert captured["body"]["system"] == ai_explain.SYSTEM_PROMPT_EXPLAIN
+
+
+def test_system_prompt_paso_a_paso_pide_json_y_no_recalcular():
+    assert "{\"respuesta\"" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+    assert "cuenta" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+    assert "YA ESTÁ CALCULADA" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+
+
+# ---------------------------------------------------------------------------
+# V. Barrido -- ningún mensaje generado contiene "None"/"null" como si fuera
+# un valor calculado (caso de alto riesgo de negocio, criterio de `qa`)
+# ---------------------------------------------------------------------------
+
+
+_NONE_VISIBLE_RE = re.compile(r"\bNone\b|\bnull\b")
+
+
+@pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
+def test_ver_dato_nunca_muestra_none_ni_con_los_4_modelos_no_calculables(code):
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    if kind == "texto_libre":
+        ctx = _texto_libre_context(
+            scenarios={"conservador": {}}, ratios={}, risk_fit={}, momentum={}, peer_comparison={},
+            pillars={}, veredicto_barata=None,
+            current_assets=None, current_liabilities=None, revenue=None, cost_of_revenue=None,
+            market_cap=None, eps_ttm=None, y_value=None,
+            revenue_reciente=None, revenue_antiguo=None, net_income_reciente=None, net_income_antiguo=None,
+            year_high=None, year_low=None, price_avg_50=None, price_avg_200=None,
+        )
+    else:
+        ctx = _avanzado_context(
+            altman={"disponible": False, "campos_faltantes": ["x"]},
+            altman_pp={"disponible": False, "campos_faltantes": ["x"]},
+            magic={"disponible": False, "campos_faltantes": ["x"]},
+            piotroski={"puntaje": 0, "criterios_evaluables": 0, "criterios_totales": 9, "criterios": []},
+            factors={"value": "no_disponible", "quality": "no_disponible", "momentum": "no_disponible", "low_vol": "no_disponible"},
+            roe=None, gross_margin=None, beta=None,
+        )
+    texto = ai_explain._build_ver_dato_content(ctx, code)
+    assert not _NONE_VISIBLE_RE.search(texto), f"'None'/'null' visible para {code}: {texto}"
+
+
+@pytest.mark.parametrize("code", ["alz", "azp", "mgr", "mge", "pir", "pia", "pie", "pig"])
+def test_cuenta_4_modelos_todo_o_nada_no_calculables_sin_none_visible(code):
+    ctx = _avanzado_context(
+        altman={"disponible": False, "campos_faltantes": ["x"]},
+        altman_pp={"disponible": False, "campos_faltantes": ["x"]},
+        magic={"disponible": False, "campos_faltantes": ["x"]},
+        piotroski={"puntaje": 0, "criterios_evaluables": 0, "criterios_totales": 9, "criterios": []},
+    )
+    datos = ai_explain._build_explain_payload(ctx, code)
+    cuenta = ai_explain._build_cuenta_line("avanzado", code, datos)
+    assert cuenta is None

@@ -8,11 +8,17 @@ los botones `xp:{context_id}:...` de AMBOS flujos (texto libre y
 `/avanzado`) — el `ExplanationContext.kind` guardado, no el módulo que lo
 generó, decide qué tabla/prompt/datos usar.
 
-3 formas de `callback_data` (Decisión de diseño #1 de la spec):
+4 formas de `callback_data` (Decisión de diseño #1 de `SDD_menu_por_capas_
+explicaciones.md`, extendida por `SDD_explicacion_paso_a_paso.md`):
 - `xp:{id}:m`        -> menú de Nivel 1 (categorías + leaves sueltos)
 - `xp:{id}:c:{cat}`  -> botones de Nivel 2 de una categoría + "🔙 Menú"
-- `xp:{id}:{code}`   -> pregunta puntual (leaf) — determinística o vía
-  Ollama según `QuestionSpec.requires_ollama` (`ai_explain_content.py`)
+- `xp:{id}:{code}`   -> "Ver dato" -- pregunta puntual (leaf), según
+  `QuestionSpec.variant` (`ai_explain_content.py`): determinístico sin
+  Ollama para `dato_y_paso_a_paso`/`deterministico`, o llama a Ollama con
+  `SYSTEM_PROMPT_EXPLAIN` para `narrativa`.
+- `xp:{id}:p:{code}` -> "Explicame paso a paso" -- solo preguntas
+  `variant="dato_y_paso_a_paso"`; llama a Ollama con la cuenta ya resuelta
+  (100% Python) inyectada al payload y `SYSTEM_PROMPT_PASO_A_PASO`.
 
 Guard de integridad (heredado sin aflojar): la respuesta de Ollama puede
 usar cualquier SUBCONJUNTO de los tokens protegidos que le pasamos, pero
@@ -50,7 +56,7 @@ import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
-from investbot import ai_explain_content, ai_rewrite, summary
+from investbot import advanced_scoring, ai_explain_content, ai_rewrite, risk_fit, summary, valuation
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +120,25 @@ class ExplanationContext:
     income_statement_fuente: Optional[str] = None
     cash_flow_fuente: Optional[str] = None
     peers_note: Optional[str] = None
+    # --- campos nuevos para "Explicame paso a paso" (kind="texto_libre") --
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- todos ya se
+    # calculaban en `query_handler.fetch_and_analyze_parts` y se descartaban;
+    # cero llamadas HTTP nuevas.
+    eps_ttm: Optional[float] = None
+    y_value: Optional[float] = None
+    current_assets: Optional[float] = None
+    current_liabilities: Optional[float] = None
+    revenue: Optional[float] = None
+    cost_of_revenue: Optional[float] = None
+    market_cap: Optional[float] = None
+    revenue_reciente: Optional[float] = None
+    revenue_antiguo: Optional[float] = None
+    net_income_reciente: Optional[float] = None
+    net_income_antiguo: Optional[float] = None
+    year_high: Optional[float] = None
+    year_low: Optional[float] = None
+    price_avg_50: Optional[float] = None
+    price_avg_200: Optional[float] = None
     # --- payload específico de /avanzado (kind="avanzado") ---
     sector: Optional[str] = None
     industry: Optional[str] = None
@@ -210,10 +235,19 @@ def _get_owned_context(
 _CALLBACK_MENU_RE = re.compile(r"^xp:([0-9a-f]{8}):m$")
 _CALLBACK_CATEGORY_RE = re.compile(r"^xp:([0-9a-f]{8}):c:([a-z]{2,4})$")
 _CALLBACK_LEAF_RE = re.compile(r"^xp:([0-9a-f]{8}):([a-z]{2,4})$")
+# 4ª forma (Decisión de diseño #1 de SDD_explicacion_paso_a_paso.md) --
+# mutuamente excluyente con `_CALLBACK_LEAF_RE`: el segmento ":p:" siempre
+# contiene un ":" (p. ej. "p:alz"), que rompe el patrón `[a-z]{2,4}$` de
+# `_CALLBACK_LEAF_RE` (confirmado por `security`, sección "Confirmaciones").
+_CALLBACK_PASO_A_PASO_RE = re.compile(r"^xp:([0-9a-f]{8}):p:([a-z]{2,4})$")
 
 _ALL_CATEGORY_CODES = frozenset(ai_explain_content.CATEGORIES_TEXTO_LIBRE) | frozenset(
     ai_explain_content.CATEGORIES_AVANZADO
 )
+_ALL_QUESTIONS_COMBINED: dict[str, ai_explain_content.QuestionSpec] = {
+    **ai_explain_content.QUESTIONS_TEXTO_LIBRE,
+    **ai_explain_content.QUESTIONS_AVANZADO,
+}
 
 
 # --- Sanitización de sector/industry (hallazgo 1 BLOQUEANTE de `security`,
@@ -302,19 +336,40 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "valor_justo_dcf": escenario.get("valor_justo_dcf"),
             "valor_justo_total": escenario.get("valor_justo_total"),
         }
-    if question_code in ("gra", "dcf", "mul"):
-        campo = {
-            "gra": "valor_justo_graham",
-            "dcf": "valor_justo_dcf",
-            "mul": "valor_justo_multiplos",
-        }[question_code]
-        modelo = {"gra": "Graham (EPS)", "dcf": "DCF", "mul": "Múltiplos"}[question_code]
-        return {
+    if question_code in ("gra", "mul"):
+        campo = {"gra": "valor_justo_graham", "mul": "valor_justo_multiplos"}[question_code]
+        modelo = {"gra": "Graham (EPS)", "mul": "Múltiplos"}[question_code]
+        esc_elegido = scenarios.get(context.escenario_elegido) or {}
+        payload = {
             "modelo": modelo,
             "escenario_elegido": context.escenario_elegido,
             "pesimista": (scenarios.get("pesimista") or {}).get(campo),
             "conservador": (scenarios.get("conservador") or {}).get(campo),
             "optimista": (scenarios.get("optimista") or {}).get(campo),
+        }
+        if question_code == "gra":
+            payload["eps_ttm"] = context.eps_ttm
+            payload["y_value"] = context.y_value
+            payload["g_aplicado"] = esc_elegido.get("graham_g_aplicado")
+        else:  # mul
+            pc = context.peer_comparison or {}
+            payload["eps_ttm"] = context.eps_ttm
+            payload["per_promedio_peers"] = pc.get("per_promedio_peers")
+        return payload
+    if question_code == "dcf":
+        esc_elegido = scenarios.get(context.escenario_elegido) or {}
+        return {
+            "modelo": "DCF",
+            "escenario_elegido": context.escenario_elegido,
+            "pesimista": (scenarios.get("pesimista") or {}).get("valor_justo_dcf"),
+            "conservador": (scenarios.get("conservador") or {}).get("valor_justo_dcf"),
+            "optimista": (scenarios.get("optimista") or {}).get("valor_justo_dcf"),
+            "dcf_wacc": esc_elegido.get("dcf_wacc"),
+            "dcf_g_fcf": esc_elegido.get("dcf_g_fcf"),
+            "dcf_fcf_base": esc_elegido.get("dcf_fcf_base"),
+            "dcf_valor_presente_flujos": esc_elegido.get("dcf_valor_presente_flujos"),
+            "dcf_valor_terminal_descontado": esc_elegido.get("dcf_valor_terminal_descontado"),
+            "dcf_equity_value": esc_elegido.get("dcf_equity_value"),
         }
     if question_code == "rat":
         ratios = context.ratios or {}
@@ -326,12 +381,25 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "per": ratios.get("per"),
             "per_no_aplicable": ratios.get("per_no_aplicable"),
             "ps": ratios.get("ps"),
+            "current_assets": context.current_assets,
+            "current_liabilities": context.current_liabilities,
+            "revenue": context.revenue,
+            "cost_of_revenue": context.cost_of_revenue,
+            "market_cap": context.market_cap,
+            "eps_ttm": context.eps_ttm,
+            "precio_actual": context.precio_actual,
         }
     if question_code == "pil":
+        ratios = context.ratios or {}
         return {
             "modelo": _MODELO_PIL,
             "pillars": context.pillars,
             "total_pilares": len(context.pillars) if context.pillars else 4,
+            "revenue_reciente": context.revenue_reciente,
+            "revenue_antiguo": context.revenue_antiguo,
+            "net_income_reciente": context.net_income_reciente,
+            "net_income_antiguo": context.net_income_antiguo,
+            "ratio_liquidez": ratios.get("ratio_liquidez"),
         }
     if question_code == "ren":
         extras = context.extras or {}
@@ -344,13 +412,15 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "payout_ratio": extras.get("payout_ratio"),
         }
     if question_code == "rsk":
-        risk_fit = context.risk_fit or {}
+        risk_fit_d = context.risk_fit or {}
         return {
             "modelo": "Encaje con tu perfil de riesgo",
-            "encaja": risk_fit.get("encaja"),
-            "perfil": risk_fit.get("perfil"),
-            "beta": risk_fit.get("beta"),
-            "etiqueta_activo": risk_fit.get("etiqueta_activo"),
+            "encaja": risk_fit_d.get("encaja"),
+            "perfil": risk_fit_d.get("perfil"),
+            "beta": risk_fit_d.get("beta"),
+            "etiqueta_activo": risk_fit_d.get("etiqueta_activo"),
+            "beta_umbral_bajo": risk_fit.BETA_UMBRAL_BAJO,
+            "beta_umbral_alto": risk_fit.BETA_UMBRAL_ALTO,
         }
     if question_code == "mom":
         momentum = context.momentum or {}
@@ -364,6 +434,11 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "etiqueta": momentum.get("etiqueta"),
             "vix_valor": vix.get("valor"),
             "vix_disponible": vix.get("disponible"),
+            "precio_actual": context.precio_actual,
+            "year_high": context.year_high,
+            "year_low": context.year_low,
+            "price_avg_50": context.price_avg_50,
+            "price_avg_200": context.price_avg_200,
         }
     if question_code == "cmp":
         pc = context.peer_comparison or {}
@@ -376,6 +451,8 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "peers_usados": pc.get("peers_usados"),
             "posicion": pc.get("posicion"),
             "motivo_no_comparable": pc.get("motivo_no_comparable"),
+            "eps_ttm": context.eps_ttm,
+            "precio_actual": context.precio_actual,
         }
     raise ValueError(f"question_code desconocido: {question_code}")
 
@@ -427,6 +504,8 @@ def _payload_avanzado(context: ExplanationContext, question_code: str) -> dict:
             "modelo": "ROIC (Magic Formula)",
             "roic": magic.get("roic"),
             "disponible": magic.get("disponible"),
+            "ebit": magic.get("ebit"),
+            "capital_invertido": magic.get("capital_invertido"),
         }
     if question_code == "mge":
         magic = context.magic or {}
@@ -434,25 +513,48 @@ def _payload_avanzado(context: ExplanationContext, question_code: str) -> dict:
             "modelo": "Earnings Yield (Magic Formula)",
             "earnings_yield": magic.get("earnings_yield"),
             "disponible": magic.get("disponible"),
+            "ebit": magic.get("ebit"),
+            "ev": magic.get("ev"),
+            "market_cap": magic.get("market_cap"),
+            "total_debt": magic.get("total_debt"),
+            "cash": magic.get("cash"),
         }
     if question_code == "aqv":
         factors = context.factors or {}
-        return {"modelo": "Factor Value (AQR)", "value": factors.get("value")}
+        magic = context.magic or {}
+        umbral_alto, umbral_bajo = advanced_scoring.FACTOR_UMBRALES["value_earnings_yield"]
+        return {
+            "modelo": "Factor Value (AQR)",
+            "value": factors.get("value"),
+            "earnings_yield": magic.get("earnings_yield"),
+            "umbral_alto": umbral_alto,
+            "umbral_bajo": umbral_bajo,
+        }
     if question_code == "aqq":
         # Hallazgo señalado explícitamente por `architect` en el Handoff a
         # `security` — superficie mínima dedicada: SOLO quality/roe/
-        # gross_margin/piotroski_ratio, nunca el resto del contexto.
+        # gross_margin/piotroski_ratio (+ umbrales, Decisión de diseño #3),
+        # nunca el resto del contexto.
         factors = context.factors or {}
         piotroski_ratio = None
         evaluables = piotroski.get("criterios_evaluables")
         if evaluables:
             piotroski_ratio = (piotroski.get("puntaje") or 0) / evaluables
+        roe_alto, roe_bajo = advanced_scoring.FACTOR_UMBRALES["quality_roe"]
+        gm_alto, gm_bajo = advanced_scoring.FACTOR_UMBRALES["quality_gross_margin"]
+        pr_alto, pr_bajo = advanced_scoring.FACTOR_UMBRALES["quality_piotroski_ratio"]
         return {
             "modelo": "Factor Quality (AQR)",
             "quality": factors.get("quality"),
             "roe": context.roe,
             "gross_margin": context.gross_margin,
             "piotroski_ratio": piotroski_ratio,
+            "roe_umbral_alto": roe_alto,
+            "roe_umbral_bajo": roe_bajo,
+            "gross_margin_umbral_alto": gm_alto,
+            "gross_margin_umbral_bajo": gm_bajo,
+            "piotroski_ratio_umbral_alto": pr_alto,
+            "piotroski_ratio_umbral_bajo": pr_bajo,
         }
     if question_code == "aqm":
         factors = context.factors or {}
@@ -463,6 +565,8 @@ def _payload_avanzado(context: ExplanationContext, question_code: str) -> dict:
             "modelo": "Factor Low-vol (AQR)",
             "low_vol": factors.get("low_vol"),
             "beta": context.beta,
+            "beta_umbral_bajo": advanced_scoring.LOW_VOL_BETA_UMBRAL_BAJO,
+            "beta_umbral_alto": advanced_scoring.LOW_VOL_BETA_UMBRAL_ALTO,
         }
     raise ValueError(f"question_code desconocido: {question_code}")
 
@@ -590,11 +694,25 @@ def _build_dato_line(kind: str, question_code: str, datos: dict) -> str:
     return _dato_avanzado(question_code, datos)
 
 
-def _build_leaf_message(dato_line: str, respuesta: str, formula: Optional[str], fuente: Optional[str]) -> str:
-    """Orden fijo (Decisión de diseño #5): header -> Dato -> respuesta de
-    Ollama -> Fórmula/Fuente (si existen) -> disclaimer. Fórmula/Fuente NUNCA
-    pasan por el guard de integridad (se agregan acá, después)."""
-    partes = [ai_rewrite.TRANSPARENCY_USED, f"📌 Dato: {dato_line}", respuesta]
+def _build_leaf_message(
+    dato_line: str,
+    respuesta: str,
+    formula: Optional[str],
+    fuente: Optional[str],
+    *,
+    cuenta: Optional[str] = None,
+) -> str:
+    """Orden fijo (Decisión de diseño #5, extendido por SDD_explicacion_
+    paso_a_paso.md): header -> Dato -> Cuenta (si está presente) -> respuesta
+    de Ollama -> Fórmula/Fuente (si existen) -> disclaimer. Fórmula/Fuente/
+    Cuenta NUNCA pasan por el guard de integridad tal cual (Cuenta SÍ entra
+    a `datos_del_contexto` -- y por lo tanto a `datos_tokens` -- ANTES de
+    llamar a Ollama, Decisión de diseño #4; acá solo se inserta en el texto
+    final)."""
+    partes = [ai_rewrite.TRANSPARENCY_USED, f"📌 Dato: {dato_line}"]
+    if cuenta:
+        partes.append(f"🧮 Cuenta: {cuenta}")
+    partes.append(respuesta)
     formula_fuente_lines = []
     if formula:
         formula_fuente_lines.append(f"📐 Fórmula: {formula}")
@@ -604,6 +722,469 @@ def _build_leaf_message(dato_line: str, respuesta: str, formula: Optional[str], 
         partes.append("\n".join(formula_fuente_lines))
     partes.append(summary.DISCLAIMER_NO_ASESORAMIENTO)
     return "\n\n".join(partes)
+
+
+def _build_ver_dato_content(context: ExplanationContext, question_code: str) -> str:
+    """"Ver dato" (Decisión de diseño #9) — generalización de
+    `DETERMINISTIC_PREFIX` + 📌 Dato + 📐 Fórmula/📊 Fuente (si existen) a las
+    22 preguntas `dato_y_paso_a_paso`: nunca llama a Ollama, sin cuenta
+    (exclusiva de "paso a paso"), sin disclaimer (no es contenido generado
+    por IA)."""
+    datos = _build_explain_payload(context, question_code)
+    dato_line = _build_dato_line(context.kind, question_code, datos)
+    formula = ai_explain_content.formulas(context.kind).get(question_code)
+    fuente = ai_explain_content.fuentes(context.kind).get(question_code)
+    partes = [DETERMINISTIC_PREFIX, f"📌 Dato: {dato_line}"]
+    formula_fuente_lines = []
+    if formula:
+        formula_fuente_lines.append(f"📐 Fórmula: {formula}")
+    if fuente:
+        formula_fuente_lines.append(f"📊 Fuente del dato: {fuente}")
+    if formula_fuente_lines:
+        partes.append("\n".join(formula_fuente_lines))
+    return "\n\n".join(partes)
+
+
+# --- Bloque "🧮 Cuenta" (paso a paso) — Decisión de diseño #3/#4 -----------
+# 100% Python, nunca por Ollama. Lee ÚNICAMENTE del `datos` ya armado por
+# `_build_explain_payload` -- nunca recalcula nada, nunca vuelve a llamar a
+# `advanced_scoring.py`/`valuation.py`. Si un campo necesario falta (modelo
+# no calculable para ese ticker), devuelve `None` -- nunca arma un string
+# con "None" visible.
+
+_MAX_CUENTA_CHARS = 400
+
+
+def _money(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def _ratio2(x: float) -> str:
+    return f"{x:.2f}"
+
+
+def _pct1(x: float) -> str:
+    return f"{x * 100:.1f}%"
+
+
+def _enforce_cuenta_length(cuenta: str) -> Optional[str]:
+    """`_MAX_CUENTA_CHARS=400` (Decisión de diseño #8). Mejora recomendada
+    (c) de `security`: a diferencia de la prosa de Ollama, la "cuenta" es
+    aritmética -- cortarla a mitad de un número mostraría un resultado
+    incompleto y potencialmente engañoso. Si el límite se excede (no debería
+    pasar con tickers reales, margen 2.5x sobre el caso más largo conocido),
+    se omite el bloque completo (mismo tratamiento que "no calculable") en
+    vez de truncar un número a la mitad."""
+    if len(cuenta) > _MAX_CUENTA_CHARS:
+        logger.warning(
+            "Cuenta de %d caracteres excede _MAX_CUENTA_CHARS=%d -- bloque omitido",
+            len(cuenta), _MAX_CUENTA_CHARS,
+        )
+        return None
+    return cuenta
+
+
+def _cuenta_ver(datos: dict) -> Optional[str]:
+    precio = datos.get("precio_actual")
+    total = datos.get("valor_justo_total")
+    veredicto = datos.get("veredicto_barata")
+    if precio is None or total is None or veredicto is None:
+        return None
+    op = "<" if veredicto else ">"
+    etiqueta = "Barata" if veredicto else "Cara"
+    return f"Precio actual {_money(precio)} {op} Valor Justo Total {_money(total)} → {etiqueta}"
+
+
+def _cuenta_vf(datos: dict) -> Optional[str]:
+    valores = [
+        v for v in (
+            datos.get("valor_justo_multiplos"), datos.get("valor_justo_graham"), datos.get("valor_justo_dcf"),
+        ) if v is not None
+    ]
+    total = datos.get("valor_justo_total")
+    if not valores or total is None:
+        return None
+    terms = " + ".join(_money(v) for v in valores)
+    return f"({terms}) / {len(valores)} = {_money(total)}"
+
+
+def _valor_escenario_elegido(datos: dict) -> Optional[float]:
+    esc = datos.get("escenario_elegido")
+    if esc not in ("pesimista", "conservador", "optimista"):
+        return None
+    return datos.get(esc)
+
+
+def _cuenta_gra(datos: dict) -> Optional[str]:
+    eps, g, y = datos.get("eps_ttm"), datos.get("g_aplicado"), datos.get("y_value")
+    valor = _valor_escenario_elegido(datos)
+    if None in (eps, g, y, valor) or y == 0:
+        return None
+    g_pct, y_pct = g * 100, y * 100
+    return (
+        f"{_money(eps)} × (8.5 + 2×{g_pct:.1f}) × {valuation.GRAHAM_HISTORICAL_YIELD:.1f} "
+        f"/ {y_pct:.1f} = {_money(valor)}"
+    )
+
+
+def _cuenta_mul(datos: dict) -> Optional[str]:
+    eps, per = datos.get("eps_ttm"), datos.get("per_promedio_peers")
+    valor = _valor_escenario_elegido(datos)
+    if None in (eps, per, valor):
+        return None
+    return f"{_money(eps)} × {_ratio2(per)} = {_money(valor)}"
+
+
+def _cuenta_dcf(datos: dict) -> Optional[str]:
+    wacc = datos.get("dcf_wacc")
+    g = datos.get("dcf_g_fcf")
+    base = datos.get("dcf_fcf_base")
+    vp_flujos = datos.get("dcf_valor_presente_flujos")
+    vt_desc = datos.get("dcf_valor_terminal_descontado")
+    equity = datos.get("dcf_equity_value")
+    valor_accion = _valor_escenario_elegido(datos)
+    if None in (wacc, g, base, vp_flujos, vt_desc, equity, valor_accion):
+        return None
+    years = valuation.DCF_PROJECTION_YEARS
+    fcf_year5 = base * (1 + g) ** years
+    return (
+        f"FCF base {_money(base)}, crece a g={g * 100:.1f}% anual (WACC={wacc * 100:.1f}%) → "
+        f"FCF proyectado año {years} ≈ {_money(fcf_year5)}. Flujos descontados a valor "
+        f"presente ≈ {_money(vp_flujos)} + valor terminal descontado ≈ {_money(vt_desc)} = "
+        f"valor de la empresa ≈ {_money(equity)} → {_money(valor_accion)} por acción."
+    )
+
+
+def _cuenta_rat(datos: dict) -> Optional[str]:
+    piezas = []
+    ca, cl = datos.get("current_assets"), datos.get("current_liabilities")
+    if ca is not None and cl and datos.get("ratio_liquidez") is not None:
+        piezas.append(f"Liquidez = {_money(ca)} / {_money(cl)} = {_ratio2(datos['ratio_liquidez'])}")
+    rev, cor = datos.get("revenue"), datos.get("cost_of_revenue")
+    if rev and cor is not None and datos.get("margen_bruto") is not None:
+        piezas.append(
+            f"Margen bruto = ({_money(rev)} − {_money(cor)}) / {_money(rev)} = {_pct1(datos['margen_bruto'])}"
+        )
+    precio, eps = datos.get("precio_actual"), datos.get("eps_ttm")
+    if (
+        precio is not None and eps and datos.get("per") is not None
+        and not datos.get("per_no_aplicable")
+    ):
+        piezas.append(f"PER = {_money(precio)} / {_money(eps)} = {_ratio2(datos['per'])}")
+    mc = datos.get("market_cap")
+    if mc is not None and rev and datos.get("ps") is not None:
+        piezas.append(f"P/S = {_money(mc)} / {_money(rev)} = {_ratio2(datos['ps'])}")
+    return " · ".join(piezas) if piezas else None
+
+
+def _cuenta_pil(datos: dict) -> Optional[str]:
+    pillars = datos.get("pillars") or {}
+    rev_r, rev_a = datos.get("revenue_reciente"), datos.get("revenue_antiguo")
+    ni_r, ni_a = datos.get("net_income_reciente"), datos.get("net_income_antiguo")
+    ratio_liq = datos.get("ratio_liquidez")
+    ingresos_crecientes = pillars.get("ingresos_crecientes")
+    if None in (rev_r, rev_a, ni_r, ni_a, ratio_liq) or ingresos_crecientes is None:
+        return None
+    ing_txt = "creciente" if pillars.get("ingresos_crecientes") else "no creciente"
+    util_txt = "creciente" if pillars.get("utilidades_crecientes") else "no creciente"
+    deuda_txt = "controlada" if pillars.get("deuda_controlada") else "no controlada"
+    precio_txt = "razonable" if pillars.get("precio_razonable") else "no razonable"
+    return (
+        f"Ingresos: {_money(rev_r)} > {_money(rev_a)} → {ing_txt} · "
+        f"Utilidades: {_money(ni_r)} > 0 y > {_money(ni_a)} → {util_txt} · "
+        f"Deuda: liquidez {_ratio2(ratio_liq)} > 1 → {deuda_txt} · "
+        f"Precio: → {precio_txt}"
+    )
+
+
+def _cuenta_beta_bucket(beta: Optional[float], bajo: float, alto: float, etiqueta_medio: str) -> Optional[str]:
+    if beta is None:
+        return None
+    if beta < bajo:
+        rango = f"< {_ratio2(bajo)}"
+    elif beta > alto:
+        rango = f"> {_ratio2(alto)}"
+    else:
+        rango = f"entre {_ratio2(bajo)} y {_ratio2(alto)}"
+    return f"Beta {_ratio2(beta)} está {rango} → {etiqueta_medio}"
+
+
+def _cuenta_rsk(datos: dict) -> Optional[str]:
+    beta = datos.get("beta")
+    bajo, alto = datos.get("beta_umbral_bajo"), datos.get("beta_umbral_alto")
+    if beta is None or bajo is None or alto is None:
+        return None
+    if beta < bajo:
+        implied = "Muy Conservador / Conservador"
+    elif beta > alto:
+        implied = "Agresivo"
+    else:
+        implied = "Moderado"
+    return _cuenta_beta_bucket(beta, bajo, alto, f"perfil {implied}")
+
+
+def _cuenta_mom(datos: dict) -> Optional[str]:
+    precio = datos.get("precio_actual")
+    refs = (
+        ("máx. 52 sem.", datos.get("year_high"), datos.get("pct_vs_year_high")),
+        ("mín. 52 sem.", datos.get("year_low"), datos.get("pct_vs_year_low")),
+        ("promedio 50d", datos.get("price_avg_50"), datos.get("pct_vs_avg_50")),
+        ("promedio 200d", datos.get("price_avg_200"), datos.get("pct_vs_avg_200")),
+    )
+    piezas = []
+    for label, ref_val, pct_val in refs:
+        if precio is None or ref_val is None or pct_val is None:
+            continue
+        piezas.append(
+            f"({_money(precio)} − {_money(ref_val)}) / {_money(ref_val)} × 100 = {pct_val:.1f}% vs. {label}"
+        )
+    return " · ".join(piezas) if piezas else None
+
+
+def _cuenta_cmp(datos: dict) -> Optional[str]:
+    precio, eps = datos.get("precio_actual"), datos.get("eps_ttm")
+    per_propio = datos.get("per_propio")
+    per_prom = datos.get("per_promedio_peers")
+    if precio is None or not eps or per_propio is None:
+        return None
+    piezas = [f"PER propio = {_money(precio)} / {_money(eps)} = {_ratio2(per_propio)}"]
+    if per_prom is not None:
+        piezas.append(f"PER promedio peers = {_ratio2(per_prom)}")
+    return " — ".join(piezas)
+
+
+_CUENTA_TEXTO_LIBRE = {
+    "ver": _cuenta_ver, "vf": _cuenta_vf, "gra": _cuenta_gra, "dcf": _cuenta_dcf,
+    "mul": _cuenta_mul, "rat": _cuenta_rat, "pil": _cuenta_pil, "rsk": _cuenta_rsk,
+    "mom": _cuenta_mom, "cmp": _cuenta_cmp,
+}
+
+
+def _cuenta_alz(datos: dict) -> Optional[str]:
+    altman = datos.get("altman") or {}
+    if not altman.get("disponible"):
+        return None
+    a, b, c, d, e, z = (altman.get(k) for k in ("a", "b", "c", "d", "e", "z"))
+    if None in (a, b, c, d, e, z):
+        return None
+    t1, t2, t3, t4, t5 = 1.2 * a, 1.4 * b, 3.3 * c, 0.6 * d, 1.0 * e
+    return (
+        f"Z = 1.2×{_ratio2(a)} + 1.4×{_ratio2(b)} + 3.3×{_ratio2(c)} + 0.6×{_ratio2(d)} + 1.0×{_ratio2(e)} = "
+        f"{_ratio2(t1)} + {_ratio2(t2)} + {_ratio2(t3)} + {_ratio2(t4)} + {_ratio2(t5)} = {_ratio2(z)}"
+    )
+
+
+def _cuenta_azp(datos: dict) -> Optional[str]:
+    altman_pp = datos.get("altman_pp") or {}
+    if not altman_pp.get("disponible"):
+        return None
+    a, b, c, d, z = (altman_pp.get(k) for k in ("a", "b", "c", "d", "z"))
+    if None in (a, b, c, d, z):
+        return None
+    t1, t2, t3, t4 = 6.56 * a, 3.26 * b, 6.72 * c, 1.05 * d
+    return (
+        f"Z'' = 6.56×{_ratio2(a)} + 3.26×{_ratio2(b)} + 6.72×{_ratio2(c)} + 1.05×{_ratio2(d)} = "
+        f"{_ratio2(t1)} + {_ratio2(t2)} + {_ratio2(t3)} + {_ratio2(t4)} = {_ratio2(z)}"
+    )
+
+
+def _cuenta_pig(datos: dict) -> Optional[str]:
+    piotroski = datos.get("piotroski") or {}
+    puntaje, evaluables = piotroski.get("puntaje"), piotroski.get("criterios_evaluables")
+    if puntaje is None or not evaluables:
+        return None
+    return f"{puntaje} de {evaluables} criterios evaluables cumplidos"
+
+
+_PIOTROSKI_CUENTA_LABEL = {
+    "roa_positivo": "Ganancia Neta",
+    "cfo_positivo": "CFO",
+    "roa_creciente": "ROA",
+    "cfo_mayor_utilidad": "CFO > Utilidad",
+    "apalancamiento_decreciente": "Apalancamiento",
+    "liquidez_creciente": "Liquidez",
+    "sin_dilucion": "Acciones en circulación",
+    "margen_bruto_creciente": "Margen bruto",
+    "rotacion_activos_creciente": "Rotación de activos",
+}
+
+
+def _fmt_criterio_piotroski(criterio: dict) -> Optional[str]:
+    nombre = criterio.get("nombre")
+    cumplido = criterio.get("cumplido")
+    valores = criterio.get("valores")
+    if cumplido is None or not valores:
+        return None
+    etiqueta = "cumplido" if cumplido else "no cumplido"
+    label = _PIOTROSKI_CUENTA_LABEL.get(nombre)
+    if label is None:
+        return None
+    if nombre == "roa_positivo":
+        v = valores.get("net_income_t")
+        return None if v is None else f"{label}: {_money(v)} > 0 → {etiqueta}"
+    if nombre == "cfo_positivo":
+        v = valores.get("cfo_t")
+        return None if v is None else f"{label}: {_money(v)} > 0 → {etiqueta}"
+    if nombre == "cfo_mayor_utilidad":
+        cfo, ni = valores.get("cfo_t"), valores.get("net_income_t")
+        if cfo is None or ni is None:
+            return None
+        return f"{label}: {_money(cfo)} > {_money(ni)} → {etiqueta}"
+    if nombre == "roa_creciente":
+        t, t1 = valores.get("roa_t"), valores.get("roa_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_ratio2(t)} > {_ratio2(t1)} → {etiqueta}"
+    if nombre == "apalancamiento_decreciente":
+        t, t1 = valores.get("apalancamiento_t"), valores.get("apalancamiento_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_ratio2(t)} < {_ratio2(t1)} → {etiqueta}"
+    if nombre == "liquidez_creciente":
+        t, t1 = valores.get("liquidez_t"), valores.get("liquidez_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_ratio2(t)} > {_ratio2(t1)} → {etiqueta}"
+    if nombre == "sin_dilucion":
+        t, t1 = valores.get("shares_t"), valores.get("shares_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_ratio2(t)} ≤ {_ratio2(t1)} → {etiqueta}"
+    if nombre == "margen_bruto_creciente":
+        t, t1 = valores.get("margen_t"), valores.get("margen_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_pct1(t)} > {_pct1(t1)} → {etiqueta}"
+    if nombre == "rotacion_activos_creciente":
+        t, t1 = valores.get("rotacion_t"), valores.get("rotacion_t1")
+        if t is None or t1 is None:
+            return None
+        return f"{label}: {_ratio2(t)} > {_ratio2(t1)} → {etiqueta}"
+    return None
+
+
+def _cuenta_piotroski_grupo(datos: dict) -> Optional[str]:
+    criterios = datos.get("criterios") or []
+    piezas = [p for p in (_fmt_criterio_piotroski(c) for c in criterios if isinstance(c, dict)) if p]
+    return " · ".join(piezas) if piezas else None
+
+
+def _cuenta_mgr(datos: dict) -> Optional[str]:
+    if not datos.get("disponible"):
+        return None
+    ebit, ci, roic = datos.get("ebit"), datos.get("capital_invertido"), datos.get("roic")
+    if None in (ebit, ci, roic) or not ci:
+        return None
+    return f"ROIC = {_money(ebit)} / {_money(ci)} = {_ratio2(roic)} = {_pct1(roic)}"
+
+
+def _cuenta_mge(datos: dict) -> Optional[str]:
+    if not datos.get("disponible"):
+        return None
+    ebit, ev, mc, td, cash, ey = (
+        datos.get(k) for k in ("ebit", "ev", "market_cap", "total_debt", "cash", "earnings_yield")
+    )
+    if None in (ebit, ev, mc, td, cash, ey) or not ev:
+        return None
+    return (
+        f"EY = {_money(ebit)} / ({_money(mc)} + {_money(td)} − {_money(cash)}) = "
+        f"{_money(ebit)} / {_money(ev)} = {_ratio2(ey)} = {_pct1(ey)}"
+    )
+
+
+def _cuenta_aqv(datos: dict) -> Optional[str]:
+    ey = datos.get("earnings_yield")
+    alto, bajo, etiqueta = datos.get("umbral_alto"), datos.get("umbral_bajo"), datos.get("value")
+    if ey is None or alto is None or bajo is None:
+        return None
+    if ey > alto:
+        rango = f"> {_pct1(alto)}"
+    elif ey < bajo:
+        rango = f"< {_pct1(bajo)}"
+    else:
+        rango = f"entre {_pct1(bajo)} y {_pct1(alto)}"
+    return f"Earnings Yield {_pct1(ey)} está {rango} → {etiqueta}"
+
+
+def _puntos_umbral(valor: Optional[float], alto: Optional[float], bajo: Optional[float]) -> Optional[int]:
+    if valor is None or alto is None or bajo is None:
+        return None
+    if valor > alto:
+        return 1
+    if valor < bajo:
+        return -1
+    return 0
+
+
+def _cuenta_aqq(datos: dict) -> Optional[str]:
+    piezas: list[str] = []
+    suma = 0
+    sub_metricas = (
+        ("ROE", datos.get("roe"), datos.get("roe_umbral_alto"), datos.get("roe_umbral_bajo"), _pct1),
+        (
+            "Margen bruto", datos.get("gross_margin"),
+            datos.get("gross_margin_umbral_alto"), datos.get("gross_margin_umbral_bajo"), _pct1,
+        ),
+        (
+            "Piotroski", datos.get("piotroski_ratio"),
+            datos.get("piotroski_ratio_umbral_alto"), datos.get("piotroski_ratio_umbral_bajo"), _pct1,
+        ),
+    )
+    for nombre, valor, alto, bajo, fmt in sub_metricas:
+        p = _puntos_umbral(valor, alto, bajo)
+        if p is None:
+            continue
+        referencia = alto if p >= 0 else bajo
+        signo = ">" if p == 1 else ("<" if p == -1 else "≈")
+        piezas.append(f"{nombre} {fmt(valor)} {signo} {fmt(referencia)} ({p:+d})")
+        suma += p
+    if not piezas:
+        return None
+    etiqueta = datos.get("quality")
+    return " · ".join(piezas) + f" → suma {suma:+d} → {etiqueta}"
+
+
+def _cuenta_aqm(datos: dict) -> Optional[str]:
+    momentum = datos.get("momentum")
+    if momentum is None:
+        return None
+    return f"Factor Momentum: {momentum}"
+
+
+def _cuenta_aql(datos: dict) -> Optional[str]:
+    beta = datos.get("beta")
+    bajo, alto, etiqueta = datos.get("beta_umbral_bajo"), datos.get("beta_umbral_alto"), datos.get("low_vol")
+    if beta is None or bajo is None or alto is None:
+        return None
+    return _cuenta_beta_bucket(beta, bajo, alto, str(etiqueta))
+
+
+_CUENTA_AVANZADO = {
+    "alz": _cuenta_alz, "azp": _cuenta_azp, "pig": _cuenta_pig,
+    "pir": _cuenta_piotroski_grupo, "pia": _cuenta_piotroski_grupo, "pie": _cuenta_piotroski_grupo,
+    "mgr": _cuenta_mgr, "mge": _cuenta_mge, "aqv": _cuenta_aqv, "aqq": _cuenta_aqq,
+    "aqm": _cuenta_aqm, "aql": _cuenta_aql,
+}
+
+
+def _build_cuenta_line(kind: str, question_code: str, datos: dict) -> Optional[str]:
+    """Dispatch de las 22 preguntas `dato_y_paso_a_paso` -- función pura,
+    `dict` de entrada -> `Optional[str]`, sin I/O (mismo criterio de
+    testabilidad que `_build_dato_line`). Envuelto en un `try/except` amplio
+    como red de seguridad adicional: cualquier error aritmético/de tipos
+    inesperado se trata igual que "no calculable" (`None`), nunca deja
+    escapar un string con un valor a medio calcular."""
+    tabla = _CUENTA_TEXTO_LIBRE if kind == "texto_libre" else _CUENTA_AVANZADO
+    fn = tabla.get(question_code)
+    if fn is None:
+        return None
+    try:
+        cuenta = fn(datos)
+    except Exception:  # noqa: BLE001 -- red de seguridad amplia a propósito
+        return None
+    if not cuenta:
+        return None
+    return _enforce_cuenta_length(cuenta)
 
 
 def _build_deterministic_content(context: ExplanationContext, question_code: str) -> str:
@@ -651,6 +1232,33 @@ SYSTEM_PROMPT_EXPLAIN = (
     "   de las 2 a 4 oraciones de la regla 1.\n"
 )
 
+# Decisión de diseño #4 de SDD_explicacion_paso_a_paso.md -- NO reemplaza
+# `SYSTEM_PROMPT_EXPLAIN` (ese sigue usándose sin cambios para `mod`/`ben`/
+# `ren`, variant="narrativa"): exclusivo del camino "paso a paso" de las 22
+# preguntas `dato_y_paso_a_paso`. Mismo `format: "json"`, mismo
+# `num_predict=220`, mismo timeout -- sin cambios de infraestructura de red.
+SYSTEM_PROMPT_PASO_A_PASO = (
+    "Sos un profesor de finanzas que explica en español rioplatense, en un\n"
+    "mensaje de chat. Vas a recibir un JSON con una pregunta puntual, los\n"
+    "datos ya calculados, y una clave \"cuenta\" con la fórmula YA RESUELTA paso\n"
+    "a paso (números reales, cada término calculado, resultado final).\n\n"
+    "Reglas estrictas:\n"
+    "1. La cuenta en \"cuenta\" YA ESTÁ CALCULADA Y ES CORRECTA — tu trabajo es\n"
+    "   explicar en 2 a 4 oraciones cortas QUÉ SIGNIFICA ese resultado o alguno\n"
+    "   de sus términos, nunca recalcularla ni repetirla palabra por palabra\n"
+    "   (el usuario ya la ve arriba de tu respuesta, repetirla desperdicia tu\n"
+    "   espacio de respuesta).\n"
+    "2. Usá ÚNICAMENTE los números/datos del JSON que te paso — nunca inventes,\n"
+    "   estimes ni completes un dato que no esté ahí.\n"
+    "3. Nunca dés una recomendación de compra/venta ni asesoramiento financiero\n"
+    "   personalizado — solo explicá qué significa el resultado.\n"
+    "4. Respondé ÚNICAMENTE con un objeto JSON de la forma\n"
+    "   {\"respuesta\": \"...\"}, sin texto antes ni después.\n"
+    "5. Con tono de análisis de inversionista: nombrá el modelo financiero\n"
+    "   (\"modelo\"/\"modelos\" en el JSON) al principio de tu respuesta y decí en\n"
+    "   general qué mide -- sin salirte de las 2 a 4 oraciones de la regla 1.\n"
+)
+
 MAX_EXPLANATION_OUTPUT_TOKENS = 220
 _MAX_EXPLANATION_CHARS = 480
 
@@ -694,6 +1302,7 @@ async def _fetch_explanation(
     pregunta_fija: str,
     datos_del_contexto: dict,
     datos_tokens: set[str],
+    system_prompt: str = SYSTEM_PROMPT_EXPLAIN,
 ) -> str:
     prompt = json.dumps(
         {"pregunta": pregunta_fija, "datos": datos_del_contexto}, ensure_ascii=False
@@ -712,7 +1321,7 @@ async def _fetch_explanation(
             f"{config.base_url}/api/generate",
             json={
                 "model": config.model,
-                "system": SYSTEM_PROMPT_EXPLAIN,
+                "system": system_prompt,
                 "prompt": prompt,
                 "stream": False,
                 "format": "json",
@@ -751,7 +1360,29 @@ async def _fetch_explanation(
     return _enforce_brevity(respuesta)
 
 
-# --- Teclados (Nivel 1 / Nivel 2 — Decisión de diseño #1/#2/#3) ------------
+# --- Teclados (Nivel 1 / Nivel 2 — Decisión de diseño #1/#2/#3, extendidos
+# por SDD_explicacion_paso_a_paso.md Decisión de diseño #1/#3) -------------
+
+# Textos EXACTOS de los 2 botones hermanos de toda pregunta
+# `variant="dato_y_paso_a_paso"` (criterio de aceptación de la spec —
+# idénticos para las 22 preguntas, distinguidos solo por `callback_data`).
+_LABEL_VER_DATO = "📊 Ver dato"
+_LABEL_PASO_A_PASO = "🎓 Explicame paso a paso"
+
+
+def _leaf_rows(
+    context_id: str, code: str, spec: ai_explain_content.QuestionSpec
+) -> list[list[InlineKeyboardButton]]:
+    """1 fila por pregunta: 2 botones hermanos si `variant="dato_y_paso_a_
+    paso"` ("Ver dato" / "Explicame paso a paso", Decisión de diseño #1 de
+    SDD_explicacion_paso_a_paso.md); 1 botón con el label propio de la
+    pregunta en caso contrario (narrativa/determinístico, sin cambios)."""
+    if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO:
+        return [[
+            InlineKeyboardButton(_LABEL_VER_DATO, callback_data=f"xp:{context_id}:{code}"),
+            InlineKeyboardButton(_LABEL_PASO_A_PASO, callback_data=f"xp:{context_id}:p:{code}"),
+        ]]
+    return [[InlineKeyboardButton(spec.label, callback_data=f"xp:{context_id}:{code}")]]
 
 
 def build_keyboard(kind: str, context_id: str) -> InlineKeyboardMarkup:
@@ -765,8 +1396,7 @@ def build_keyboard(kind: str, context_id: str) -> InlineKeyboardMarkup:
     categories = ai_explain_content.all_categories(kind)
     for item_kind, code in ai_explain_content.level1(kind):
         if item_kind == "leaf":
-            spec = questions[code]
-            rows.append([InlineKeyboardButton(spec.label, callback_data=f"xp:{context_id}:{code}")])
+            rows.extend(_leaf_rows(context_id, code, questions[code]))
         else:
             cat = categories[code]
             rows.append(
@@ -797,12 +1427,26 @@ def build_category_keyboard(
         return None
     questions = ai_explain_content.all_questions(kind)
     codes = [c for c in cat.question_codes if _leaf_visible(c, context)]
-    rows = [
-        [InlineKeyboardButton(questions[c].label, callback_data=f"xp:{context_id}:{c}")]
-        for c in codes
-    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for c in codes:
+        rows.extend(_leaf_rows(context_id, c, questions[c]))
     rows.append([InlineKeyboardButton("🔙 Menú", callback_data=f"xp:{context_id}:m")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_response_keyboard(
+    kind: str, context_id: str, question_code: str, context: Optional[ExplanationContext]
+) -> InlineKeyboardMarkup:
+    """Decisión de diseño #2 de SDD_explicacion_paso_a_paso.md — el menú
+    reaparece SIEMPRE tras cualquier respuesta de leaf: el de Nivel 2 de SU
+    categoría (con "🔙 Menú" al final) si la pregunta pertenece a una, el de
+    Nivel 1 si es suelta. `category_of` es la fuente de verdad única."""
+    cat_code = ai_explain_content.category_of(kind, question_code)
+    if cat_code is not None:
+        markup = build_category_keyboard(kind, context_id, cat_code, context)
+        if markup is not None:
+            return markup
+    return build_keyboard(kind, context_id)
 
 
 # --- Dispatch de las 3 formas de callback_data (Decisión de diseño #1) -----
@@ -847,14 +1491,25 @@ async def _dispatch_category(
 
 async def _dispatch_leaf(
     bot, chat_id, store: ExplanationContextStore, rate_limiter, clients,
-    context_id: str, question_code: str,
+    context_id: str, question_code: str, *, paso_a_paso: bool = False,
 ) -> None:
-    if (
-        question_code not in ai_explain_content.QUESTIONS_TEXTO_LIBRE
-        and question_code not in ai_explain_content.QUESTIONS_AVANZADO
+    """Dispatchea las 3 variantes (`dato_y_paso_a_paso`/`narrativa`/
+    `deterministico`) × la forma `:p:` nueva. Las 3 ramas de envío
+    (determinístico/"Ver dato" vía `send_message`, narrativa/"paso a paso"
+    vía `edit_message_text` tras "🤔 Pensando…") SIEMPRE adjuntan
+    `reply_markup` (Decisión de diseño #2 de SDD_explicacion_paso_a_paso.md
+    — el menú reaparece SIEMPRE)."""
+    spec_global = _ALL_QUESTIONS_COMBINED.get(question_code)
+    if spec_global is None or (
+        paso_a_paso and spec_global.variant != ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO
     ):
+        # `question_code` desconocido en ambas tablas, O la forma `:p:` se
+        # usó con un `code` de variant distinta a "dato_y_paso_a_paso" (ej.
+        # `xp:{id}:p:mod`) — mismo camino que un `question_code` desconocido
+        # (criterio de aceptación explícito), sin excepción.
         logger.warning(
-            "question_code desconocido en callback xp:: %s", _sanitize_for_log(question_code)
+            "question_code desconocido o incompatible con :p: en callback xp:: %s",
+            _sanitize_for_log(question_code),
         )
         await bot.send_message(chat_id=chat_id, text=EXPLAIN_INVALID_MSG)
         return
@@ -872,19 +1527,53 @@ async def _dispatch_leaf(
         await bot.send_message(chat_id=chat_id, text=EXPLAIN_EXPIRED_MSG)
         return
 
-    if not spec.requires_ollama:
-        # Decisión de diseño #4 — determinístico: sin "🤔 Pensando…", sin
-        # llamada HTTP, sin pasar por el guard, sin consumir el balde.
+    reply_markup = build_response_keyboard(stored.kind, context_id, question_code, stored)
+
+    if spec.variant == ai_explain_content.VARIANT_DETERMINISTICO:
+        # Decisión de diseño #4 (spec cerrada) — determinístico: sin "🤔
+        # Pensando…", sin llamada HTTP, sin pasar por el guard, sin
+        # consumir el balde.
         texto = _build_deterministic_content(stored, question_code)
-        await bot.send_message(chat_id=chat_id, text=texto)
+        await bot.send_message(chat_id=chat_id, text=texto, reply_markup=reply_markup)
         return
 
-    # Decisión de diseño #10 — SOLO lo que llama a Ollama consume el balde.
+    if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO and not paso_a_paso:
+        # Decisión de diseño #9 -- "Ver dato": mismo criterio de costo cero
+        # que `evt`/`inf`, generalizado a las 22 preguntas.
+        texto = _build_ver_dato_content(stored, question_code)
+        await bot.send_message(chat_id=chat_id, text=texto, reply_markup=reply_markup)
+        return
+
+    # A partir de acá: `narrativa` (mod/ben/ren, sin cambios), o
+    # `dato_y_paso_a_paso` con `paso_a_paso=True` ("Explicame paso a paso")
+    # -- ambas llaman a Ollama y consumen el balde (Decisión de diseño #10).
     if not rate_limiter.allow(str(chat_id)):
         await bot.send_message(chat_id=chat_id, text=RATE_LIMITED_MSG)
         return
 
     datos_del_contexto = _build_explain_payload(stored, question_code)
+
+    cuenta: Optional[str] = None
+    if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO:
+        try:
+            cuenta = _build_cuenta_line(stored.kind, question_code, datos_del_contexto)
+        except Exception:
+            # Mejora recomendada (b) de `security` -- un bug de programación
+            # en el dispatch de `_build_cuenta_line` (~22 casos) nunca debe
+            # dejar al usuario sin respuesta: cae al mismo mensaje que un
+            # fallo de Ollama, nunca sube sin capturar hasta el handler
+            # global de errores.
+            logger.exception(
+                "Fallo inesperado construyendo la cuenta de %s", _sanitize_for_log(question_code)
+            )
+            await bot.send_message(chat_id=chat_id, text=EXPLAIN_UNAVAILABLE_MSG)
+            return
+        if cuenta is not None:
+            # Decisión de diseño #4 -- la cuenta entra al payload ANTES del
+            # cálculo de `datos_tokens` del guard: Ollama la recibe como
+            # dato garantizado, nunca la genera.
+            datos_del_contexto["cuenta"] = cuenta
+
     datos_tokens = {
         _normalize_numeric_token(token)
         for token in ai_rewrite.protected_tokens(
@@ -897,14 +1586,22 @@ async def _dispatch_leaf(
 
     pensando = await bot.send_message(chat_id=chat_id, text=EXPLAIN_PENDING_MSG)
 
+    if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO:
+        pregunta_fija = spec.pregunta_paso_a_paso
+        system_prompt = SYSTEM_PROMPT_PASO_A_PASO
+    else:
+        pregunta_fija = spec.pregunta_narrativa
+        system_prompt = SYSTEM_PROMPT_EXPLAIN
+
     try:
         respuesta = await _fetch_explanation(
             clients=clients,
             config=config,
             question_code=question_code,
-            pregunta_fija=spec.pregunta_fija,
+            pregunta_fija=pregunta_fija,
             datos_del_contexto=datos_del_contexto,
             datos_tokens=datos_tokens,
+            system_prompt=system_prompt,
         )
     except _ExplainUnavailable:
         await bot.edit_message_text(
@@ -915,8 +1612,10 @@ async def _dispatch_leaf(
     dato_line = _build_dato_line(stored.kind, question_code, datos_del_contexto)
     formula = ai_explain_content.formulas(stored.kind).get(question_code)
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
-    texto = _build_leaf_message(dato_line, respuesta, formula, fuente)
-    await bot.edit_message_text(chat_id=chat_id, message_id=pensando.message_id, text=texto)
+    texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta)
+    await bot.edit_message_text(
+        chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup
+    )
 
 
 # --- Handler compartido -----------------------------------------------------
@@ -944,6 +1643,15 @@ def build_explain_handler(clients, rate_limiter, store: ExplanationContextStore)
         if match_cat is not None:
             await _dispatch_category(
                 context.bot, chat_id, store, match_cat.group(1), match_cat.group(2)
+            )
+            return
+
+        match_paso_a_paso = _CALLBACK_PASO_A_PASO_RE.fullmatch(raw_data)
+        if match_paso_a_paso is not None:
+            await _dispatch_leaf(
+                context.bot, chat_id, store, rate_limiter, clients,
+                match_paso_a_paso.group(1), match_paso_a_paso.group(2),
+                paso_a_paso=True,
             )
             return
 

@@ -232,6 +232,40 @@ def calculate_wacc(
     return e_weight * ke + d_weight * kd_aftertax
 
 
+@dataclass(frozen=True)
+class DCFBreakdown:
+    """SDD_explicacion_paso_a_paso.md, Decisión de diseño #7 -- cambio de
+    contrato ACOTADO de `calculate_dcf_fair_value` (única función de esa spec
+    cuyo contrato cambia). `valor_por_accion` es el mismo valor que antes
+    devolvía la función a secas; los otros 4 campos son los valores
+    intermedios ya calculados internamente y antes descartados -- salvo la
+    proyección año a año completa (fuera de alcance de esta iteración, D1)."""
+
+    valor_por_accion: Optional[float]
+    fcf_proyectado_final: Optional[float]  # último año de la proyección (año 5), no los 5
+    valor_presente_flujos: Optional[float]  # suma de los 5 flujos descontados
+    valor_terminal_descontado: Optional[float]  # valor terminal ya traído a presente
+    equity_value: Optional[float]
+
+
+# Hallazgo BLOQUEANTE de `security` (SDD_explicacion_paso_a_paso.md) --
+# CWE-476: los 4 puntos de retorno temprano de `calculate_dcf_fair_value`
+# tienen que devolver un `DCFBreakdown` con los 5 campos en `None`, NUNCA un
+# `None` desnudo -- de lo contrario `dcf.valor_por_accion` en los 2 call
+# sites (`compute_valuation`/`compute_valuation_scenarios`) lanza
+# `AttributeError: 'NoneType' object has no attribute 'valor_por_accion'`
+# para cualquier ticker donde el DCF no sea calculable (caso nada marginal:
+# historial de FCF insuficiente, `wacc <= terminal_growth`, CAGR no
+# calculable).
+_DCF_NO_CALCULABLE = DCFBreakdown(
+    valor_por_accion=None,
+    fcf_proyectado_final=None,
+    valor_presente_flujos=None,
+    valor_terminal_descontado=None,
+    equity_value=None,
+)
+
+
 def calculate_dcf_fair_value(
     *,
     fcf_historial: list[float],
@@ -242,7 +276,7 @@ def calculate_dcf_fair_value(
     g_fcf_override: Optional[float] = None,
     fcf_base_override: Optional[float] = None,
     periodos_por_anio: int = 1,
-) -> Optional[float]:
+) -> DCFBreakdown:
     """DCF por acción: proyección de FCF a `years` + valor terminal (Gordon Growth).
 
     `fcf_historial` debe venir ordenado de más antiguo a más reciente (mismo
@@ -267,14 +301,14 @@ def calculate_dcf_fair_value(
     crece o decrece).
     """
     if not fcf_historial or len(fcf_historial) < (CAGR_MIN_N_AÑOS * periodos_por_anio) + 1:
-        return None
+        return _DCF_NO_CALCULABLE
     if shares_outstanding is None or shares_outstanding <= 0:
-        return None
+        return _DCF_NO_CALCULABLE
     if wacc is None or wacc <= terminal_growth:
         # WACC debe superar el crecimiento terminal para que la perpetuidad
         # tenga un denominador positivo — de lo contrario no hay valor
         # terminal financieramente válido.
-        return None
+        return _DCF_NO_CALCULABLE
 
     fcf_reciente = fcf_historial[-1]
     fcf_antiguo = fcf_historial[0]
@@ -285,7 +319,7 @@ def calculate_dcf_fair_value(
     else:
         g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años)
         if g_fcf is None:
-            return None
+            return _DCF_NO_CALCULABLE
 
     # Ancla de la PROYECCIÓN (nivel, no tendencia): FCF TTM cuando está
     # disponible (`fcf_base_override`), el último punto crudo del historial
@@ -307,7 +341,13 @@ def calculate_dcf_fair_value(
     valor_presente_terminal = valor_terminal / (1 + wacc) ** years
 
     equity_value = valor_presente + valor_presente_terminal
-    return equity_value / shares_outstanding
+    return DCFBreakdown(
+        valor_por_accion=equity_value / shares_outstanding,
+        fcf_proyectado_final=fcf_proyectado[-1],
+        valor_presente_flujos=valor_presente,
+        valor_terminal_descontado=valor_presente_terminal,
+        equity_value=equity_value,
+    )
 
 
 @dataclass
@@ -326,6 +366,18 @@ class ValuationResult:
     graham_g_original: Optional[float] = None   # NUEVO — Iter-4
     graham_g_aplicado: Optional[float] = None   # NUEVO — Iter-4
     graham_g_capped: bool = False               # NUEVO — Iter-4
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #7 — DCF con cuenta
+    # PARCIAL: `dcf_wacc`/`dcf_g_fcf`/`dcf_fcf_base` ya eran locales gratis
+    # en el caller; `dcf_valor_presente_flujos`/`dcf_valor_terminal_
+    # descontado`/`dcf_equity_value` vienen del `DCFBreakdown` nuevo. Los 6
+    # quedan `None` en cualquier escenario donde `valor_justo_dcf` también
+    # es `None` (mismo criterio "todo o nada" que el resto del proyecto).
+    dcf_wacc: Optional[float] = None
+    dcf_g_fcf: Optional[float] = None
+    dcf_fcf_base: Optional[float] = None
+    dcf_valor_presente_flujos: Optional[float] = None
+    dcf_valor_terminal_descontado: Optional[float] = None
+    dcf_equity_value: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -339,6 +391,12 @@ class ValuationResult:
             "graham_g_original": self.graham_g_original,     # NUEVO
             "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
             "graham_g_capped": self.graham_g_capped,         # NUEVO
+            "dcf_wacc": self.dcf_wacc,                                     # NUEVO
+            "dcf_g_fcf": self.dcf_g_fcf,                                   # NUEVO
+            "dcf_fcf_base": self.dcf_fcf_base,                             # NUEVO
+            "dcf_valor_presente_flujos": self.dcf_valor_presente_flujos,   # NUEVO
+            "dcf_valor_terminal_descontado": self.dcf_valor_terminal_descontado,  # NUEVO
+            "dcf_equity_value": self.dcf_equity_value,                     # NUEVO
         }
 
 
@@ -448,17 +506,28 @@ def compute_valuation(
         if wacc is None:
             result.modelos_excluidos.append(ModeloExcluido("dcf", "wacc_no_calculable"))
         else:
-            result.valor_justo_dcf = calculate_dcf_fair_value(
+            dcf = calculate_dcf_fair_value(
                 fcf_historial=fcf_historial,
                 wacc=wacc,
                 shares_outstanding=shares_outstanding,
                 periodos_por_anio=periodos_por_anio_fcf,
                 fcf_base_override=fcf_base,
             )
-            if result.valor_justo_dcf is None:
+            result.valor_justo_dcf = dcf.valor_por_accion
+            if dcf.valor_por_accion is None:
                 result.modelos_excluidos.append(
                     ModeloExcluido("dcf", "dcf_no_calculable")
                 )
+            else:
+                # Mejora recomendada (a) de `security` -- gateo único: estos
+                # 6 campos SOLO se asignan si el DCF terminó siendo
+                # calculable, nunca 3+3 asignaciones sueltas.
+                result.dcf_wacc = wacc
+                result.dcf_g_fcf = g_fcf
+                result.dcf_fcf_base = fcf_base if fcf_base is not None else fcf_reciente
+                result.dcf_valor_presente_flujos = dcf.valor_presente_flujos
+                result.dcf_valor_terminal_descontado = dcf.valor_terminal_descontado
+                result.dcf_equity_value = dcf.equity_value
 
     valores = [
         v
@@ -494,6 +563,14 @@ class ScenarioValuationResult:
     graham_g_original: Optional[float] = None   # NUEVO — Iter-4
     graham_g_aplicado: Optional[float] = None   # NUEVO — Iter-4
     graham_g_capped: bool = False               # NUEVO — Iter-4
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #7 — mismo criterio
+    # que `ValuationResult`, ver docstring ahí.
+    dcf_wacc: Optional[float] = None
+    dcf_g_fcf: Optional[float] = None
+    dcf_fcf_base: Optional[float] = None
+    dcf_valor_presente_flujos: Optional[float] = None
+    dcf_valor_terminal_descontado: Optional[float] = None
+    dcf_equity_value: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -507,6 +584,12 @@ class ScenarioValuationResult:
             "graham_g_original": self.graham_g_original,     # NUEVO
             "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
             "graham_g_capped": self.graham_g_capped,         # NUEVO
+            "dcf_wacc": self.dcf_wacc,                                     # NUEVO
+            "dcf_g_fcf": self.dcf_g_fcf,                                   # NUEVO
+            "dcf_fcf_base": self.dcf_fcf_base,                             # NUEVO
+            "dcf_valor_presente_flujos": self.dcf_valor_presente_flujos,   # NUEVO
+            "dcf_valor_terminal_descontado": self.dcf_valor_terminal_descontado,  # NUEVO
+            "dcf_equity_value": self.dcf_equity_value,                     # NUEVO
         }
 
 
@@ -673,7 +756,7 @@ def compute_valuation_scenarios(
         else:
             wacc_escenario = wacc_conservador + wacc_delta
             g_fcf_escenario = g_fcf + g_delta
-            scenario.valor_justo_dcf = calculate_dcf_fair_value(
+            dcf = calculate_dcf_fair_value(
                 fcf_historial=fcf_historial,
                 wacc=wacc_escenario,
                 shares_outstanding=shares_outstanding,
@@ -681,8 +764,17 @@ def compute_valuation_scenarios(
                 periodos_por_anio=periodos_por_anio_fcf,
                 fcf_base_override=fcf_base,
             )
-            if scenario.valor_justo_dcf is None:
+            scenario.valor_justo_dcf = dcf.valor_por_accion
+            if dcf.valor_por_accion is None:
                 scenario.modelos_excluidos.append(ModeloExcluido("dcf", "dcf_no_calculable"))
+            else:
+                # Mejora recomendada (a) de `security` -- gateo único.
+                scenario.dcf_wacc = wacc_escenario
+                scenario.dcf_g_fcf = g_fcf_escenario
+                scenario.dcf_fcf_base = fcf_base if fcf_base is not None else fcf_reciente
+                scenario.dcf_valor_presente_flujos = dcf.valor_presente_flujos
+                scenario.dcf_valor_terminal_descontado = dcf.valor_terminal_descontado
+                scenario.dcf_equity_value = dcf.equity_value
 
         valores = [
             v

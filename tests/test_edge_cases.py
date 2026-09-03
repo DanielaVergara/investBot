@@ -48,7 +48,7 @@ def test_dcf_shares_outstanding_invalido():
             wacc=0.10,
             shares_outstanding=0,
         )
-        is None
+        == valuation._DCF_NO_CALCULABLE
     )
 
 

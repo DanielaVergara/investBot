@@ -2636,6 +2636,24 @@ def _sink_values_texto_libre(**overrides) -> dict:
         income_statement_fuente="trimestral",
         cash_flow_fuente="trimestral",
         peers_note="nota de peers de prueba",
+        # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 — 15 campos
+        # nuevos, siempre poblados juntos por el `.update()` real de
+        # `fetch_and_analyze_parts`.
+        eps_ttm=8.2,
+        y_value=0.042,
+        current_assets=100.0,
+        current_liabilities=50.0,
+        revenue=1000.0,
+        cost_of_revenue=400.0,
+        market_cap=2_000_000.0,
+        revenue_reciente=1000.0,
+        revenue_antiguo=800.0,
+        net_income_reciente=200.0,
+        net_income_antiguo=150.0,
+        year_high=600.0,
+        year_low=400.0,
+        price_avg_50=540.0,
+        price_avg_200=520.0,
     )
     defaults.update(overrides)
     return defaults
@@ -2667,7 +2685,7 @@ async def test_reply_markup_solo_en_ultimo_chunk_texto_libre_con_botones(conn_fa
     assert "reply_markup" not in call2.kwargs  # chunk 2/3, intermedio
     assert "reply_markup" in call3.kwargs  # chunk 3/3, el último
     keyboard = call3.kwargs["reply_markup"]
-    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5  # Nivel 1: ver/val/cal/rie/inf
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 6  # Nivel 1: ver(2 botones)/val/cal/rie/inf
 
 
 async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_factory, monkeypatch):
@@ -2700,7 +2718,7 @@ async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_f
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
     assert "reply_markup" in final_kwargs
     keyboard = final_kwargs["reply_markup"]
-    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 5  # Nivel 1: ver/val/cal/rie/inf
+    assert sum(len(fila) for fila in keyboard.inline_keyboard) == 6  # Nivel 1: ver(2 botones)/val/cal/rie/inf
 
 
 async def test_run_analysis_ollama_habilitado_mensaje_corto_end_to_end(adobe_fixtures, conn_factory, monkeypatch):

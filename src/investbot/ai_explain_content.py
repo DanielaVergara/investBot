@@ -15,13 +15,27 @@ es texto fijo del código (Decisión de diseño #5, #6, #7 de la spec).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
+
+# Decisión de diseño #1 (SDD_explicacion_paso_a_paso.md) -- 3 variantes,
+# reemplazan el booleano `requires_ollama` de la spec anterior:
+# - "dato_y_paso_a_paso": 2 botones -- "Ver dato" (determinístico, nunca
+#   llama a Ollama) y "Explicame paso a paso" (llama a Ollama con la cuenta
+#   ya resuelta como dato garantizado).
+# - "narrativa": 1 botón, llama a Ollama, sin cuenta (no hay fórmula propia
+#   del bot detrás -- mod/ben/ren).
+# - "deterministico": 1 botón, nunca llama a Ollama (evt/inf).
+VARIANT_DATO_Y_PASO_A_PASO = "dato_y_paso_a_paso"
+VARIANT_NARRATIVA = "narrativa"
+VARIANT_DETERMINISTICO = "deterministico"
 
 
 @dataclass(frozen=True)
 class QuestionSpec:
     label: str  # texto del botón (Nivel 2, o Nivel 1 si es leaf suelto)
-    pregunta_fija: str  # solo se usa si requires_ollama=True
-    requires_ollama: bool  # False para "evt"/"inf" (Decisión de diseño #4)
+    variant: str  # "dato_y_paso_a_paso" | "narrativa" | "deterministico"
+    pregunta_narrativa: Optional[str] = None  # solo si variant == "narrativa"
+    pregunta_paso_a_paso: Optional[str] = None  # solo si variant == "dato_y_paso_a_paso"
 
 
 @dataclass(frozen=True)
@@ -35,81 +49,103 @@ class CategorySpec:
 QUESTIONS_TEXTO_LIBRE: dict[str, QuestionSpec] = {
     "ver": QuestionSpec(
         "⚖️ Veredicto",
-        "Explicá en 2 a 4 oraciones por qué el veredicto (barata/cara/sin "
-        "datos) salió así para este ticker, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones por qué el veredicto (barata/cara/sin "
+            "datos) salió así para este ticker, usando SOLO los datos del JSON."
+        ),
     ),
     "vf": QuestionSpec(
         "💰 Valor Justo Total",
-        "Explicá en 2 a 4 oraciones qué significa el rango de Valor Justo "
-        "estimado para esta empresa y cómo se compara con el precio actual, "
-        "para el escenario elegido, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué significa el rango de Valor Justo "
+            "estimado para esta empresa y cómo se compara con el precio actual, "
+            "para el escenario elegido, usando SOLO los datos del JSON."
+        ),
     ),
     "gra": QuestionSpec(
         "Graham (EPS)",
-        "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
-        "Graham (EPS) para este ticker en los 3 escenarios, usando SOLO los "
-        "datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
+            "Graham (EPS) para este ticker en los 3 escenarios, usando SOLO los "
+            "datos del JSON."
+        ),
     ),
     "dcf": QuestionSpec(
         "DCF",
-        "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
-        "DCF (flujo de caja descontado) para este ticker en los 3 "
-        "escenarios, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
+            "DCF (flujo de caja descontado) para este ticker en los 3 "
+            "escenarios, usando SOLO los datos del JSON."
+        ),
     ),
     "mul": QuestionSpec(
         "Múltiplos",
-        "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
-        "de Múltiplos para este ticker en los 3 escenarios, usando SOLO los "
-        "datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué significa el resultado del modelo "
+            "de Múltiplos para este ticker en los 3 escenarios, usando SOLO los "
+            "datos del JSON."
+        ),
     ),
     "rat": QuestionSpec(
         "Ratios clave",
-        "Explicá en 2 a 4 oraciones qué dicen los ratios clave (liquidez, "
-        "margen bruto, PER, P/S) de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué dicen los ratios clave (liquidez, "
+            "margen bruto, PER, P/S) de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
     "pil": QuestionSpec(
         "🏛 Los 4 pilares",
-        "Explicá en 2 a 4 oraciones qué son los 4 pilares de \"buena "
-        "empresa\" evaluados y cuáles cumplió o no cumplió este ticker en "
-        "particular, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué son los 4 pilares de \"buena "
+            "empresa\" evaluados y cuáles cumplió o no cumplió este ticker en "
+            "particular, usando SOLO los datos del JSON."
+        ),
     ),
     "ren": QuestionSpec(
         "ROE y rentabilidad",
-        "Explicá en 2 a 4 oraciones qué dicen el ROE, la deuda y los "
-        "dividendos de este ticker sobre su rentabilidad, usando SOLO los "
-        "datos del JSON.",
-        True,
+        VARIANT_NARRATIVA,
+        pregunta_narrativa=(
+            "Explicá en 2 a 4 oraciones qué dicen el ROE, la deuda y los "
+            "dividendos de este ticker sobre su rentabilidad, usando SOLO los "
+            "datos del JSON."
+        ),
     ),
     "rsk": QuestionSpec(
         "Encaje con tu perfil",
-        "Explicá en 2 a 4 oraciones si este ticker encaja con el perfil de "
-        "riesgo guardado y por qué, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones si este ticker encaja con el perfil de "
+            "riesgo guardado y por qué, usando SOLO los datos del JSON."
+        ),
     ),
     "mom": QuestionSpec(
         "Momentum y volatilidad",
-        "Explicá en 2 a 4 oraciones qué dice el momentum de precio (y el "
-        "VIX si está disponible) sobre este ticker, usando SOLO los datos "
-        "del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué dice el momentum de precio (y el "
+            "VIX si está disponible) sobre este ticker, usando SOLO los datos "
+            "del JSON."
+        ),
     ),
     "cmp": QuestionSpec(
         "Comparables del sector",
-        "Explicá en 2 a 4 oraciones cómo se compara el PER de este ticker "
-        "con el de sus comparables del sector, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones cómo se compara el PER de este ticker "
+            "con el de sus comparables del sector, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
-    "evt": QuestionSpec("Eventos corporativos", "", False),
-    "inf": QuestionSpec("ℹ️ Fuentes y transparencia", "", False),
+    "evt": QuestionSpec("Eventos corporativos", VARIANT_DETERMINISTICO),
+    "inf": QuestionSpec("ℹ️ Fuentes y transparencia", VARIANT_DETERMINISTICO),
 }
 
 CATEGORIES_TEXTO_LIBRE: dict[str, CategorySpec] = {
@@ -219,102 +255,130 @@ FUENTES_TEXTO_LIBRE: dict[str, str] = {
 QUESTIONS_AVANZADO: dict[str, QuestionSpec] = {
     "mod": QuestionSpec(
         "❓ ¿Qué modelos aplican?",
-        "Explicá en 2 a 4 oraciones qué modelos de los 5 (Altman Z-Score, "
-        "Piotroski F-Score, Beneish M-Score, Magic Formula, Factores AQR) "
-        "fueron calculables para este ticker en particular y por qué, "
-        "usando SOLO los datos del JSON.",
-        True,
+        VARIANT_NARRATIVA,
+        pregunta_narrativa=(
+            "Explicá en 2 a 4 oraciones qué modelos de los 5 (Altman Z-Score, "
+            "Piotroski F-Score, Beneish M-Score, Magic Formula, Factores AQR) "
+            "fueron calculables para este ticker en particular y por qué, "
+            "usando SOLO los datos del JSON."
+        ),
     ),
     "alz": QuestionSpec(
         "Z (fórmula original)",
-        "Explicá en 2 a 4 oraciones qué mide el Altman Z-Score y qué "
-        "significa el resultado de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el Altman Z-Score y qué "
+            "significa el resultado de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
     "azp": QuestionSpec(
         "Z'' (asset-light)",
-        "Explicá en 2 a 4 oraciones qué mide la variante Z'' del Altman "
-        "Z-Score (para empresas asset-light) y qué significa el resultado "
-        "de este ticker, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide la variante Z'' del Altman "
+            "Z-Score (para empresas asset-light) y qué significa el resultado "
+            "de este ticker, usando SOLO los datos del JSON."
+        ),
     ),
     "pig": QuestionSpec(
         "Puntaje general",
-        "Explicá en 2 a 4 oraciones qué mide el Piotroski F-Score en "
-        "general y qué significa el puntaje total de este ticker, usando "
-        "SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el Piotroski F-Score en "
+            "general y qué significa el puntaje total de este ticker, usando "
+            "SOLO los datos del JSON."
+        ),
     ),
     "pir": QuestionSpec(
         "Rentabilidad",
-        "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
-        "rentabilidad del Piotroski F-Score y cuáles cumplió este ticker, "
-        "usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
+            "rentabilidad del Piotroski F-Score y cuáles cumplió este ticker, "
+            "usando SOLO los datos del JSON."
+        ),
     ),
     "pia": QuestionSpec(
         "Apalancamiento y liquidez",
-        "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
-        "apalancamiento y liquidez del Piotroski F-Score y cuáles cumplió "
-        "este ticker, usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
+            "apalancamiento y liquidez del Piotroski F-Score y cuáles cumplió "
+            "este ticker, usando SOLO los datos del JSON."
+        ),
     ),
     "pie": QuestionSpec(
         "Eficiencia",
-        "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
-        "eficiencia del Piotroski F-Score y cuáles cumplió este ticker, "
-        "usando SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué evalúan los criterios de "
+            "eficiencia del Piotroski F-Score y cuáles cumplió este ticker, "
+            "usando SOLO los datos del JSON."
+        ),
     ),
     "ben": QuestionSpec(
         "🚫 Beneish M",
-        "Explicá en 2 a 4 oraciones por qué el Beneish M-Score no es "
-        "calculable para este ticker con los datos disponibles, usando "
-        "SOLO los datos del JSON.",
-        True,
+        VARIANT_NARRATIVA,
+        pregunta_narrativa=(
+            "Explicá en 2 a 4 oraciones por qué el Beneish M-Score no es "
+            "calculable para este ticker con los datos disponibles, usando "
+            "SOLO los datos del JSON."
+        ),
     ),
     "mgr": QuestionSpec(
         "ROIC",
-        "Explicá en 2 a 4 oraciones qué mide el ROIC de la Magic Formula "
-        "y qué significa el valor de este ticker, usando SOLO los datos "
-        "del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el ROIC de la Magic Formula "
+            "y qué significa el valor de este ticker, usando SOLO los datos "
+            "del JSON."
+        ),
     ),
     "mge": QuestionSpec(
         "Earnings Yield",
-        "Explicá en 2 a 4 oraciones qué mide el Earnings Yield de la "
-        "Magic Formula y qué significa el valor de este ticker, usando "
-        "SOLO los datos del JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el Earnings Yield de la "
+            "Magic Formula y qué significa el valor de este ticker, usando "
+            "SOLO los datos del JSON."
+        ),
     ),
     "aqv": QuestionSpec(
         "Value",
-        "Explicá en 2 a 4 oraciones qué mide el factor Value y qué "
-        "significa la etiqueta de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el factor Value y qué "
+            "significa la etiqueta de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
     "aqq": QuestionSpec(
         "Quality",
-        "Explicá en 2 a 4 oraciones qué mide el factor Quality y qué "
-        "significa la etiqueta de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el factor Quality y qué "
+            "significa la etiqueta de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
     "aqm": QuestionSpec(
         "Momentum",
-        "Explicá en 2 a 4 oraciones qué mide el factor Momentum y qué "
-        "significa la etiqueta de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el factor Momentum y qué "
+            "significa la etiqueta de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
     "aql": QuestionSpec(
         "Low-vol",
-        "Explicá en 2 a 4 oraciones qué mide el factor Low-vol y qué "
-        "significa la etiqueta de este ticker, usando SOLO los datos del "
-        "JSON.",
-        True,
+        VARIANT_DATO_Y_PASO_A_PASO,
+        pregunta_paso_a_paso=(
+            "Explicá en 2 a 4 oraciones qué mide el factor Low-vol y qué "
+            "significa la etiqueta de este ticker, usando SOLO los datos del "
+            "JSON."
+        ),
     ),
 }
 
@@ -434,3 +498,28 @@ def formulas(kind: str) -> dict[str, str]:
 
 def fuentes(kind: str) -> dict[str, str]:
     return FUENTES_TEXTO_LIBRE if kind == "texto_libre" else FUENTES_AVANZADO
+
+
+# --- Decisión de diseño #2 (SDD_explicacion_paso_a_paso.md) -- el menú
+# reaparece SIEMPRE tras cualquier respuesta: Nivel 2 de la categoría si la
+# pregunta pertenece a una, Nivel 1 si es suelta. `category_of` es la
+# búsqueda inversa, precomputada a nivel de módulo (O(1), función pura). ---
+
+
+def _build_category_of_index(categories: dict[str, CategorySpec]) -> dict[str, str]:
+    index: dict[str, str] = {}
+    for cat_code, cat in categories.items():
+        for question_code in cat.question_codes:
+            index[question_code] = cat_code
+    return index
+
+
+_CATEGORY_OF_TEXTO_LIBRE: dict[str, str] = _build_category_of_index(CATEGORIES_TEXTO_LIBRE)
+_CATEGORY_OF_AVANZADO: dict[str, str] = _build_category_of_index(CATEGORIES_AVANZADO)
+
+
+def category_of(kind: str, code: str) -> Optional[str]:
+    """`None` si `code` es una pregunta suelta (Nivel 1) de este `kind`; el
+    código de categoría correspondiente en caso contrario."""
+    index = _CATEGORY_OF_TEXTO_LIBRE if kind == "texto_libre" else _CATEGORY_OF_AVANZADO
+    return index.get(code)

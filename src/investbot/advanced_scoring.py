@@ -98,6 +98,15 @@ class AltmanZResult:
     z: Optional[float] = None
     zona: Optional[str] = None  # "segura" | "gris" | "riesgo"
     campos_faltantes: list[str] = field(default_factory=list)
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- los 5
+    # componentes A-E, EXACTAMENTE los mismos valores ya usados para sumar
+    # `z`/`z''` (nunca recalculados aparte). `calculate_altman_z_prime_prime`
+    # no usa `e` (sin el factor Ventas/Activos) -- queda `None` ahí.
+    a: Optional[float] = None
+    b: Optional[float] = None
+    c: Optional[float] = None
+    d: Optional[float] = None
+    e: Optional[float] = None
 
 
 def calculate_altman_z(
@@ -144,6 +153,7 @@ def calculate_altman_z(
         disponible=True,
         z=z,
         zona=_clasificar_zona(z, ALTMAN_Z_UMBRAL_SEGURO, ALTMAN_Z_UMBRAL_GRIS),
+        a=a, b=b, c=c, d=d, e=e,
     )
 
 
@@ -191,6 +201,7 @@ def calculate_altman_z_prime_prime(
         zona=_clasificar_zona(
             z_pp, ALTMAN_Z_PRIME_PRIME_UMBRAL_SEGURO, ALTMAN_Z_PRIME_PRIME_UMBRAL_GRIS
         ),
+        a=a, b=b, c=c, d=d,
     )
 
 
@@ -203,6 +214,10 @@ def calculate_altman_z_prime_prime(
 class CriterioPiotroski:
     nombre: str
     cumplido: Optional[bool]  # `None` = no evaluable (dato faltante)
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- las magnitudes
+    # reales que determinaron `cumplido` (nunca poblado si `cumplido is None`
+    # -- criterio no evaluable, sin datos que mostrar).
+    valores: Optional[dict[str, float]] = None
 
 
 @dataclass
@@ -337,32 +352,99 @@ def calculate_piotroski_f_score(
     revenue_t = _get_num(income_reciente, "revenue")
     revenue_t1 = _get_num(income_anterior, "revenue")
 
+    def _valores_si_evaluable(cumplido: Optional[bool], **campos: Optional[float]) -> Optional[dict]:
+        """`None` si el criterio no fue evaluable (`cumplido is None`) --
+        nunca se arma un dict de magnitudes "reales" para un criterio sin
+        datos. Los `campos` ya vienen ratios/montos calculados por el
+        llamador (Decisión de diseño #3, "las magnitudes reales que
+        determinaron `cumplido`")."""
+        if cumplido is None:
+            return None
+        return campos
+
+    def _ratio(numerador: Optional[float], denominador: Optional[float]) -> Optional[float]:
+        if numerador is None or not denominador:
+            return None
+        return numerador / denominador
+
+    roa_t = _ratio(net_income_t, total_assets_t)
+    roa_t1 = _ratio(net_income_t1, total_assets_t1)
+    apalancamiento_t = _ratio(lt_debt_t, total_assets_t)
+    apalancamiento_t1 = _ratio(lt_debt_t1, total_assets_t1)
+    liquidez_t = _ratio(current_assets_t, current_liabilities_t)
+    liquidez_t1 = _ratio(current_assets_t1, current_liabilities_t1)
+    margen_t = _ratio(gross_profit_t, revenue_t)
+    margen_t1 = _ratio(gross_profit_t1, revenue_t1)
+    rotacion_t = _ratio(revenue_t, total_assets_t)
+    rotacion_t1 = _ratio(revenue_t1, total_assets_t1)
+
+    cumplido_roa_positivo = _criterio_roa_positivo(net_income_t)
+    cumplido_cfo_positivo = _criterio_cfo_positivo(cfo_t)
+    cumplido_roa_creciente = _criterio_roa_creciente(
+        net_income_t, total_assets_t, net_income_t1, total_assets_t1
+    )
+    cumplido_cfo_mayor_utilidad = _criterio_cfo_mayor_utilidad(cfo_t, net_income_t)
+    cumplido_apalancamiento_decreciente = _criterio_apalancamiento_decreciente(
+        lt_debt_t, total_assets_t, lt_debt_t1, total_assets_t1
+    )
+    cumplido_liquidez_creciente = _criterio_liquidez_creciente(
+        current_assets_t, current_liabilities_t, current_assets_t1, current_liabilities_t1
+    )
+    cumplido_sin_dilucion = _criterio_sin_dilucion(shares_t, shares_t1)
+    cumplido_margen_bruto_creciente = _criterio_margen_bruto_creciente(
+        gross_profit_t, revenue_t, gross_profit_t1, revenue_t1
+    )
+    cumplido_rotacion_activos_creciente = _criterio_rotacion_activos_creciente(
+        revenue_t, total_assets_t, revenue_t1, total_assets_t1
+    )
+
     criterios = [
-        CriterioPiotroski("roa_positivo", _criterio_roa_positivo(net_income_t)),
-        CriterioPiotroski("cfo_positivo", _criterio_cfo_positivo(cfo_t)),
         CriterioPiotroski(
-            "roa_creciente",
-            _criterio_roa_creciente(net_income_t, total_assets_t, net_income_t1, total_assets_t1),
-        ),
-        CriterioPiotroski("cfo_mayor_utilidad", _criterio_cfo_mayor_utilidad(cfo_t, net_income_t)),
-        CriterioPiotroski(
-            "apalancamiento_decreciente",
-            _criterio_apalancamiento_decreciente(lt_debt_t, total_assets_t, lt_debt_t1, total_assets_t1),
+            "roa_positivo", cumplido_roa_positivo,
+            valores=_valores_si_evaluable(cumplido_roa_positivo, net_income_t=net_income_t),
         ),
         CriterioPiotroski(
-            "liquidez_creciente",
-            _criterio_liquidez_creciente(
-                current_assets_t, current_liabilities_t, current_assets_t1, current_liabilities_t1
+            "cfo_positivo", cumplido_cfo_positivo,
+            valores=_valores_si_evaluable(cumplido_cfo_positivo, cfo_t=cfo_t),
+        ),
+        CriterioPiotroski(
+            "roa_creciente", cumplido_roa_creciente,
+            valores=_valores_si_evaluable(cumplido_roa_creciente, roa_t=roa_t, roa_t1=roa_t1),
+        ),
+        CriterioPiotroski(
+            "cfo_mayor_utilidad", cumplido_cfo_mayor_utilidad,
+            valores=_valores_si_evaluable(
+                cumplido_cfo_mayor_utilidad, cfo_t=cfo_t, net_income_t=net_income_t
             ),
         ),
-        CriterioPiotroski("sin_dilucion", _criterio_sin_dilucion(shares_t, shares_t1)),
         CriterioPiotroski(
-            "margen_bruto_creciente",
-            _criterio_margen_bruto_creciente(gross_profit_t, revenue_t, gross_profit_t1, revenue_t1),
+            "apalancamiento_decreciente", cumplido_apalancamiento_decreciente,
+            valores=_valores_si_evaluable(
+                cumplido_apalancamiento_decreciente,
+                apalancamiento_t=apalancamiento_t, apalancamiento_t1=apalancamiento_t1,
+            ),
         ),
         CriterioPiotroski(
-            "rotacion_activos_creciente",
-            _criterio_rotacion_activos_creciente(revenue_t, total_assets_t, revenue_t1, total_assets_t1),
+            "liquidez_creciente", cumplido_liquidez_creciente,
+            valores=_valores_si_evaluable(
+                cumplido_liquidez_creciente, liquidez_t=liquidez_t, liquidez_t1=liquidez_t1
+            ),
+        ),
+        CriterioPiotroski(
+            "sin_dilucion", cumplido_sin_dilucion,
+            valores=_valores_si_evaluable(cumplido_sin_dilucion, shares_t=shares_t, shares_t1=shares_t1),
+        ),
+        CriterioPiotroski(
+            "margen_bruto_creciente", cumplido_margen_bruto_creciente,
+            valores=_valores_si_evaluable(
+                cumplido_margen_bruto_creciente, margen_t=margen_t, margen_t1=margen_t1
+            ),
+        ),
+        CriterioPiotroski(
+            "rotacion_activos_creciente", cumplido_rotacion_activos_creciente,
+            valores=_valores_si_evaluable(
+                cumplido_rotacion_activos_creciente, rotacion_t=rotacion_t, rotacion_t1=rotacion_t1
+            ),
         ),
     ]
 
@@ -422,6 +504,15 @@ class MagicFormulaResult:
     roic: Optional[float] = None
     earnings_yield: Optional[float] = None
     campos_faltantes: list[str] = field(default_factory=list)
+    # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 -- los mismos
+    # valores ya usados para armar `roic`/`earnings_yield` (nunca
+    # recalculados aparte).
+    ebit: Optional[float] = None
+    capital_invertido: Optional[float] = None
+    ev: Optional[float] = None
+    market_cap: Optional[float] = None
+    total_debt: Optional[float] = None
+    cash: Optional[float] = None
 
 
 def calculate_magic_formula_metrics(
@@ -462,7 +553,17 @@ def calculate_magic_formula_metrics(
 
     roic = ebit / capital_invertido
     earnings_yield = ebit / ev
-    return MagicFormulaResult(disponible=True, roic=roic, earnings_yield=earnings_yield)
+    return MagicFormulaResult(
+        disponible=True,
+        roic=roic,
+        earnings_yield=earnings_yield,
+        ebit=ebit,
+        capital_invertido=capital_invertido,
+        ev=ev,
+        market_cap=mc,
+        total_debt=total_debt,
+        cash=cash,
+    )
 
 
 # ---------------------------------------------------------------------------

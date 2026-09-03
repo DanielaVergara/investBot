@@ -233,7 +233,7 @@ def test_dcf_fcf_historial_insuficiente_excluido():
             wacc=0.10,
             shares_outstanding=1_000_000,
         )
-        is None
+        == valuation._DCF_NO_CALCULABLE
     )
 
 
@@ -244,7 +244,7 @@ def test_dcf_wacc_none_excluido():
             wacc=None,
             shares_outstanding=1_000_000,
         )
-        is None
+        == valuation._DCF_NO_CALCULABLE
     )
 
 
@@ -255,7 +255,7 @@ def test_dcf_wacc_menor_a_terminal_growth_excluido():
             wacc=0.01,  # menor al terminal growth (0.025) -> denominador negativo
             shares_outstanding=1_000_000,
         )
-        is None
+        == valuation._DCF_NO_CALCULABLE
     )
 
 
@@ -266,7 +266,7 @@ def test_dcf_fcf_base_negativo_excluido():
             wacc=0.10,
             shares_outstanding=1_000_000,
         )
-        is None
+        == valuation._DCF_NO_CALCULABLE
     )
 
 
@@ -279,7 +279,7 @@ def test_dcf_verificado_a_mano_valor_presente_primer_flujo():
         wacc=wacc,
         shares_outstanding=1000,
     )
-    assert resultado is not None
+    assert resultado.valor_por_accion is not None
     # Reconstrucción manual del primer término de la proyección:
     fcf_reciente = fcf_historial[-1]
     g_fcf = valuation.calculate_cagr(fcf_reciente, fcf_historial[0], 4)
@@ -427,15 +427,15 @@ def test_dcf_g_fcf_override_reemplaza_el_cagr_interno():
 
     sin_override = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000
-    )
+    ).valor_por_accion
     con_override_mismo_valor = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000, g_fcf_override=0.08
-    )
+    ).valor_por_accion
     assert con_override_mismo_valor == pytest.approx(sin_override)
 
     con_override_distinto = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000, g_fcf_override=0.11
-    )
+    ).valor_por_accion
     assert con_override_distinto != pytest.approx(sin_override)
     assert con_override_distinto > sin_override  # más crecimiento -> más valor
 
@@ -901,12 +901,12 @@ def test_calculate_dcf_fair_value_fcf_base_override_cambia_la_proyeccion():
     wacc = 0.12
     sin_override = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
-    )
+    ).valor_por_accion
     fcf_base = fcf_historial[-1] * 2  # ancla del doble
     con_override = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
         fcf_base_override=fcf_base,
-    )
+    ).valor_por_accion
     assert con_override is not None and sin_override is not None
     assert con_override == pytest.approx(sin_override * 2)
 
@@ -924,11 +924,11 @@ def test_calculate_dcf_fair_value_g_fcf_se_mide_sobre_crudo_no_sobre_fcf_base():
     con_fcf_base_absurdo = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
         fcf_base_override=1.0,  # ancla de nivel absurdamente chica
-    )
+    ).valor_por_accion
     con_g_fcf_override_explicito = valuation.calculate_dcf_fair_value(
         fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=1000,
         fcf_base_override=1.0, g_fcf_override=g_fcf_esperado,
-    )
+    ).valor_por_accion
     # Si `g_fcf` se calculara sobre `fcf_base_override` (bug), estos 2
     # resultados diferirían -- al medirse siempre sobre el historial crudo,
     # son idénticos.
@@ -943,7 +943,7 @@ def test_calculate_dcf_fair_value_periodos_por_anio_4_piso_8_elementos_rechaza()
         fcf_historial=fcf_historial, wacc=0.12, shares_outstanding=1000,
         periodos_por_anio=4,
     )
-    assert resultado is None
+    assert resultado == valuation._DCF_NO_CALCULABLE
 
 
 def test_calculate_dcf_fair_value_periodos_por_anio_4_piso_9_elementos_acepta():
@@ -952,7 +952,7 @@ def test_calculate_dcf_fair_value_periodos_por_anio_4_piso_9_elementos_acepta():
         fcf_historial=fcf_historial, wacc=0.12, shares_outstanding=1000,
         periodos_por_anio=4,
     )
-    assert resultado is not None
+    assert resultado.valor_por_accion is not None
 
 
 def test_compute_valuation_defaults_regresion_byte_a_byte():
@@ -1586,3 +1586,139 @@ def test_compute_valuation_12_trimestres_ttm_no_excluido_end_to_end():
     assert result.valor_justo_graham is not None
     motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
     assert "graham" not in motivos
+
+
+# ---------------------------------------------------------------------------
+# SDD_explicacion_paso_a_paso.md — hallazgo BLOQUEANTE de `security`: los 4
+# caminos de retorno temprano de `calculate_dcf_fair_value` devuelven
+# `DCFBreakdown` con los 5 campos en `None` (nunca un `None` desnudo), y los
+# 2 call sites nunca lanzan `AttributeError` cuando el DCF no es calculable.
+# ---------------------------------------------------------------------------
+
+
+def test_dcf_breakdown_fcf_historial_insuficiente_devuelve_campos_none():
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=[100, 110],  # 2 registros, insuficiente
+        wacc=0.10,
+        shares_outstanding=1_000_000,
+    )
+    assert resultado == valuation._DCF_NO_CALCULABLE
+
+
+@pytest.mark.parametrize("shares_outstanding", [None, 0, -1])
+def test_dcf_breakdown_shares_outstanding_invalido_devuelve_campos_none(shares_outstanding):
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=[100.0, 110.0, 120.0, 130.0, 140.0],
+        wacc=0.10,
+        shares_outstanding=shares_outstanding,
+    )
+    assert resultado == valuation._DCF_NO_CALCULABLE
+
+
+@pytest.mark.parametrize("wacc", [None, 0.025, 0.01])  # None, == terminal_growth, < terminal_growth
+def test_dcf_breakdown_wacc_no_supera_terminal_growth_devuelve_campos_none(wacc):
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=[100.0, 110.0, 120.0, 130.0, 140.0],
+        wacc=wacc,
+        shares_outstanding=1_000_000,
+    )
+    assert resultado == valuation._DCF_NO_CALCULABLE
+
+
+def test_dcf_breakdown_cagr_no_calculable_devuelve_campos_none():
+    resultado = valuation.calculate_dcf_fair_value(
+        fcf_historial=[-100.0, 50.0, 60.0, 70.0, 80.0],  # base negativa -> CAGR None
+        wacc=0.10,
+        shares_outstanding=1_000_000,
+    )
+    assert resultado == valuation._DCF_NO_CALCULABLE
+
+
+def test_compute_valuation_dcf_no_calculable_sin_attribute_error():
+    """El único de los 4 caminos NO pre-filtrado ya por `compute_valuation`
+    antes de invocar `calculate_dcf_fair_value` (confirmado leyendo
+    `valuation.py`): `shares_outstanding` inválido. Sin este fix, revienta
+    con `AttributeError: 'NoneType' object has no attribute 'valor_por_accion'`."""
+    result = valuation.compute_valuation(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=0,  # inválido
+    )
+    assert result.valor_justo_dcf is None
+    motivos = {m.modelo: m.motivo for m in result.modelos_excluidos}
+    assert motivos.get("dcf") == "dcf_no_calculable"
+    assert result.dcf_wacc is None
+    assert result.dcf_g_fcf is None
+    assert result.dcf_fcf_base is None
+    assert result.dcf_valor_presente_flujos is None
+    assert result.dcf_valor_terminal_descontado is None
+    assert result.dcf_equity_value is None
+
+
+def test_compute_valuation_scenarios_dcf_no_calculable_sin_attribute_error():
+    """Mismo caso que arriba, ejercitando el segundo call site
+    (`compute_valuation_scenarios`) para los 3 escenarios."""
+    peer_average = peers.PeerAverageResult(
+        per_promedio=20.0, per_minimo=18.0, per_maximo=25.0,
+        peers_usados=["MSFT", "CRM"],
+    )
+    scenarios = valuation.compute_valuation_scenarios(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        peer_average=peer_average,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=0,  # inválido -> AttributeError si el fix no se aplica
+    )
+    for escenario in (scenarios.pesimista, scenarios.conservador, scenarios.optimista):
+        assert escenario.valor_justo_dcf is None
+        motivos = {m.modelo: m.motivo for m in escenario.modelos_excluidos}
+        assert motivos.get("dcf") == "dcf_no_calculable"
+        assert escenario.dcf_wacc is None
+        assert escenario.dcf_g_fcf is None
+        assert escenario.dcf_fcf_base is None
+        assert escenario.dcf_valor_presente_flujos is None
+        assert escenario.dcf_valor_terminal_descontado is None
+        assert escenario.dcf_equity_value is None
+
+
+def test_dcf_breakdown_campos_intermedios_reconstruyen_valor_por_accion():
+    """`fcf_proyectado_final`/`valor_presente_flujos`/`valor_terminal_
+    descontado`/`equity_value` son EXACTAMENTE los valores intermedios que
+    ya se usan para armar `valor_por_accion` -- test de reconstrucción,
+    mismo criterio que Altman/MagicFormula."""
+    fcf_historial = [100.0, 108.0, 116.64, 125.9712, 136.048896]
+    wacc = 0.12
+    shares_outstanding = 1000.0
+    dcf = valuation.calculate_dcf_fair_value(
+        fcf_historial=fcf_historial, wacc=wacc, shares_outstanding=shares_outstanding,
+    )
+    assert dcf.valor_por_accion is not None
+    reconstruido = (dcf.valor_presente_flujos + dcf.valor_terminal_descontado) / shares_outstanding
+    assert reconstruido == pytest.approx(dcf.valor_por_accion)
+    assert dcf.equity_value == pytest.approx(dcf.valor_presente_flujos + dcf.valor_terminal_descontado)
+    assert dcf.fcf_proyectado_final > fcf_historial[-1]  # creció con g_fcf > 0
+
+
+def test_compute_valuation_dcf_calculable_puebla_los_6_campos_nuevos():
+    result = valuation.compute_valuation(
+        eps_ttm=10.0,
+        eps_historial=[5.0, 6.0, 7.0, 8.0, 10.0],
+        per_promedio_peers=20.0,
+        fcf_historial=[80.0, 90.0, 100.0, 110.0, 120.0],
+        y=0.044,
+        wacc_inputs=_wacc_inputs_validos(),
+        shares_outstanding=1_000_000,
+    )
+    assert result.valor_justo_dcf is not None
+    assert result.dcf_wacc is not None
+    assert result.dcf_g_fcf is not None
+    assert result.dcf_fcf_base == pytest.approx(120.0)  # último punto crudo (sin fcf_base override)
+    assert result.dcf_valor_presente_flujos is not None
+    assert result.dcf_valor_terminal_descontado is not None
+    assert result.dcf_equity_value is not None

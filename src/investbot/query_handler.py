@@ -588,6 +588,25 @@ async def fetch_and_analyze_parts(
             income_statement_fuente=income_statements_fuente,
             cash_flow_fuente=cash_flow_fuente,
             peers_note=summary._build_peers_note(peer_comparison_dict["fuente_peers"]),
+            # SDD_explicacion_paso_a_paso.md, Decisión de diseño #3 — los
+            # ~15 campos nuevos para el bloque "🧮 Cuenta" de "paso a paso":
+            # todos ya calculados como locales arriba, cero llamada HTTP
+            # nueva.
+            eps_ttm=eps_ttm,
+            y_value=y_value,
+            current_assets=current_assets,
+            current_liabilities=current_liabilities,
+            revenue=revenue,
+            cost_of_revenue=cost_of_revenue,
+            market_cap=market_cap,
+            revenue_reciente=revenue_historial[-1] if revenue_historial else None,
+            revenue_antiguo=revenue_historial[0] if revenue_historial else None,
+            net_income_reciente=net_income_historial[-1] if net_income_historial else None,
+            net_income_antiguo=net_income_historial[0] if net_income_historial else None,
+            year_high=quote.get("yearHigh"),
+            year_low=quote.get("yearLow"),
+            price_avg_50=quote.get("priceAvg50"),
+            price_avg_200=quote.get("priceAvg200"),
         )
 
     if use_short_summary:
@@ -1077,6 +1096,21 @@ def build_query_handlers(
                     income_statement_fuente=explain_context_sink["income_statement_fuente"],
                     cash_flow_fuente=explain_context_sink["cash_flow_fuente"],
                     peers_note=explain_context_sink["peers_note"],
+                    eps_ttm=explain_context_sink["eps_ttm"],
+                    y_value=explain_context_sink["y_value"],
+                    current_assets=explain_context_sink["current_assets"],
+                    current_liabilities=explain_context_sink["current_liabilities"],
+                    revenue=explain_context_sink["revenue"],
+                    cost_of_revenue=explain_context_sink["cost_of_revenue"],
+                    market_cap=explain_context_sink["market_cap"],
+                    revenue_reciente=explain_context_sink["revenue_reciente"],
+                    revenue_antiguo=explain_context_sink["revenue_antiguo"],
+                    net_income_reciente=explain_context_sink["net_income_reciente"],
+                    net_income_antiguo=explain_context_sink["net_income_antiguo"],
+                    year_high=explain_context_sink["year_high"],
+                    year_low=explain_context_sink["year_low"],
+                    price_avg_50=explain_context_sink["price_avg_50"],
+                    price_avg_200=explain_context_sink["price_avg_200"],
                 )
                 context_id = explanation_store.put(explanation_context)
                 keyboard = ai_explain.build_keyboard("texto_libre", context_id)

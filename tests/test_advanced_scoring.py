@@ -466,3 +466,125 @@ def test_calculate_piotroski_es_pura_mismo_input_mismo_output():
     )
     assert r1.puntaje == r2.puntaje
     assert r1.criterios_evaluables == r2.criterios_evaluables
+
+
+# ---------------------------------------------------------------------------
+# SDD_explicacion_paso_a_paso.md, "Campos nuevos — sin cálculo nuevo, solo
+# exposición" -- los campos nuevos expuestos por AltmanZResult/
+# CriterioPiotroski.valores/MagicFormulaResult reconstruyen EXACTAMENTE el
+# resultado ya calculado con la fórmula documentada.
+# ---------------------------------------------------------------------------
+
+
+def test_altman_z_campos_a_e_reconstruyen_z_con_los_coeficientes_documentados():
+    result = scoring.calculate_altman_z(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is True
+    assert None not in (result.a, result.b, result.c, result.d, result.e)
+    reconstruido = 1.2 * result.a + 1.4 * result.b + 3.3 * result.c + 0.6 * result.d + 1.0 * result.e
+    assert reconstruido == pytest.approx(result.z)
+
+
+def test_altman_z_prime_prime_campos_a_d_reconstruyen_z_pp_sin_e():
+    result = scoring.calculate_altman_z_prime_prime(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is True
+    assert None not in (result.a, result.b, result.c, result.d)
+    assert result.e is None  # Z'' no usa el factor E (ventas/activos)
+    reconstruido = 6.56 * result.a + 3.26 * result.b + 6.72 * result.c + 1.05 * result.d
+    assert reconstruido == pytest.approx(result.z)
+
+
+def test_altman_z_no_disponible_campos_a_e_en_none():
+    balance = {**BALANCE_RECIENTE, "totalAssets": None}
+    result = scoring.calculate_altman_z(balance=balance, income=INCOME_RECIENTE, market_cap=MARKET_CAP)
+    assert result.disponible is False
+    assert (result.a, result.b, result.c, result.d, result.e) == (None, None, None, None, None)
+
+
+def test_magic_formula_campos_nuevos_reconstruyen_roic_y_earnings_yield():
+    result = scoring.calculate_magic_formula_metrics(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is True
+    assert None not in (
+        result.ebit, result.capital_invertido, result.ev,
+        result.market_cap, result.total_debt, result.cash,
+    )
+    roic_reconstruido = result.ebit / result.capital_invertido
+    ey_reconstruido = result.ebit / result.ev
+    assert roic_reconstruido == pytest.approx(result.roic)
+    assert ey_reconstruido == pytest.approx(result.earnings_yield)
+    ev_reconstruido = result.market_cap + result.total_debt - result.cash
+    assert ev_reconstruido == pytest.approx(result.ev)
+
+
+def test_magic_formula_no_disponible_campos_nuevos_en_none():
+    result = scoring.calculate_magic_formula_metrics(
+        balance={**BALANCE_RECIENTE, "totalDebt": None}, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is False
+    assert result.ebit is None
+    assert result.capital_invertido is None
+    assert result.ev is None
+
+
+_PIOTROSKI_VALORES_ESPERADOS = {
+    "roa_positivo": ("net_income_t",),
+    "cfo_positivo": ("cfo_t",),
+    "roa_creciente": ("roa_t", "roa_t1"),
+    "cfo_mayor_utilidad": ("cfo_t", "net_income_t"),
+    "apalancamiento_decreciente": ("apalancamiento_t", "apalancamiento_t1"),
+    "liquidez_creciente": ("liquidez_t", "liquidez_t1"),
+    "sin_dilucion": ("shares_t", "shares_t1"),
+    "margen_bruto_creciente": ("margen_t", "margen_t1"),
+    "rotacion_activos_creciente": ("rotacion_t", "rotacion_t1"),
+}
+
+
+@pytest.mark.parametrize("nombre,claves", list(_PIOTROSKI_VALORES_ESPERADOS.items()))
+def test_piotroski_valores_presentes_por_criterio_evaluable(nombre, claves):
+    """Para cada uno de los 9 criterios, el dict `valores` contiene las
+    magnitudes reales que determinaron `cumplido` (test por criterio, con un
+    fixture donde se conoce el resultado esperado)."""
+    result = scoring.calculate_piotroski_f_score(
+        balance_reciente=BALANCE_RECIENTE, balance_anterior=BALANCE_ANTERIOR,
+        income_reciente=INCOME_RECIENTE, income_anterior=INCOME_ANTERIOR,
+        cash_flow_reciente=CASH_FLOW_RECIENTE,
+    )
+    criterio = next(c for c in result.criterios if c.nombre == nombre)
+    assert criterio.cumplido is not None
+    assert criterio.valores is not None
+    for clave in claves:
+        assert clave in criterio.valores
+        assert criterio.valores[clave] is not None
+
+
+def test_piotroski_criterio_no_evaluable_valores_en_none():
+    """Ningún criterio no evaluable arma un dict de "magnitudes reales" --
+    `valores` queda `None`, nunca un dict con `None` adentro."""
+    balance_reciente_sin_lt_debt = {**BALANCE_RECIENTE, "longTermDebt": None}
+    result = scoring.calculate_piotroski_f_score(
+        balance_reciente=balance_reciente_sin_lt_debt, balance_anterior=BALANCE_ANTERIOR,
+        income_reciente=INCOME_RECIENTE, income_anterior=INCOME_ANTERIOR,
+        cash_flow_reciente=CASH_FLOW_RECIENTE,
+    )
+    criterio = next(c for c in result.criterios if c.nombre == "apalancamiento_decreciente")
+    assert criterio.cumplido is None
+    assert criterio.valores is None
+
+
+def test_piotroski_roa_creciente_valores_reconstruyen_la_comparacion():
+    result = scoring.calculate_piotroski_f_score(
+        balance_reciente=BALANCE_RECIENTE, balance_anterior=BALANCE_ANTERIOR,
+        income_reciente=INCOME_RECIENTE, income_anterior=INCOME_ANTERIOR,
+        cash_flow_reciente=CASH_FLOW_RECIENTE,
+    )
+    criterio = next(c for c in result.criterios if c.nombre == "roa_creciente")
+    roa_t_esperado = INCOME_RECIENTE["netIncome"] / BALANCE_RECIENTE["totalAssets"]
+    roa_t1_esperado = INCOME_ANTERIOR["netIncome"] / BALANCE_ANTERIOR["totalAssets"]
+    assert criterio.valores["roa_t"] == pytest.approx(roa_t_esperado)
+    assert criterio.valores["roa_t1"] == pytest.approx(roa_t1_esperado)
+    assert criterio.cumplido == (roa_t_esperado > roa_t1_esperado)
