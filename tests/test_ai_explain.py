@@ -1076,6 +1076,138 @@ async def test_fetch_explanation_num_predict_y_formato_correctos():
 
 
 # ---------------------------------------------------------------------------
+# G bis. Eco del JSON de entrada -- incidente de producción 2026-09-03
+# (captura de Daniela: `qwen2.5:3b-instruct` repitió `datos_del_contexto`
+# pegado adelante de la explicación real, separado por " -- ").
+# ---------------------------------------------------------------------------
+
+# `datos_del_contexto` EXACTO de la evidencia real (pregunta "ver", texto
+# libre -- ver `_payload_texto_libre`).
+_DATOS_EVIDENCIA_REAL = {
+    "modelo": "Graham (EPS) + DCF (flujo de caja descontado) + los 4 pilares de calidad fundamental",
+    "veredicto_barata": True,
+    "escenario_elegido": "conservador",
+    "precio_actual": 286.635,
+    "valor_justo_total": 403.6118412598229,
+}
+
+
+def _respuesta_con_eco(datos: dict, texto_real: str) -> str:
+    """Reproduce el patrón exacto de la evidencia: el JSON de `datos`
+    serializado igual que `_fetch_explanation` arma el prompt, pegado
+    adelante de la explicación real, separado por " -- "."""
+    return f"{json.dumps(datos, ensure_ascii=False)} -- {texto_real}"
+
+
+def _tokens_de(datos: dict) -> set[str]:
+    """Mismo cálculo que `_dispatch_leaf` hace en producción antes de
+    llamar a `_fetch_explanation` -- usado acá para que el guard de
+    integridad no interfiera con los tests de detección de eco (que ya
+    tienen su propia cobertura dedicada más arriba en el archivo)."""
+    return {
+        ai_explain._normalize_numeric_token(t)
+        for t in ai_rewrite.protected_tokens(json.dumps(datos, ensure_ascii=False, default=str))
+    }
+
+
+def test_respuesta_es_eco_detecta_el_patron_exacto_de_la_evidencia_real():
+    respuesta = _respuesta_con_eco(
+        _DATOS_EVIDENCIA_REAL,
+        "El veredicto de la inversión en este ticker como 'barata' se basa en que el "
+        "precio actual ($286.63) es menor al valor justo total ($403.61).",
+    )
+    assert ai_explain._respuesta_es_eco_del_payload(respuesta, _DATOS_EVIDENCIA_REAL) is True
+
+
+def test_respuesta_es_eco_no_da_falso_positivo_en_respuesta_limpia():
+    respuesta = (
+        "Graham + DCF + los 4 pilares evalúan si la acción cotiza por debajo de su "
+        "valor justo estimado. Con el precio actual bajo el valor justo total, el "
+        "modelo la marca como barata en el escenario conservador."
+    )
+    assert ai_explain._respuesta_es_eco_del_payload(respuesta, _DATOS_EVIDENCIA_REAL) is False
+
+
+async def test_fetch_explanation_eco_del_payload_reintenta_y_se_recupera(caplog):
+    """1er intento: mismo patrón exacto de la evidencia real (JSON de
+    entrada + " -- " + explicación). 2o intento (reintento): respuesta
+    limpia. `_fetch_explanation` NUNCA debe devolver el JSON crudo -- debe
+    recuperarse con la respuesta limpia del reintento."""
+    call_count = {"n": 0}
+    texto_real = (
+        "El veredicto de la inversión en este ticker como 'barata' se basa en que el "
+        "precio actual ($286.635) es menor al valor justo total ($403.6118412598229)."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            eco = _respuesta_con_eco(_DATOS_EVIDENCIA_REAL, texto_real)
+            return httpx.Response(200, json={"response": json.dumps({"respuesta": eco})})
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+
+    with caplog.at_level(logging.INFO):
+        resultado = await ai_explain._fetch_explanation(
+            **_fetch_kwargs(
+                http_client=_client_with_handler(handler),
+                datos=_DATOS_EVIDENCIA_REAL,
+                tokens=_tokens_de(_DATOS_EVIDENCIA_REAL),
+            )
+        )
+
+    assert call_count["n"] == 2
+    assert resultado == texto_real
+    assert json.dumps(_DATOS_EVIDENCIA_REAL, ensure_ascii=False) not in resultado
+    assert any("reintentando" in r.message for r in caplog.records)
+
+
+async def test_fetch_explanation_eco_del_payload_en_ambos_intentos_cae_a_unavailable(caplog):
+    """Si el eco del JSON de entrada se repite en el reintento también, se
+    hacen exactamente 2 llamadas HTTP y el resultado final es
+    `_ExplainUnavailable` -- el JSON crudo nunca llega al usuario."""
+    call_count = {"n": 0}
+    texto_real = "El precio actual es menor al valor justo total."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        eco = _respuesta_con_eco(_DATOS_EVIDENCIA_REAL, texto_real)
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": eco})})
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ai_explain._ExplainUnavailable):
+            await ai_explain._fetch_explanation(
+                **_fetch_kwargs(
+                    http_client=_client_with_handler(handler),
+                    datos=_DATOS_EVIDENCIA_REAL,
+                )
+            )
+
+    assert call_count["n"] == 2
+
+
+async def test_fetch_explanation_respuesta_limpia_sin_eco_pasa_normal():
+    """Sin el patrón de eco, una respuesta limpia sigue devolviéndose tal
+    cual en el primer intento -- sin falsos positivos ni reintento."""
+    call_count = {"n": 0}
+    texto_real = "Graham + DCF miden el valor justo combinando múltiplos, flujo de caja y calidad fundamental."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+
+    resultado = await ai_explain._fetch_explanation(
+        **_fetch_kwargs(
+            http_client=_client_with_handler(handler),
+            datos=_DATOS_EVIDENCIA_REAL,
+            tokens=_tokens_de(_DATOS_EVIDENCIA_REAL),
+        )
+    )
+
+    assert call_count["n"] == 1
+    assert resultado == texto_real
+
+
+# ---------------------------------------------------------------------------
 # H. Flujo completo del handler -- leaf con Ollama ("Explicame paso a paso",
 # callback_data=xp:{id}:p:{code})
 # ---------------------------------------------------------------------------

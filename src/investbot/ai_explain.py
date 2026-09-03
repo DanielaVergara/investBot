@@ -1230,6 +1230,10 @@ SYSTEM_PROMPT_EXPLAIN = (
     "   \"modelo\" o \"modelos\", nombrá ese/esos modelo(s) financiero(s) al\n"
     "   principio de tu respuesta y decí en general qué mide -- sin salirte\n"
     "   de las 2 a 4 oraciones de la regla 1.\n"
+    "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
+    "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
+    "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
+    "   de él.\n"
 )
 
 # Decisión de diseño #4 de SDD_explicacion_paso_a_paso.md -- NO reemplaza
@@ -1257,6 +1261,10 @@ SYSTEM_PROMPT_PASO_A_PASO = (
     "5. Con tono de análisis de inversionista: nombrá el modelo financiero\n"
     "   (\"modelo\"/\"modelos\" en el JSON) al principio de tu respuesta y decí en\n"
     "   general qué mide -- sin salirte de las 2 a 4 oraciones de la regla 1.\n"
+    "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
+    "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
+    "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
+    "   de él.\n"
 )
 
 MAX_EXPLANATION_OUTPUT_TOKENS = 220
@@ -1315,6 +1323,55 @@ def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
             continue
         return False
     return True
+
+
+# --- Detección de eco del JSON de entrada (incidente de producción
+# 2026-09-03, captura de Daniela): `qwen2.5:3b-instruct` a veces devuelve
+# `{"respuesta": "<datos_del_contexto repetido> -- <explicación real>"}` --
+# el parseo del contrato `{"respuesta": "..."}` es válido (no dispara
+# `json.JSONDecodeError`/`ValueError`/`KeyError`), pero el CONTENIDO de
+# `respuesta` es el eco del payload que le mandamos, no una explicación.
+# Tratado igual que una estructura JSON inesperada: reintento único, y si
+# el reintento también da el mismo patrón, `_ExplainUnavailable`. -----------
+
+_ECO_PREFIX_CHARS = 50
+_ECO_SEPARADOR_RE = re.compile(r"\}\s*--\s*")
+
+
+def _normalizar_para_comparar_eco(texto: str) -> str:
+    return re.sub(r"\s+", "", texto)
+
+
+def _respuesta_es_eco_del_payload(respuesta: str, datos_del_contexto: dict) -> bool:
+    """Dos señales independientes, cualquiera dispara -- ninguna depende de
+    que Ollama serialice el JSON EXACTAMENTE igual a `json.dumps`, ya que
+    puede reformatear espacios al repetirlo:
+    1. Los primeros `_ECO_PREFIX_CHARS` de `respuesta` (sin espacios)
+       coinciden con los primeros `_ECO_PREFIX_CHARS` del `datos_del_
+       contexto` serializado (sin espacios) -- comparación real contra lo
+       que se envió, no solo "empieza con {" (evita falsos positivos si
+       alguna vez una respuesta legítima arrancara con una llave).
+    2. Aparece el separador visto en la evidencia real ("} -- "/"}-- ")
+       cerca del principio de `respuesta`, con contenido real después --
+       señal tolerante para el caso en que el eco no sea 100% textual.
+    """
+    texto = respuesta.strip()
+    if not texto:
+        return False
+
+    payload_json = json.dumps(datos_del_contexto, ensure_ascii=False)
+    texto_norm = _normalizar_para_comparar_eco(texto)[:_ECO_PREFIX_CHARS]
+    payload_norm = _normalizar_para_comparar_eco(payload_json)[:_ECO_PREFIX_CHARS]
+    if texto_norm and payload_norm and texto_norm == payload_norm:
+        return True
+
+    match = _ECO_SEPARADOR_RE.search(texto[:200])
+    if match is not None and texto[: match.start() + 1].lstrip().startswith("{"):
+        resto = texto[match.end():].strip()
+        if resto:
+            return True
+
+    return False
 
 
 class _ExplainUnavailable(Exception):
@@ -1379,18 +1436,22 @@ async def _fetch_explanation(
             parsed = json.loads(raw_text)
             if not isinstance(parsed, dict) or not isinstance(parsed.get("respuesta"), str):
                 raise ValueError("estructura inesperada -- falta la clave 'respuesta' string")
-            respuesta = parsed["respuesta"]
+            respuesta_candidata = parsed["respuesta"]
+            if _respuesta_es_eco_del_payload(respuesta_candidata, datos_del_contexto):
+                raise ValueError("respuesta contiene el eco del JSON de entrada")
+            respuesta = respuesta_candidata
             break
         except (json.JSONDecodeError, ValueError) as exc:
             if attempt == 0:
                 logger.info(
-                    "Respuesta de Ollama con estructura JSON inesperada generando "
-                    "explicación (%s) — reintentando una vez", type(exc).__name__,
+                    "Respuesta de Ollama con estructura JSON inesperada o con eco del "
+                    "JSON de entrada generando explicación (%s) — reintentando una vez",
+                    type(exc).__name__,
                 )
                 continue
             logger.info(
-                "Respuesta de Ollama con estructura JSON inesperada generando "
-                "explicación tras reintentar (%s)", type(exc).__name__,
+                "Respuesta de Ollama con estructura JSON inesperada o con eco del JSON "
+                "de entrada generando explicación tras reintentar (%s)", type(exc).__name__,
             )
             raise _ExplainUnavailable() from exc
 
