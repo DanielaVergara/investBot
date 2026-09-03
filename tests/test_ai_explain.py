@@ -1278,10 +1278,21 @@ async def test_handler_leaf_dato_cambia_segun_ticker():
     assert texto_a != texto_b
 
 
-def test_bloque_formula_ausente_para_ver_y_mod():
-    """`ver` (texto libre) y `mod` (avanzado) no tienen entrada en
-    `FORMULAS` -- omitida, nunca vacía."""
-    assert "ver" not in ai_explain_content.FORMULAS_TEXTO_LIBRE
+def test_bloque_formula_presente_para_ver():
+    """`ver` (Veredicto, texto libre) SÍ tiene fórmula/fuente propias
+    (pedido explícito de Daniela 2026-09-03: aunque combina varios modelos,
+    la comparación precio vs. Valor Justo Total es una regla concreta, no
+    una síntesis narrativa sin cuenta detrás) -- a diferencia de `mod`
+    (avanzado), que sigue siendo una síntesis narrativa de los 5 modelos
+    sin fórmula/fuente propia."""
+    assert "ver" in ai_explain_content.FORMULAS_TEXTO_LIBRE
+    assert "ver" in ai_explain_content.FUENTES_TEXTO_LIBRE
+
+
+def test_bloque_formula_ausente_para_mod():
+    """`mod` (avanzado, "¿qué modelos aplican?") sigue sin entrada en
+    `FORMULAS`/`FUENTES` -- es una síntesis narrativa de los 5 modelos, no
+    una fórmula propia -- omitida, nunca vacía."""
     assert "mod" not in ai_explain_content.FORMULAS_AVANZADO
     assert "mod" not in ai_explain_content.FUENTES_AVANZADO
 

@@ -166,6 +166,12 @@ LEVEL1_TEXTO_LIBRE: tuple[tuple[str, str], ...] = (
 )
 
 FORMULAS_TEXTO_LIBRE: dict[str, str] = {
+    "ver": (
+        "Precio actual < Valor Justo Total (escenario elegido) → Barata · "
+        "Precio actual > Valor Justo Total → Cara · sin Valor Justo Total "
+        "calculable → sin veredicto"
+    ),
+    "vf": "Promedio simple de los modelos calculables entre Múltiplos, Graham y DCF, para el escenario elegido",
     "gra": "EPS (TTM) × (8.5 + 2×g) × 4.4 / Y, con g = CAGR histórico de EPS",
     "dcf": "proyección de Flujo de Caja Libre a 5 años + valor terminal, descontados al WACC",
     "mul": "EPS (TTM) × PER promedio/mínimo/máximo de los peers del sector",
@@ -200,6 +206,11 @@ FORMULAS_TEXTO_LIBRE: dict[str, str] = {
 }
 
 FUENTES_TEXTO_LIBRE: dict[str, str] = {
+    "ver": (
+        "Precio actual: cotización (quote) de FMP; Valor Justo Total: "
+        "promedio de Múltiplos/Graham/DCF calculables (ver fuente de "
+        "Valor Justo Total)."
+    ),
     "vf": (
         "Valor Justo Total = promedio simple de los modelos calculables "
         "entre Múltiplos, Graham y DCF (valuation.py, "
