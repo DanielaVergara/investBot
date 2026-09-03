@@ -491,6 +491,192 @@ FUENTES_AVANZADO: dict[str, str] = {
 }
 
 
+# --- "🔍 Desglose" (SDD_desglose_terminos_formula.md) --------------------
+# Texto fijo, 100% estático -- ningún string interpola `datos` del ticker
+# (mismo criterio ya auditado que FORMULAS_AVANZADO/FUENTES_AVANZADO arriba).
+# Solo 7 de las 27 preguntas (Decisión de diseño #1: `pig` se apoya en
+# pir/pia/pie, no tiene desglose propio).
+
+
+@dataclass(frozen=True)
+class DesgloseTermino:
+    letra: str  # símbolo tal cual aparece en la Fórmula/Cuenta
+    campo_origen: str  # de dónde sale -- campo(s) de FMP o cálculo del bot
+    nombre: str  # nombre legible del concepto
+    que_mide: str  # 1 línea, lenguaje simple, sin jerga
+
+
+_DESGLOSE_ALTMAN_A_D: tuple[DesgloseTermino, ...] = (
+    DesgloseTermino(
+        letra="A",
+        campo_origen="Activos Corrientes − Pasivos Corrientes, sobre Activos Totales (balance)",
+        nombre="Capital de Trabajo",
+        que_mide=(
+            "La plata \"líquida\" que le queda a la empresa para operar el "
+            "día a día, en proporción a su tamaño"
+        ),
+    ),
+    DesgloseTermino(
+        letra="B",
+        campo_origen="Utilidades Retenidas, sobre Activos Totales (balance)",
+        nombre="Utilidades Retenidas",
+        que_mide="Cuánta ganancia acumulada a lo largo de los años reinvirtió la empresa en sí misma",
+    ),
+    DesgloseTermino(
+        letra="C",
+        campo_origen="EBIT, sobre Activos Totales (estado de resultados + balance)",
+        nombre="EBIT (Ganancia antes de Intereses e Impuestos)",
+        que_mide="Qué tan rentable es el negocio en sí, sin el efecto de la deuda ni de los impuestos",
+    ),
+    DesgloseTermino(
+        letra="D",
+        campo_origen="Capitalización de Mercado, sobre Pasivos Totales (cotización + balance)",
+        nombre="Capitalización de Mercado sobre Deuda",
+        que_mide="Cuánto \"colchón\" de valor en bolsa tiene la empresa frente a lo que debe",
+    ),
+)
+
+_DESGLOSE_ALTMAN_E = DesgloseTermino(
+    letra="E",
+    campo_origen="Ventas, sobre Activos Totales (estado de resultados + balance)",
+    nombre="Rotación de Activos",
+    que_mide="Cuánto factura la empresa por cada dólar que tiene invertido en el negocio",
+)
+
+DESGLOSE_AVANZADO: dict[str, tuple[DesgloseTermino, ...]] = {
+    "alz": _DESGLOSE_ALTMAN_A_D + (_DESGLOSE_ALTMAN_E,),
+    "azp": _DESGLOSE_ALTMAN_A_D,
+    "pir": (
+        DesgloseTermino(
+            letra="ROA positivo",
+            campo_origen="Ganancia Neta (estado de resultados)",
+            nombre="Ganancia Neta",
+            que_mide="Si la empresa ganó plata (no perdió) en el último año",
+        ),
+        DesgloseTermino(
+            letra="CFO positivo",
+            campo_origen="Flujo de Caja Operativo (estado de flujo de efectivo)",
+            nombre="Flujo de Caja Operativo",
+            que_mide=(
+                "Si entró más efectivo real del que salió por operar el "
+                "negocio, más allá de la ganancia contable"
+            ),
+        ),
+        DesgloseTermino(
+            letra="ROA creciente",
+            campo_origen=(
+                "Ganancia Neta / Activos Totales, año actual vs. anterior "
+                "(estado de resultados + balance)"
+            ),
+            nombre="ROA (Retorno sobre Activos)",
+            que_mide="Si la empresa se volvió más eficiente generando ganancia con lo que tiene",
+        ),
+        DesgloseTermino(
+            letra="CFO > Utilidad",
+            campo_origen="Flujo de Caja Operativo vs. Ganancia Neta (flujo de efectivo + resultados)",
+            nombre="Calidad de la Ganancia",
+            que_mide="Si la ganancia reportada está respaldada por efectivo real, no solo \"en papel\"",
+        ),
+    ),
+    "pia": (
+        DesgloseTermino(
+            letra="Apalancamiento decreciente",
+            campo_origen="Deuda de Largo Plazo / Activos Totales, año actual vs. anterior (balance)",
+            nombre="Apalancamiento",
+            que_mide="Si la empresa se está endeudando menos en relación a su tamaño",
+        ),
+        DesgloseTermino(
+            letra="Liquidez creciente",
+            campo_origen="Activos Corrientes / Pasivos Corrientes, año actual vs. anterior (balance)",
+            nombre="Liquidez Corriente",
+            que_mide="Si mejoró su capacidad de pagar deudas de corto plazo con lo que tiene a mano",
+        ),
+        DesgloseTermino(
+            letra="Sin dilución",
+            campo_origen="Acciones en Circulación, año actual vs. anterior (estado de resultados)",
+            nombre="Acciones en Circulación",
+            que_mide="Si la empresa emitió menos acciones nuevas, sin \"repartir la torta\" entre más dueños",
+        ),
+    ),
+    "pie": (
+        DesgloseTermino(
+            letra="Margen bruto creciente",
+            campo_origen="Utilidad Bruta / Ventas, año actual vs. anterior (estado de resultados)",
+            nombre="Margen Bruto",
+            que_mide="Si le queda más ganancia por cada venta después del costo directo de producir/vender",
+        ),
+        DesgloseTermino(
+            letra="Rotación de activos creciente",
+            campo_origen=(
+                "Ventas / Activos Totales, año actual vs. anterior "
+                "(estado de resultados + balance)"
+            ),
+            nombre="Rotación de Activos",
+            que_mide="Si la empresa usa mejor sus activos para generar ventas",
+        ),
+    ),
+    "mgr": (
+        DesgloseTermino(
+            letra="EBIT",
+            campo_origen="Estado de resultados",
+            nombre="EBIT (Ganancia antes de Intereses e Impuestos)",
+            que_mide="La ganancia operativa del negocio, antes de intereses e impuestos",
+        ),
+        DesgloseTermino(
+            letra="Capital de Trabajo Neto",
+            campo_origen="Activos Corrientes − Pasivos Corrientes (balance)",
+            nombre="Capital de Trabajo Neto",
+            que_mide="La plata que la empresa necesita tener disponible para el día a día",
+        ),
+        DesgloseTermino(
+            letra="Activos Fijos Netos",
+            campo_origen="Propiedad, Planta y Equipo neto (balance)",
+            nombre="Activos Fijos Netos (PP&E)",
+            que_mide=(
+                "Cuánto tiene invertido en cosas físicas — plantas, "
+                "maquinaria, edificios — para operar"
+            ),
+        ),
+    ),
+    "mge": (
+        DesgloseTermino(
+            letra="EBIT",
+            campo_origen="Estado de resultados",
+            nombre="EBIT",
+            que_mide="(mismo que en ROIC de la Magic Formula)",
+        ),
+        DesgloseTermino(
+            letra="Capitalización de Mercado",
+            campo_origen="Cotización en bolsa",
+            nombre="Capitalización de Mercado",
+            que_mide="Cuánto vale la empresa en bolsa hoy",
+        ),
+        DesgloseTermino(
+            letra="Deuda Total",
+            campo_origen="Balance",
+            nombre="Deuda Total",
+            que_mide="Cuánto debe en total la empresa",
+        ),
+        DesgloseTermino(
+            letra="Efectivo",
+            campo_origen="Balance",
+            nombre="Efectivo y Equivalentes",
+            que_mide="Cuánta plata líquida tiene disponible ahora mismo",
+        ),
+    ),
+}
+
+
+def desglose(kind: str, code: str) -> tuple[DesgloseTermino, ...]:
+    """`()` para `kind == "texto_libre"` o cualquier `code` sin entrada --
+    las 20 preguntas sin desglose no rompen nada, se comportan como hoy
+    (Decisión de diseño #1: `pig` es una de esas 20 -- se apoya en
+    pir/pia/pie, no tiene desglose propio)."""
+    if kind != "avanzado":
+        return ()
+    return DESGLOSE_AVANZADO.get(code, ())
+
+
 def all_questions(kind: str) -> dict[str, QuestionSpec]:
     return QUESTIONS_TEXTO_LIBRE if kind == "texto_libre" else QUESTIONS_AVANZADO
 

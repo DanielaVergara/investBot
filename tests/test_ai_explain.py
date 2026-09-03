@@ -2578,3 +2578,198 @@ def test_cuenta_4_modelos_todo_o_nada_no_calculables_sin_none_visible(code):
     datos = ai_explain._build_explain_payload(ctx, code)
     cuenta = ai_explain._build_cuenta_line("avanzado", code, datos)
     assert cuenta is None
+
+
+# ---------------------------------------------------------------------------
+# V. "🔍 Desglose" -- SDD_desglose_terminos_formula.md
+# ---------------------------------------------------------------------------
+
+_CODES_CON_DESGLOSE = ("alz", "azp", "pir", "pia", "pie", "mgr", "mge")
+
+# QA, "Fixtures mínimos que faltan" #2 -- lista explícita de las 20
+# preguntas sin desglose, confirmada contra el código real (`_TODAS_LAS_
+# PREGUNTAS`, 27 codes) en vez de contra el conteo de la spec.
+_CODES_SIN_DESGLOSE = tuple(c for c in _TODAS_LAS_PREGUNTAS if c not in _CODES_CON_DESGLOSE)
+
+
+def test_desglose_20_preguntas_sin_desglose_mas_7_con_desglose_suman_27():
+    assert len(_CODES_SIN_DESGLOSE) == 20
+    assert len(_CODES_CON_DESGLOSE) == 7
+    assert set(_CODES_SIN_DESGLOSE) | set(_CODES_CON_DESGLOSE) == set(_TODAS_LAS_PREGUNTAS)
+
+
+def test_desglose_avanzado_7_entradas_exactas():
+    assert set(ai_explain_content.DESGLOSE_AVANZADO) == set(_CODES_CON_DESGLOSE)
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+def test_desglose_entrada_sin_terminos_vacios_ni_none(code):
+    """Ningún término del bloque tiene `letra`/`campo_origen`/`nombre`/
+    `que_mide` vacío, `None`, o la palabra literal "None" visible."""
+    terminos = ai_explain_content.desglose("avanzado", code)
+    assert terminos, f"{code} debería tener desglose"
+    for t in terminos:
+        for campo in (t.letra, t.campo_origen, t.nombre, t.que_mide):
+            assert campo, f"{code}: campo vacío en {t!r}"
+            assert "None" not in campo, f"{code}: 'None' visible en {t!r}"
+
+
+def test_desglose_azp_mismas_a_d_que_alz_sin_e():
+    alz = ai_explain_content.desglose("avanzado", "alz")
+    azp = ai_explain_content.desglose("avanzado", "azp")
+    assert len(alz) == 5
+    assert len(azp) == 4
+    assert azp == alz[:4]
+
+
+def test_desglose_pig_no_tiene_desglose_propio():
+    """Decisión de diseño #1 -- test dedicado: `pig` se apoya en pir/pia/pie,
+    no gana un desglose propio por simetría. Sin este test, un futuro
+    `implementer` podría "completar" `pig` por simetría y violar la
+    decisión de diseño."""
+    assert ai_explain_content.desglose("avanzado", "pig") == ()
+
+
+@pytest.mark.parametrize("code", ["xyz", "", "zzz"])
+def test_desglose_code_inexistente_o_vacio_devuelve_vacio(code):
+    assert ai_explain_content.desglose("avanzado", code) == ()
+
+
+@pytest.mark.parametrize("code", list(_TODAS_LAS_PREGUNTAS) + ["alz", "cualquier_cosa"])
+def test_desglose_texto_libre_siempre_vacio(code):
+    """`kind == "texto_libre"` devuelve `()` para cualquier `code`, incluso
+    uno que sí tiene entrada en `DESGLOSE_AVANZADO` (ej. "alz")."""
+    assert ai_explain_content.desglose("texto_libre", code) == ()
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+def test_build_desglose_block_happy_path_sin_terminos_faltantes(code):
+    bloque = ai_explain._build_desglose_block("avanzado", code)
+    assert bloque is not None
+    assert bloque.startswith("🔍 Desglose:\n")
+    assert "None" not in bloque
+    terminos = ai_explain_content.desglose("avanzado", code)
+    for t in terminos:
+        assert t.letra in bloque
+        assert t.nombre in bloque
+
+
+@pytest.mark.parametrize("code", _CODES_SIN_DESGLOSE)
+def test_build_desglose_block_none_para_las_20_preguntas_sin_desglose(code):
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    assert ai_explain._build_desglose_block(kind, code) is None
+
+
+def test_build_leaf_message_inserta_desglose_entre_cuenta_y_respuesta():
+    texto = ai_explain._build_leaf_message(
+        "Dato de prueba", "Respuesta de Ollama.", None, None,
+        cuenta="Z = 1.2×0.34 = 0.41", desglose="🔍 Desglose:\n• A (Capital de Trabajo) — sale de X. Mide Y.",
+    )
+    idx_cuenta = texto.index("🧮 Cuenta")
+    idx_desglose = texto.index("🔍 Desglose")
+    idx_respuesta = texto.index("Respuesta de Ollama.")
+    assert idx_cuenta < idx_desglose < idx_respuesta
+
+
+def test_build_leaf_message_sin_desglose_no_agrega_seccion():
+    texto = ai_explain._build_leaf_message(
+        "Dato", "Respuesta.", None, None, cuenta="Z = 0.41", desglose=None,
+    )
+    assert "🔍 Desglose" not in texto
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+async def test_mensaje_paso_a_paso_muestra_cuenta_y_desglose_en_orden(code):
+    """Caso obligatorio de QA -- Happy path: para cada una de las 7
+    preguntas con desglose, el mensaje completo de "Explicame paso a paso"
+    muestra "🧮 Cuenta" seguido de "🔍 Desglose", ambos antes de la respuesta
+    de Ollama."""
+    ctx = _avanzado_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "Este modelo mide la salud financiera de la empresa en base a varios factores."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:{code}")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    texto = kwargs["text"]
+    assert texto != ai_explain.EXPLAIN_UNAVAILABLE_MSG
+    assert "🧮 Cuenta" in texto
+    assert "🔍 Desglose" in texto
+    assert texto.index("🧮 Cuenta") < texto.index("🔍 Desglose") < texto.index(respuesta)
+    assert "None" not in texto
+
+
+@pytest.mark.parametrize("code", _CODES_SIN_DESGLOSE)
+async def test_mensaje_paso_a_paso_sin_desglose_para_las_20_preguntas_regresion(code):
+    """Regresión dirigida (QA, "Regression testing dirigida") -- las 20
+    preguntas sin desglose no muestran la sección nueva. Contexto avanzado
+    con todos los campos para los `question_code` de avanzado, texto_libre
+    para el resto."""
+    ctx = _avanzado_context() if code in ai_explain_content.QUESTIONS_AVANZADO else _texto_libre_context()
+    spec = ai_explain_content.all_questions(ctx.kind)[code]
+    if spec.variant == ai_explain_content.VARIANT_DETERMINISTICO:
+        pytest.skip("evt/inf nunca llaman a Ollama -- sin mensaje 'paso a paso' que comparar")
+    # `narrativa` (mod/ben/ren) usa el callback leaf `xp:{id}:{code}` (sin
+    # `:p:`) -- no tiene 2º botón "paso a paso", es su único camino a Ollama.
+    sufijo = code if spec.variant == ai_explain_content.VARIANT_NARRATIVA else f"p:{code}"
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "Explicación genérica sin números inventados."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:{sufijo}")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    assert "🔍 Desglose" not in kwargs["text"]
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+async def test_ver_dato_nunca_incluye_desglose_ni_para_las_7_preguntas_con_desglose(code):
+    """El botón "📊 Ver dato" no cambia (decisión ya resuelta: el desglose
+    queda solo en "Explicame paso a paso") -- verificado explícitamente
+    contra las 7 preguntas que SÍ tienen desglose, el caso de mayor riesgo
+    de regresión por ser justo donde "podría" agregarse por error."""
+    ctx = _avanzado_context()
+    contenido = ai_explain._build_ver_dato_content(ctx, code)
+    assert "🔍 Desglose" not in contenido
+    assert "🧮 Cuenta" not in contenido
+
+
+# --- _MAX_DESGLOSE_CHARS=1200 -- omitir, nunca truncar (Decisión de
+# diseño #6) --------------------------------------------------------------
+
+
+def test_max_desglose_chars_tope_exacto_1200_no_se_omite():
+    bloque_1200 = "X" * ai_explain._MAX_DESGLOSE_CHARS
+    assert ai_explain._enforce_desglose_length(bloque_1200) == bloque_1200
+
+
+def test_max_desglose_chars_1201_se_omite_completo_no_trunca(caplog):
+    bloque_1201 = "X" * (ai_explain._MAX_DESGLOSE_CHARS + 1)
+    with caplog.at_level(logging.WARNING):
+        resultado = ai_explain._enforce_desglose_length(bloque_1201)
+    assert resultado is None
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_desglose_avanzado_7_entradas_todas_bajo_el_tope():
+    """Test parametrizado en el sentido que pide QA: recorre las 7 entradas
+    y hace un `assert` explícito por entrada, para que el mensaje de fallo
+    señale cuál entrada se pasó del límite, sin depurar las 7."""
+    for code, terminos in ai_explain_content.DESGLOSE_AVANZADO.items():
+        bloque = ai_explain._build_desglose_block("avanzado", code)
+        assert bloque is not None, f"{code}: desglose se omitió (excede el tope)"
+        assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS, (
+            f"{code}: desglose de {len(bloque)} caracteres excede "
+            f"_MAX_DESGLOSE_CHARS={ai_explain._MAX_DESGLOSE_CHARS}"
+        )

@@ -701,17 +701,25 @@ def _build_leaf_message(
     fuente: Optional[str],
     *,
     cuenta: Optional[str] = None,
+    desglose: Optional[str] = None,
 ) -> str:
     """Orden fijo (Decisión de diseño #5, extendido por SDD_explicacion_
-    paso_a_paso.md): header -> Dato -> Cuenta (si está presente) -> respuesta
+    paso_a_paso.md y por SDD_desglose_terminos_formula.md): header -> Dato ->
+    Cuenta (si está presente) -> Desglose (si está presente, Decisión de
+    diseño #2 de esa spec: sección nueva, no reemplaza Cuenta) -> respuesta
     de Ollama -> Fórmula/Fuente (si existen) -> disclaimer. Fórmula/Fuente/
-    Cuenta NUNCA pasan por el guard de integridad tal cual (Cuenta SÍ entra
-    a `datos_del_contexto` -- y por lo tanto a `datos_tokens` -- ANTES de
-    llamar a Ollama, Decisión de diseño #4; acá solo se inserta en el texto
-    final)."""
+    Cuenta/Desglose NUNCA pasan por el guard de integridad tal cual (Cuenta
+    SÍ entra a `datos_del_contexto` -- y por lo tanto a `datos_tokens` --
+    ANTES de llamar a Ollama, Decisión de diseño #4 de la spec anterior;
+    Desglose, igual que Fórmula/Fuente, se arma y se inserta en el texto
+    final DESPUÉS de la respuesta de Ollama, nunca antes ni mezclado con el
+    prompt -- Decisión de diseño #4/Revisión de seguridad de
+    SDD_desglose_terminos_formula.md)."""
     partes = [ai_rewrite.TRANSPARENCY_USED, f"📌 Dato: {dato_line}"]
     if cuenta:
         partes.append(f"🧮 Cuenta: {cuenta}")
+    if desglose:
+        partes.append(desglose)
     partes.append(respuesta)
     formula_fuente_lines = []
     if formula:
@@ -782,6 +790,46 @@ def _enforce_cuenta_length(cuenta: str) -> Optional[str]:
         )
         return None
     return cuenta
+
+
+# --- Bloque "🔍 Desglose" (paso a paso) -- SDD_desglose_terminos_
+# formula.md, Decisión de diseño #3/#4/#5. 100% texto fijo, nunca por
+# Ollama, no recibe `datos` -- a diferencia de "🧮 Cuenta", nunca puede
+# fallar por un campo faltante del ticker.
+
+_MAX_DESGLOSE_CHARS = 1200
+
+
+def _enforce_desglose_length(bloque: str) -> Optional[str]:
+    """`_MAX_DESGLOSE_CHARS=1200` (Decisión de diseño #6). Mismo criterio que
+    `_enforce_cuenta_length`: si el bloque excede el tope, se omite el
+    bloque COMPLETO (nunca se trunca a mitad de una línea) -- acá el único
+    escenario que lo dispara es un error de edición futuro (una entrada de
+    `DESGLOSE_AVANZADO` con descripciones demasiado largas), no un ticker
+    con números grandes, porque el contenido es texto fijo."""
+    if len(bloque) > _MAX_DESGLOSE_CHARS:
+        logger.warning(
+            "Desglose de %d caracteres excede _MAX_DESGLOSE_CHARS=%d -- bloque omitido",
+            len(bloque), _MAX_DESGLOSE_CHARS,
+        )
+        return None
+    return bloque
+
+
+def _build_desglose_block(kind: str, question_code: str) -> Optional[str]:
+    """100% texto fijo (Decisión de diseño #3) -- no recibe `datos`, no hace
+    I/O, nunca puede fallar por un campo faltante del ticker (a diferencia
+    de `_build_cuenta_line`). `None` si la pregunta no tiene desglose (20 de
+    27 preguntas) -- comportamiento hoy sin cambios."""
+    terminos = ai_explain_content.desglose(kind, question_code)
+    if not terminos:
+        return None
+    lineas = [
+        f"• {t.letra} ({t.nombre}) — sale de {t.campo_origen}. {t.que_mide}."
+        for t in terminos
+    ]
+    bloque = "🔍 Desglose:\n" + "\n".join(lineas)
+    return _enforce_desglose_length(bloque)
 
 
 def _cuenta_ver(datos: dict) -> Optional[str]:
@@ -1247,11 +1295,16 @@ SYSTEM_PROMPT_PASO_A_PASO = (
     "datos ya calculados, y una clave \"cuenta\" con la fórmula YA RESUELTA paso\n"
     "a paso (números reales, cada término calculado, resultado final).\n\n"
     "Reglas estrictas:\n"
-    "1. La cuenta en \"cuenta\" YA ESTÁ CALCULADA Y ES CORRECTA — tu trabajo es\n"
-    "   explicar en 2 a 4 oraciones cortas QUÉ SIGNIFICA ese resultado o alguno\n"
-    "   de sus términos, nunca recalcularla ni repetirla palabra por palabra\n"
-    "   (el usuario ya la ve arriba de tu respuesta, repetirla desperdicia tu\n"
-    "   espacio de respuesta).\n"
+    "1. La cuenta en \"cuenta\" YA ESTÁ CALCULADA Y ES CORRECTA — no la\n"
+    "   recalcules ni repitas los números tal cual (el usuario ya los ve\n"
+    "   arriba de tu respuesta). Tu trabajo es explicar, en 2 a 4 oraciones\n"
+    "   cortas y en criollo bien simple (como si le explicaras a alguien que\n"
+    "   nunca estudió finanzas, con una comparación cotidiana si ayuda —\n"
+    "   mismo estilo que \"pensá en una empresa como una tienda de\n"
+    "   limonada\"), QUÉ ES cada valor clave de la cuenta (ej. qué\n"
+    "   representa \"Valor Justo Total\" o \"Precio actual\", no solo que\n"
+    "   uno es mayor que el otro) y QUÉ SIGNIFICA el resultado final para\n"
+    "   quien lee. Nunca dejes un término de la cuenta sin explicar qué es.\n"
     "2. Usá ÚNICAMENTE los números/datos del JSON que te paso — nunca inventes,\n"
     "   estimes ni completes un dato que no esté ahí.\n"
     "3. Nunca dés una recomendación de compra/venta ni asesoramiento financiero\n"
@@ -1738,7 +1791,8 @@ async def _dispatch_leaf(
     dato_line = _build_dato_line(stored.kind, question_code, datos_del_contexto)
     formula = ai_explain_content.formulas(stored.kind).get(question_code)
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
-    texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta)
+    desglose = _build_desglose_block(stored.kind, question_code)
+    texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose)
     await bot.edit_message_text(
         chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup
     )
