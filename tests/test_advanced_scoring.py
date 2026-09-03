@@ -8,6 +8,8 @@ archivo ni `httpx.MockTransport`.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from investbot import advanced_scoring as scoring
@@ -340,6 +342,99 @@ def test_calculate_magic_formula_metrics_market_cap_faltante_no_calculable():
         balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=None
     )
     assert result.disponible is False
+
+
+# ---------------------------------------------------------------------------
+# SDD_desglose_con_valores_reales.md -- `MagicFormulaResult` gana 3 campos
+# de exposición pura (`current_assets`/`current_liabilities`/`ppe_net`) sin
+# cambiar la fórmula de `capital_invertido` ya validada.
+# ---------------------------------------------------------------------------
+
+
+def test_calculate_magic_formula_metrics_capital_invertido_identico_post_cambio():
+    """Regresión explícita del criterio de aceptación del `architect`:
+    `capital_invertido`/`roic`/`earnings_yield` devuelven exactamente los
+    mismos valores que antes de exponer los 3 campos nuevos."""
+    result = scoring.calculate_magic_formula_metrics(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is True
+    assert result.capital_invertido == pytest.approx(550_000_000)
+    assert result.roic == pytest.approx(150_000_000 / 550_000_000)
+    assert result.earnings_yield == pytest.approx(150_000_000 / 5_200_000_000)
+
+
+def test_magic_formula_result_expone_current_assets_liabilities_ppe_net():
+    """`mgr` necesita `current_assets`/`current_liabilities`/`ppe_net` por
+    separado -- confirma que se pueblan con las MISMAS variables locales que
+    ya arman `capital_invertido` (no recalculadas aparte)."""
+    result = scoring.calculate_magic_formula_metrics(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.current_assets == pytest.approx(300_000_000)
+    assert result.current_liabilities == pytest.approx(150_000_000)
+    assert result.ppe_net == pytest.approx(400_000_000)
+    # Aritmética exacta: (current_assets - current_liabilities) + ppe_net ==
+    # capital_invertido -- mismo criterio de consistencia que pide `qa`.
+    assert (result.current_assets - result.current_liabilities) + result.ppe_net == pytest.approx(
+        result.capital_invertido
+    )
+
+
+def test_magic_formula_result_no_disponible_campos_nuevos_en_none():
+    result = scoring.calculate_magic_formula_metrics(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=None
+    )
+    assert result.disponible is False
+    assert result.current_assets is None
+    assert result.current_liabilities is None
+    assert result.ppe_net is None
+
+
+def test_magic_formula_result_capital_de_trabajo_negativo_no_se_oculta():
+    """Alto riesgo de negocio (QA) -- empresa con problemas de liquidez
+    (`current_assets < current_liabilities`): el componente negativo debe
+    seguir viajando tal cual, nunca en valor absoluto ni omitido."""
+    balance_liquidez_negativa = {
+        **BALANCE_RECIENTE,
+        "totalCurrentAssets": 100_000_000,
+        "totalCurrentLiabilities": 150_000_000,
+    }
+    result = scoring.calculate_magic_formula_metrics(
+        balance=balance_liquidez_negativa, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    assert result.disponible is True
+    assert result.current_assets == pytest.approx(100_000_000)
+    assert result.current_liabilities == pytest.approx(150_000_000)
+    assert result.current_assets - result.current_liabilities == pytest.approx(-50_000_000)
+
+
+def test_magic_formula_result_construible_sin_campos_nuevos_retrocompatible():
+    """Regresión -- cualquier consumidor (tests incluidos) que siga
+    construyendo `MagicFormulaResult` sin los 3 campos nuevos no debe
+    romperse: valen `None` por default."""
+    result = scoring.MagicFormulaResult(disponible=True, roic=0.2, earnings_yield=0.08)
+    assert result.current_assets is None
+    assert result.current_liabilities is None
+    assert result.ppe_net is None
+
+
+def test_magic_formula_result_asdict_trae_las_3_claves_nuevas():
+    """Mismo patrón que `advanced_command.py` (`dataclasses.asdict(magic)`)
+    -- confirma que el dict resultante trae las 3 claves nuevas, con `None`
+    cuando no se pasaron y con el valor real cuando sí."""
+    sin_campos_nuevos = dataclasses.asdict(scoring.MagicFormulaResult(disponible=True))
+    assert sin_campos_nuevos["current_assets"] is None
+    assert sin_campos_nuevos["current_liabilities"] is None
+    assert sin_campos_nuevos["ppe_net"] is None
+
+    result = scoring.calculate_magic_formula_metrics(
+        balance=BALANCE_RECIENTE, income=INCOME_RECIENTE, market_cap=MARKET_CAP
+    )
+    con_campos_nuevos = dataclasses.asdict(result)
+    assert con_campos_nuevos["current_assets"] == pytest.approx(300_000_000)
+    assert con_campos_nuevos["current_liabilities"] == pytest.approx(150_000_000)
+    assert con_campos_nuevos["ppe_net"] == pytest.approx(400_000_000)
 
 
 # ---------------------------------------------------------------------------

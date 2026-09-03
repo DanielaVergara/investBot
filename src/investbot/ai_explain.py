@@ -506,6 +506,12 @@ def _payload_avanzado(context: ExplanationContext, question_code: str) -> dict:
             "disponible": magic.get("disponible"),
             "ebit": magic.get("ebit"),
             "capital_invertido": magic.get("capital_invertido"),
+            # SDD_desglose_con_valores_reales.md, Decisión de diseño #1 --
+            # componentes de `capital_invertido` expuestos por separado para
+            # el Desglose, sin cambiar la fórmula ya validada.
+            "current_assets": magic.get("current_assets"),
+            "current_liabilities": magic.get("current_liabilities"),
+            "ppe_net": magic.get("ppe_net"),
         }
     if question_code == "mge":
         magic = context.magic or {}
@@ -793,11 +799,91 @@ def _enforce_cuenta_length(cuenta: str) -> Optional[str]:
 
 
 # --- Bloque "🔍 Desglose" (paso a paso) -- SDD_desglose_terminos_
-# formula.md, Decisión de diseño #3/#4/#5. 100% texto fijo, nunca por
-# Ollama, no recibe `datos` -- a diferencia de "🧮 Cuenta", nunca puede
-# fallar por un campo faltante del ticker.
+# formula.md + SDD_desglose_con_valores_reales.md, Decisión de diseño
+# #3/#4/#5. Texto fijo (nombre/origen/qué mide) + valor real puntual del
+# ticker por línea, agregado en la spec de valores reales. Nunca por
+# Ollama -- se arma DESPUÉS de `_fetch_explanation`, nunca es input suyo.
 
 _MAX_DESGLOSE_CHARS = 1200
+
+# SDD_desglose_con_valores_reales.md, Decisión de diseño #3 -- mapeo
+# texto-de-letra (tal cual aparece en `DESGLOSE_AVANZADO`) -> clave interna
+# del criterio de Piotroski, reutilizando las mismas 9 claves canónicas que
+# `_PIOTROSKI_CUENTA_LABEL`. Vive acá (no en `ai_explain_content.py`) --
+# esa fuente sigue siendo 100% texto fijo, sin lógica que dependa de `datos`.
+_DESGLOSE_LETRA_A_NOMBRE_CRITERIO = {
+    "ROA positivo": "roa_positivo",
+    "CFO positivo": "cfo_positivo",
+    "ROA creciente": "roa_creciente",
+    "CFO > Utilidad": "cfo_mayor_utilidad",
+    "Apalancamiento decreciente": "apalancamiento_decreciente",
+    "Liquidez creciente": "liquidez_creciente",
+    "Sin dilución": "sin_dilucion",
+    "Margen bruto creciente": "margen_bruto_creciente",
+    "Rotación de activos creciente": "rotacion_activos_creciente",
+}
+
+
+def _valor_desglose_alz(letra: str, datos: dict) -> Optional[str]:
+    altman = datos.get("altman") or {}
+    if not altman.get("disponible"):
+        return None
+    clave = {"A": "a", "B": "b", "C": "c", "D": "d", "E": "e"}.get(letra)
+    valor = altman.get(clave) if clave else None
+    return _ratio2(valor) if valor is not None else None
+
+
+def _valor_desglose_azp(letra: str, datos: dict) -> Optional[str]:
+    altman_pp = datos.get("altman_pp") or {}
+    if not altman_pp.get("disponible"):
+        return None
+    clave = {"A": "a", "B": "b", "C": "c", "D": "d"}.get(letra)
+    valor = altman_pp.get(clave) if clave else None
+    return _ratio2(valor) if valor is not None else None
+
+
+def _valor_desglose_piotroski(letra: str, datos: dict) -> Optional[str]:
+    nombre = _DESGLOSE_LETRA_A_NOMBRE_CRITERIO.get(letra)
+    criterio = next(
+        (c for c in (datos.get("criterios") or []) if isinstance(c, dict) and c.get("nombre") == nombre),
+        None,
+    )
+    if criterio is None:
+        return None
+    cumplido = criterio.get("cumplido")
+    if cumplido is None:
+        return "➖ No evaluable"
+    return "✅ Cumple" if cumplido else "❌ No cumple"
+
+
+def _valor_desglose_mgr(letra: str, datos: dict) -> Optional[str]:
+    if letra == "EBIT":
+        v = datos.get("ebit")
+        return _money(v) if v is not None else None
+    if letra == "Capital de Trabajo Neto":
+        ca, cl = datos.get("current_assets"), datos.get("current_liabilities")
+        return _money(ca - cl) if ca is not None and cl is not None else None
+    if letra == "Activos Fijos Netos":
+        v = datos.get("ppe_net")
+        return _money(v) if v is not None else None
+    return None
+
+
+def _valor_desglose_mge(letra: str, datos: dict) -> Optional[str]:
+    campo = {
+        "EBIT": "ebit", "Capitalización de Mercado": "market_cap",
+        "Deuda Total": "total_debt", "Efectivo": "cash",
+    }.get(letra)
+    v = datos.get(campo) if campo else None
+    return _money(v) if v is not None else None
+
+
+_DESGLOSE_VALOR_EXTRACTORS = {
+    "alz": _valor_desglose_alz, "azp": _valor_desglose_azp,
+    "pir": _valor_desglose_piotroski, "pia": _valor_desglose_piotroski,
+    "pie": _valor_desglose_piotroski,
+    "mgr": _valor_desglose_mgr, "mge": _valor_desglose_mge,
+}
 
 
 def _enforce_desglose_length(bloque: str) -> Optional[str]:
@@ -816,18 +902,28 @@ def _enforce_desglose_length(bloque: str) -> Optional[str]:
     return bloque
 
 
-def _build_desglose_block(kind: str, question_code: str) -> Optional[str]:
-    """100% texto fijo (Decisión de diseño #3) -- no recibe `datos`, no hace
-    I/O, nunca puede fallar por un campo faltante del ticker (a diferencia
-    de `_build_cuenta_line`). `None` si la pregunta no tiene desglose (20 de
-    27 preguntas) -- comportamiento hoy sin cambios."""
+def _build_desglose_block(kind: str, question_code: str, datos: dict) -> Optional[str]:
+    """Descripción fija (Decisión de diseño #3 de la spec original) + valor
+    real puntual del ticker (SDD_desglose_con_valores_reales.md) por línea.
+    No hace I/O. `None` si la pregunta no tiene desglose (20 de 27
+    preguntas) -- comportamiento sin cambios. Un valor puntual faltante o un
+    extractor que falla nunca le quita la línea a las demás letras, solo le
+    quita el número a esa letra -- mismo `try/except` amplio que
+    `_build_cuenta_line`."""
     terminos = ai_explain_content.desglose(kind, question_code)
     if not terminos:
         return None
-    lineas = [
-        f"• {t.letra} ({t.nombre}) — sale de {t.campo_origen}. {t.que_mide}."
-        for t in terminos
-    ]
+    extractor = _DESGLOSE_VALOR_EXTRACTORS.get(question_code)
+    lineas = []
+    for t in terminos:
+        valor = None
+        if extractor is not None:
+            try:
+                valor = extractor(t.letra, datos)
+            except Exception:  # noqa: BLE001 -- misma red de seguridad que _build_cuenta_line
+                valor = None
+        prefijo_valor = f" = {valor}" if valor else ""
+        lineas.append(f"• {t.letra} ({t.nombre}){prefijo_valor} — sale de {t.campo_origen}. {t.que_mide}.")
     bloque = "🔍 Desglose:\n" + "\n".join(lineas)
     return _enforce_desglose_length(bloque)
 
@@ -1791,7 +1887,7 @@ async def _dispatch_leaf(
     dato_line = _build_dato_line(stored.kind, question_code, datos_del_contexto)
     formula = ai_explain_content.formulas(stored.kind).get(question_code)
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
-    desglose = _build_desglose_block(stored.kind, question_code)
+    desglose = _build_desglose_block(stored.kind, question_code, datos_del_contexto)
     texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose)
     await bot.edit_message_text(
         chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup

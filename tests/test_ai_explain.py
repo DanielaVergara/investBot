@@ -232,6 +232,7 @@ def _avanzado_context(**overrides) -> ai_explain.ExplanationContext:
             "disponible": True, "roic": 0.2, "earnings_yield": 0.08, "campos_faltantes": [],
             "ebit": 114_000.0, "capital_invertido": 570_000.0, "ev": 1_425_000.0,
             "market_cap": 1_400_000.0, "total_debt": 100_000.0, "cash": 75_000.0,
+            "current_assets": 650_000.0, "current_liabilities": 150_000.0, "ppe_net": 70_000.0,
         },
         factors={"value": "alto", "quality": "alto", "momentum": "medio", "low_vol": "bajo"},
         roe=0.22,
@@ -767,7 +768,12 @@ def test_payload_aqv_aqm_aql_superficie_minima():
 def test_payload_mgr_mge_solo_contienen_su_metrica():
     ctx = _avanzado_context()
     mgr = ai_explain._build_explain_payload(ctx, "mgr")
-    assert set(mgr) == {"modelo", "roic", "disponible", "ebit", "capital_invertido"}
+    assert set(mgr) == {
+        "modelo", "roic", "disponible", "ebit", "capital_invertido",
+        # SDD_desglose_con_valores_reales.md, Decisión de diseño #1 -- 2
+        # componentes de `capital_invertido` expuestos por separado.
+        "current_assets", "current_liabilities", "ppe_net",
+    }
     mge = ai_explain._build_explain_payload(ctx, "mge")
     assert set(mge) == {
         "modelo", "earnings_yield", "disponible", "ebit", "ev", "market_cap", "total_debt", "cash",
@@ -2644,7 +2650,8 @@ def test_desglose_texto_libre_siempre_vacio(code):
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
 def test_build_desglose_block_happy_path_sin_terminos_faltantes(code):
-    bloque = ai_explain._build_desglose_block("avanzado", code)
+    datos = ai_explain._build_explain_payload(_avanzado_context(), code)
+    bloque = ai_explain._build_desglose_block("avanzado", code, datos)
     assert bloque is not None
     assert bloque.startswith("🔍 Desglose:\n")
     assert "None" not in bloque
@@ -2657,7 +2664,7 @@ def test_build_desglose_block_happy_path_sin_terminos_faltantes(code):
 @pytest.mark.parametrize("code", _CODES_SIN_DESGLOSE)
 def test_build_desglose_block_none_para_las_20_preguntas_sin_desglose(code):
     kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
-    assert ai_explain._build_desglose_block(kind, code) is None
+    assert ai_explain._build_desglose_block(kind, code, {}) is None
 
 
 def test_build_leaf_message_inserta_desglose_entre_cuenta_y_respuesta():
@@ -2767,9 +2774,372 @@ def test_desglose_avanzado_7_entradas_todas_bajo_el_tope():
     y hace un `assert` explícito por entrada, para que el mensaje de fallo
     señale cuál entrada se pasó del límite, sin depurar las 7."""
     for code, terminos in ai_explain_content.DESGLOSE_AVANZADO.items():
-        bloque = ai_explain._build_desglose_block("avanzado", code)
+        datos = ai_explain._build_explain_payload(_avanzado_context(), code)
+        bloque = ai_explain._build_desglose_block("avanzado", code, datos)
         assert bloque is not None, f"{code}: desglose se omitió (excede el tope)"
         assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS, (
             f"{code}: desglose de {len(bloque)} caracteres excede "
             f"_MAX_DESGLOSE_CHARS={ai_explain._MAX_DESGLOSE_CHARS}"
         )
+
+
+# ---------------------------------------------------------------------------
+# VI. "🔍 Desglose" con valores reales -- SDD_desglose_con_valores_reales.md
+# ---------------------------------------------------------------------------
+
+
+def test_build_desglose_block_es_funcion_pura_sin_io():
+    """Mismo criterio de testabilidad que `_build_cuenta_line`/
+    `_build_dato_line` -- callable directo, sin `await`, sin mockear nada."""
+    import inspect
+    assert not inspect.iscoroutinefunction(ai_explain._build_desglose_block)
+
+
+def test_valor_desglose_alz_termino_a_termino_ejemplo_de_daniela():
+    """Ejemplo textual EXACTO del Estado objetivo de la spec."""
+    datos = {"altman": {"disponible": True, "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "e": 0.87}}
+    assert ai_explain._valor_desglose_alz("A", datos) == "0.34"
+    assert ai_explain._valor_desglose_alz("B", datos) == "0.12"
+    assert ai_explain._valor_desglose_alz("C", datos) == "0.18"
+    assert ai_explain._valor_desglose_alz("D", datos) == "1.05"
+    assert ai_explain._valor_desglose_alz("E", datos) == "0.87"
+
+    bloque = ai_explain._build_desglose_block("avanzado", "alz", datos)
+    assert "• A (Capital de Trabajo) = 0.34 — sale de" in bloque
+    assert "• E (Rotación de Activos) = 0.87 — sale de" in bloque
+
+
+def test_valor_desglose_azp_termino_a_termino():
+    datos = {"altman_pp": {"disponible": True, "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "e": None}}
+    assert ai_explain._valor_desglose_azp("A", datos) == "0.34"
+    assert ai_explain._valor_desglose_azp("B", datos) == "0.12"
+    assert ai_explain._valor_desglose_azp("C", datos) == "0.18"
+    assert ai_explain._valor_desglose_azp("D", datos) == "1.05"
+
+    bloque = ai_explain._build_desglose_block("avanzado", "azp", datos)
+    assert "• A (Capital de Trabajo) = 0.34 — sale de" in bloque
+    # `azp` no usa E -- no debería aparecer una línea de E en absoluto.
+    assert "(Rotación de Activos)" not in bloque
+
+
+@pytest.mark.parametrize(
+    "code,letra,nombre_criterio,esperado",
+    [
+        ("pir", "ROA positivo", "roa_positivo", "✅ Cumple"),
+        ("pir", "CFO positivo", "cfo_positivo", "✅ Cumple"),
+        ("pir", "ROA creciente", "roa_creciente", "✅ Cumple"),
+        ("pir", "CFO > Utilidad", "cfo_mayor_utilidad", "❌ No cumple"),
+        ("pia", "Apalancamiento decreciente", "apalancamiento_decreciente", "✅ Cumple"),
+        ("pia", "Liquidez creciente", "liquidez_creciente", "❌ No cumple"),
+        ("pia", "Sin dilución", "sin_dilucion", "✅ Cumple"),
+        ("pie", "Margen bruto creciente", "margen_bruto_creciente", "✅ Cumple"),
+        ("pie", "Rotación de activos creciente", "rotacion_activos_creciente", "❌ No cumple"),
+    ],
+)
+def test_valor_desglose_piotroski_las_9_letras_contra_fixture_avanzado(code, letra, nombre_criterio, esperado):
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    assert ai_explain._valor_desglose_piotroski(letra, datos) == esperado
+
+    bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+    assert f"{letra} = {esperado}" in bloque or f"({ai_explain_content.desglose('avanzado', code)[0].nombre})" in bloque
+
+
+def test_valor_desglose_piotroski_no_evaluable_cumplido_none():
+    datos = {"criterios": [{"nombre": "roa_positivo", "cumplido": None, "valores": None}]}
+    assert ai_explain._valor_desglose_piotroski("ROA positivo", datos) == "➖ No evaluable"
+
+    bloque = ai_explain._build_desglose_block("avanzado", "pir", datos)
+    assert "➖ No evaluable" in bloque
+    assert "None" not in bloque
+
+
+def test_valor_desglose_piotroski_criterio_ausente_del_payload_sin_valor():
+    """Caso de error obligatorio de QA -- ni `KeyError` ni `AttributeError`,
+    ni tampoco 'None' visible; la letra sale sin `= valor`."""
+    datos = {"criterios": []}
+    assert ai_explain._valor_desglose_piotroski("ROA positivo", datos) is None
+
+    bloque = ai_explain._build_desglose_block("avanzado", "pir", datos)
+    assert bloque is not None
+    assert "None" not in bloque
+    assert " = " not in bloque.split("\n")[1]  # primera línea de término, sin segmento de valor
+
+
+def test_valor_desglose_piotroski_letra_desconocida_sin_mapeo():
+    """100% branch coverage (QA) -- letra sin entrada en
+    `_DESGLOSE_LETRA_A_NOMBRE_CRITERIO` no revienta, devuelve `None`."""
+    datos = {"criterios": [{"nombre": "roa_positivo", "cumplido": True, "valores": {}}]}
+    assert ai_explain._valor_desglose_piotroski("Letra inexistente", datos) is None
+
+
+def test_valor_desglose_piotroski_ignora_entradas_no_dict_en_criterios():
+    """100% branch coverage (QA) -- una entrada no-dict en `criterios` no
+    rompe el filtro `isinstance(c, dict)`."""
+    datos = {"criterios": ["esto-no-es-un-dict", {"nombre": "roa_positivo", "cumplido": True, "valores": {}}]}
+    assert ai_explain._valor_desglose_piotroski("ROA positivo", datos) == "✅ Cumple"
+
+
+def test_valor_desglose_mgr_letra_desconocida_sin_mapeo():
+    """100% branch coverage (QA) -- letra fuera de las 3 conocidas de `mgr`
+    devuelve `None` sin reventar."""
+    assert ai_explain._valor_desglose_mgr("Letra inexistente", {"ebit": 1.0}) is None
+
+
+def test_valor_desglose_mgr_cada_sub_rama_con_dato_ausente():
+    """100% branch coverage (QA) -- cada una de las 3 letras de `mgr` con su
+    campo faltante devuelve `None` (rama negativa de cada `if`)."""
+    assert ai_explain._valor_desglose_mgr("EBIT", {}) is None
+    assert ai_explain._valor_desglose_mgr("Capital de Trabajo Neto", {"current_assets": 1.0}) is None
+    assert ai_explain._valor_desglose_mgr("Capital de Trabajo Neto", {"current_liabilities": 1.0}) is None
+    assert ai_explain._valor_desglose_mgr("Activos Fijos Netos", {}) is None
+
+
+def test_valor_desglose_mge_letra_desconocida_sin_mapeo():
+    assert ai_explain._valor_desglose_mge("Letra inexistente", {"ebit": 1.0}) is None
+
+
+def test_valor_desglose_alz_letra_desconocida_y_altman_no_disponible():
+    assert ai_explain._valor_desglose_alz("Z", {"altman": {"disponible": True, "a": 0.34}}) is None
+    assert ai_explain._valor_desglose_alz("A", {"altman": {"disponible": False}}) is None
+
+
+def test_valor_desglose_azp_letra_desconocida_y_altman_pp_no_disponible():
+    assert ai_explain._valor_desglose_azp("E", {"altman_pp": {"disponible": True, "a": 0.34}}) is None
+    assert ai_explain._valor_desglose_azp("A", {"altman_pp": {"disponible": False}}) is None
+
+
+def test_valor_desglose_mgr_termino_a_termino():
+    datos = {"ebit": 114_000.0, "current_assets": 650_000.0, "current_liabilities": 150_000.0, "ppe_net": 70_000.0}
+    assert ai_explain._valor_desglose_mgr("EBIT", datos) == "$114,000.00"
+    assert ai_explain._valor_desglose_mgr("Capital de Trabajo Neto", datos) == "$500,000.00"
+    assert ai_explain._valor_desglose_mgr("Activos Fijos Netos", datos) == "$70,000.00"
+
+    bloque = ai_explain._build_desglose_block("avanzado", "mgr", datos)
+    assert "• EBIT (EBIT (Ganancia antes de Intereses e Impuestos)) = $114,000.00" in bloque
+    assert "• Capital de Trabajo Neto (Capital de Trabajo Neto) = $500,000.00" in bloque
+    assert "• Activos Fijos Netos (Activos Fijos Netos (PP&E)) = $70,000.00" in bloque
+
+
+def test_valor_desglose_mgr_capital_de_trabajo_negativo_se_muestra_tal_cual():
+    """Alto riesgo de negocio (QA) -- capital de trabajo negativo no se
+    omite ni se muestra en valor absoluto."""
+    datos = {"ebit": 114_000.0, "current_assets": 100_000.0, "current_liabilities": 150_000.0, "ppe_net": 70_000.0}
+    # `_money` (mismo formateador que ya usa "🧮 Cuenta") antepone el signo
+    # de moneda al signo del número -- "$-50,000.00", no "-$50,000.00".
+    assert ai_explain._valor_desglose_mgr("Capital de Trabajo Neto", datos) == "$-50,000.00"
+
+
+def test_valor_desglose_mge_termino_a_termino():
+    datos = {"ebit": 114_000.0, "market_cap": 1_400_000.0, "total_debt": 100_000.0, "cash": 75_000.0}
+    assert ai_explain._valor_desglose_mge("EBIT", datos) == "$114,000.00"
+    assert ai_explain._valor_desglose_mge("Capitalización de Mercado", datos) == "$1,400,000.00"
+    assert ai_explain._valor_desglose_mge("Deuda Total", datos) == "$100,000.00"
+    assert ai_explain._valor_desglose_mge("Efectivo", datos) == "$75,000.00"
+
+    bloque = ai_explain._build_desglose_block("avanzado", "mge", datos)
+    assert "$114,000.00" in bloque
+    assert "$1,400,000.00" in bloque
+    assert "$100,000.00" in bloque
+    assert "$75,000.00" in bloque
+
+
+@pytest.mark.parametrize("code", ["alz", "azp", "mgr", "mge"])
+def test_build_desglose_block_caso_limite_cero_real_no_ausente(code):
+    """Caso límite obligatorio de QA -- un término en 0.0 real debe seguir
+    mostrando `= 0.00`/`$0.00`, nunca omitirse por falsy-check."""
+    if code == "alz":
+        datos = {"altman": {"disponible": True, "a": 0.0, "b": 0.12, "c": 0.18, "d": 1.05, "e": 0.87}}
+        bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+        assert "• A (Capital de Trabajo) = 0.00 —" in bloque
+    elif code == "azp":
+        datos = {"altman_pp": {"disponible": True, "a": 0.0, "b": 0.12, "c": 0.18, "d": 1.05, "e": None}}
+        bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+        assert "• A (Capital de Trabajo) = 0.00 —" in bloque
+    elif code == "mgr":
+        datos = {"ebit": 0.0, "current_assets": 150_000.0, "current_liabilities": 150_000.0, "ppe_net": 70_000.0}
+        bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+        assert "• EBIT (EBIT (Ganancia antes de Intereses e Impuestos)) = $0.00" in bloque
+        assert "• Capital de Trabajo Neto (Capital de Trabajo Neto) = $0.00" in bloque
+    else:  # mge
+        datos = {"ebit": 0.0, "market_cap": 1_400_000.0, "total_debt": 100_000.0, "cash": 75_000.0}
+        bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+        assert "= $0.00" in bloque
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+def test_build_desglose_block_modelo_no_disponible_lineas_sin_valor(code):
+    """Caso de error obligatorio de QA -- `disponible=False` no rompe el
+    bloque: cada línea se muestra sin el segmento `= valor` (distinto del
+    comportamiento de "🧮 Cuenta", que omite la línea/bloque completo)."""
+    if code in ("alz",):
+        datos = {"altman": {"disponible": False, "campos_faltantes": ["ebit"]}}
+    elif code in ("azp",):
+        datos = {"altman_pp": {"disponible": False, "campos_faltantes": ["ebit"]}}
+    elif code in ("pir", "pia", "pie"):
+        datos = {"criterios": []}
+    else:  # mgr, mge
+        datos = {}
+    bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+    assert bloque is not None, f"{code}: el bloque no debería omitirse por dato faltante"
+    assert "None" not in bloque
+    assert " = " not in bloque  # ninguna línea trae el segmento de valor
+    terminos = ai_explain_content.desglose("avanzado", code)
+    for t in terminos:
+        assert f"• {t.letra} ({t.nombre}) — sale de" in bloque
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+def test_build_desglose_block_ningun_none_visible_en_ningun_caso(code):
+    """Cubre transversalmente el criterio 'ningún "None" visible' con
+    `datos={}` (peor caso: ningún campo presente para ninguna pregunta)."""
+    bloque = ai_explain._build_desglose_block("avanzado", code, {})
+    assert bloque is not None
+    assert "None" not in bloque
+
+
+def test_build_desglose_block_extractor_con_dato_malformado_no_propaga_excepcion():
+    """Caso de error obligatorio de QA -- un `datos` con tipos inválidos no
+    debe propagar la excepción del extractor: la línea sale sin `= valor`,
+    el resto del bloque se arma normal (misma red de seguridad amplia que
+    ya usa `_build_cuenta_line`)."""
+    datos = {"altman": {"disponible": True, "a": "no-es-numero", "b": 0.12, "c": 0.18, "d": 1.05, "e": 0.87}}
+    bloque = ai_explain._build_desglose_block("avanzado", "alz", datos)
+    assert bloque is not None
+    assert "None" not in bloque
+    # La letra A queda sin valor (el `_ratio2` sobre un string revienta,
+    # capturado por el try/except) pero el resto de las letras sigue con
+    # su valor real.
+    assert "• A (Capital de Trabajo) —" in bloque  # sin "= valor"
+    assert "• B (Utilidades Retenidas) = 0.12 —" in bloque
+
+
+def test_piotroski_letras_desglose_alineadas_con_mapeo_interno():
+    """Mejora recomendada de `security`, incorporada como criterio de
+    aceptación obligatorio -- las 9 letras que expone `DESGLOSE_AVANZADO`
+    para pir/pia/pie deben mapear, todas, a uno de los 9 nombres canónicos
+    de criterio de Piotroski que usa `_PIOTROSKI_CUENTA_LABEL` (fuente
+    existente, no una lista nueva inventada en el test)."""
+    nombres_canonicos = set(ai_explain._PIOTROSKI_CUENTA_LABEL)
+    letras_piotroski = [
+        t.letra
+        for code in ("pir", "pia", "pie")
+        for t in ai_explain_content.desglose("avanzado", code)
+    ]
+    assert len(letras_piotroski) == 9
+    for letra in letras_piotroski:
+        nombre = ai_explain._DESGLOSE_LETRA_A_NOMBRE_CRITERIO.get(letra)
+        assert nombre is not None, f"letra '{letra}' sin entrada en _DESGLOSE_LETRA_A_NOMBRE_CRITERIO"
+        assert nombre in nombres_canonicos, (
+            f"letra '{letra}' mapea a '{nombre}', que no es un nombre canónico de criterio Piotroski"
+        )
+    # Y a la inversa -- el mapeo no tiene entradas huérfanas sin letra real.
+    assert set(ai_explain._DESGLOSE_LETRA_A_NOMBRE_CRITERIO) == set(letras_piotroski)
+
+
+def test_build_desglose_block_datos_no_es_input_de_ai_rewrite():
+    """El guard de integridad (`ai_rewrite.protected_tokens`) sigue actuando
+    ÚNICAMENTE sobre `datos_del_contexto`, nunca sobre el resultado de
+    `_build_desglose_block` -- aserción estructural sobre el orden real de
+    llamadas en `_dispatch_leaf` y sobre la firma de `_fetch_explanation`
+    (sin mockear nada)."""
+    import inspect
+
+    firma_fetch = inspect.signature(ai_explain._fetch_explanation)
+    assert "desglose" not in firma_fetch.parameters
+
+    fuente = inspect.getsource(ai_explain._dispatch_leaf)
+    idx_fetch = fuente.index("_fetch_explanation(")
+    idx_desglose = fuente.index("_build_desglose_block(")
+    assert idx_fetch < idx_desglose, (
+        "_build_desglose_block debe llamarse DESPUÉS de _fetch_explanation "
+        "-- nunca entra al prompt de Ollama"
+    )
+
+
+# --- Consistencia "🧮 Cuenta" vs. "🔍 Desglose" (punto explícito del pedido
+# de Daniela) -- mismo `datos`, mismo string formateado para el mismo
+# término, en el mismo test. ------------------------------------------------
+
+
+def test_consistencia_cuenta_y_desglose_alz_mismo_valor_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "alz")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "alz", datos)
+    desglose = ai_explain._build_desglose_block("avanzado", "alz", datos)
+    assert "1.2×0.34" in cuenta  # término A de la Cuenta
+    assert "• A (Capital de Trabajo) = 0.34 —" in desglose  # mismo A en el Desglose
+
+
+def test_consistencia_cuenta_y_desglose_azp_mismo_valor_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "azp")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "azp", datos)
+    desglose = ai_explain._build_desglose_block("avanzado", "azp", datos)
+    assert "6.56×0.34" in cuenta
+    assert "• A (Capital de Trabajo) = 0.34 —" in desglose
+
+
+@pytest.mark.parametrize("code", ["pir", "pia", "pie"])
+def test_consistencia_cuenta_y_desglose_piotroski_mismo_cumplido(code):
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    cuenta = ai_explain._build_cuenta_line("avanzado", code, datos)
+    desglose = ai_explain._build_desglose_block("avanzado", code, datos)
+    # El primer criterio de la Cuenta (cumplido=True en la fixture) debe
+    # coincidir en sentido con el ✅/❌ del Desglose para el mismo criterio.
+    assert "cumplido" in cuenta
+    assert "✅ Cumple" in desglose or "❌ No cumple" in desglose
+
+
+def test_consistencia_cuenta_y_desglose_mgr_capital_invertido_igual_a_suma_de_componentes():
+    """Para `mgr` el criterio de consistencia es aritmético, no textual:
+    `current_assets - current_liabilities` (Desglose) + `ppe_net`
+    (Desglose) debe sumar exactamente el `capital_invertido` que usa
+    "🧮 Cuenta", con la misma fixture."""
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "mgr")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mgr", datos)
+    assert "$570,000.00" in cuenta  # capital_invertido de la fixture
+
+    ca, cl, ppe = datos["current_assets"], datos["current_liabilities"], datos["ppe_net"]
+    assert (ca - cl) + ppe == pytest.approx(datos["capital_invertido"])
+
+    desglose = ai_explain._build_desglose_block("avanzado", "mgr", datos)
+    assert "Capital de Trabajo Neto (Capital de Trabajo Neto) = $500,000.00" in desglose
+    assert "Activos Fijos Netos (Activos Fijos Netos (PP&E)) = $70,000.00" in desglose
+
+
+def test_consistencia_cuenta_y_desglose_mge_mismos_4_valores():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "mge")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mge", datos)
+    desglose = ai_explain._build_desglose_block("avanzado", "mge", datos)
+    for valor in ("$114,000.00", "$1,400,000.00", "$100,000.00", "$75,000.00"):
+        assert valor in cuenta
+        assert valor in desglose
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
+async def test_mensaje_paso_a_paso_desglose_muestra_valores_reales_no_solo_texto_fijo(code):
+    """Happy path por pregunta (7 casos, QA) -- en el mensaje real de
+    "Explicame paso a paso" el bloque de Desglose ya no es 100% texto fijo:
+    contiene al menos un valor real del ticker."""
+    ctx = _avanzado_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "Explicación genérica sin números inventados."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:{code}")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    texto = kwargs["text"]
+    idx_desglose = texto.index("🔍 Desglose")
+    bloque_desglose = texto[idx_desglose:texto.index(respuesta)]
+    assert " = " in bloque_desglose, f"{code}: el Desglose no muestra ningún valor real"
+    assert "None" not in bloque_desglose

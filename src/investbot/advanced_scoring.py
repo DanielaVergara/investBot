@@ -513,6 +513,14 @@ class MagicFormulaResult:
     market_cap: Optional[float] = None
     total_debt: Optional[float] = None
     cash: Optional[float] = None
+    # SDD_desglose_con_valores_reales.md, Decisión de diseño #1 -- campos
+    # nuevos de exposición pura (los 2 componentes de `capital_invertido`
+    # por separado), poblados con las MISMAS variables locales ya usadas
+    # para calcularlo -- nunca recalculados aparte, la fórmula de
+    # `capital_invertido` no cambia.
+    current_assets: Optional[float] = None
+    current_liabilities: Optional[float] = None
+    ppe_net: Optional[float] = None
 
 
 def calculate_magic_formula_metrics(
@@ -563,6 +571,9 @@ def calculate_magic_formula_metrics(
         market_cap=mc,
         total_debt=total_debt,
         cash=cash,
+        current_assets=current_assets,
+        current_liabilities=current_liabilities,
+        ppe_net=ppe_net,
     )
 
 
