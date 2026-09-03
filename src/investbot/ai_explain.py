@@ -1282,11 +1282,39 @@ def _normalize_numeric_token(token: str) -> str:
     return body + "%" if percent else body
 
 
+def _percent_token_a_decimal(token: str) -> Optional[str]:
+    """Si `token` (ya normalizado por `_normalize_numeric_token`) es un
+    porcentaje, devuelve el string que tendría el mismo valor expresado
+    como proporción decimal cruda (ej. "12%" -> "0.12"), matcheando cómo
+    `json.dumps` serializa el float crudo del payload que Ollama recibió
+    (ej. `net_debt_to_ebitda: 0.12`, un múltiplo -- no un porcentaje -- que
+    varios campos vecinos del mismo payload SÍ son, roe/dividend_yield/
+    payout_ratio). Extiende la normalización de formato ya existente
+    ($/separador de miles) al mismo tipo de falso positivo: incidente real
+    de producción 2026-09-03 donde Ollama redactó 0.12 como "12%" para
+    `net_debt_to_ebitda` -- mismo valor, otra representación, no una
+    alucinación. `None` si `token` no es un porcentaje o no es convertible."""
+    if not token.endswith("%"):
+        return None
+    try:
+        value = float(token[:-1])
+    except ValueError:
+        return None
+    return repr(value / 100)
+
+
 def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
     respuesta_tokens = {
         _normalize_numeric_token(token) for token in ai_rewrite.protected_tokens(respuesta)
     }
-    return respuesta_tokens <= datos_tokens
+    for token in respuesta_tokens:
+        if token in datos_tokens:
+            continue
+        decimal_equiv = _percent_token_a_decimal(token)
+        if decimal_equiv is not None and decimal_equiv in datos_tokens:
+            continue
+        return False
+    return True
 
 
 class _ExplainUnavailable(Exception):
@@ -1316,39 +1344,55 @@ async def _fetch_explanation(
         pool=config.timeout_seconds,
     )
 
-    try:
-        response = await http_client.post(
-            f"{config.base_url}/api/generate",
-            json={
-                "model": config.model,
-                "system": system_prompt,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"num_predict": MAX_EXPLANATION_OUTPUT_TOKENS},
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        raw_text = data["response"]
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        logger.info(
-            "Ollama no disponible o timeout generando explicación (%s)", type(exc).__name__
-        )
-        raise _ExplainUnavailable() from exc
+    # Reintento único ante estructura JSON inesperada (evidencia de
+    # producción 2026-09-03: `qwen2.5:3b-instruct` a veces no respeta el
+    # contrato de formato en el primer intento). Se repite la llamada
+    # COMPLETA a Ollama (mismo `config.timeout_seconds` sin recortar, no
+    # toca el rate limiter) hasta 2 intentos en total -- si el segundo
+    # también falla (mismo motivo o timeout/conexión), se aplica el
+    # comportamiento de siempre (`_ExplainUnavailable`).
+    respuesta: Optional[str] = None
+    for attempt in range(2):
+        try:
+            response = await http_client.post(
+                f"{config.base_url}/api/generate",
+                json={
+                    "model": config.model,
+                    "system": system_prompt,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"num_predict": MAX_EXPLANATION_OUTPUT_TOKENS},
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            raw_text = data["response"]
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            logger.info(
+                "Ollama no disponible o timeout generando explicación (%s)", type(exc).__name__
+            )
+            raise _ExplainUnavailable() from exc
 
-    try:
-        parsed = json.loads(raw_text)
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("respuesta"), str):
-            raise ValueError("estructura inesperada -- falta la clave 'respuesta' string")
-        respuesta = parsed["respuesta"]
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.info(
-            "Respuesta de Ollama con estructura JSON inesperada generando "
-            "explicación (%s)", type(exc).__name__,
-        )
-        raise _ExplainUnavailable() from exc
+        try:
+            parsed = json.loads(raw_text)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("respuesta"), str):
+                raise ValueError("estructura inesperada -- falta la clave 'respuesta' string")
+            respuesta = parsed["respuesta"]
+            break
+        except (json.JSONDecodeError, ValueError) as exc:
+            if attempt == 0:
+                logger.info(
+                    "Respuesta de Ollama con estructura JSON inesperada generando "
+                    "explicación (%s) — reintentando una vez", type(exc).__name__,
+                )
+                continue
+            logger.info(
+                "Respuesta de Ollama con estructura JSON inesperada generando "
+                "explicación tras reintentar (%s)", type(exc).__name__,
+            )
+            raise _ExplainUnavailable() from exc
 
     if not _no_new_protected_tokens(datos_tokens, respuesta):
         logger.warning(
@@ -1363,24 +1407,45 @@ async def _fetch_explanation(
 # --- Teclados (Nivel 1 / Nivel 2 — Decisión de diseño #1/#2/#3, extendidos
 # por SDD_explicacion_paso_a_paso.md Decisión de diseño #1/#3) -------------
 
-# Textos EXACTOS de los 2 botones hermanos de toda pregunta
-# `variant="dato_y_paso_a_paso"` (criterio de aceptación de la spec —
-# idénticos para las 22 preguntas, distinguidos solo por `callback_data`).
-_LABEL_VER_DATO = "📊 Ver dato"
-_LABEL_PASO_A_PASO = "🎓 Explicame paso a paso"
+# Prefijos FIJOS de los 2 botones hermanos de toda pregunta
+# `variant="dato_y_paso_a_paso"` -- el nombre propio de la pregunta
+# (`spec.label`) se agrega a continuación para que cada fila sea
+# distinguible a simple vista (bug de UX: antes los 2 botones eran
+# idénticos en las 27 preguntas -- ver captura de pantalla de Daniela).
+_PREFIX_VER_DATO = "📊"
+_PREFIX_PASO_A_PASO = "🎓"
+
+# Un token inicial separado por espacio que no tiene ningún caracter
+# alfanumérico se interpreta como el emoji propio del label (ej. "💰 Valor
+# Justo Total" -> "💰" + "Valor Justo Total") y se quita antes de anteponer
+# nuestro propio prefijo, para no duplicar emoji en el botón.
+_LEADING_EMOJI_RE = re.compile(r"^(\S+)\s+(.+)$")
+
+
+def _label_sin_emoji_propio(label: str) -> str:
+    match = _LEADING_EMOJI_RE.match(label)
+    if match and not any(ch.isalnum() for ch in match.group(1)):
+        return match.group(2)
+    return label
 
 
 def _leaf_rows(
     context_id: str, code: str, spec: ai_explain_content.QuestionSpec
 ) -> list[list[InlineKeyboardButton]]:
     """1 fila por pregunta: 2 botones hermanos si `variant="dato_y_paso_a_
-    paso"` ("Ver dato" / "Explicame paso a paso", Decisión de diseño #1 de
-    SDD_explicacion_paso_a_paso.md); 1 botón con el label propio de la
-    pregunta en caso contrario (narrativa/determinístico, sin cambios)."""
+    paso"` (Decisión de diseño #1 de SDD_explicacion_paso_a_paso.md), cada
+    uno con el nombre propio de la pregunta (`spec.label`) para que se
+    distingan entre sí (fix UX 2026-09-03); 1 botón con el label propio de
+    la pregunta en caso contrario (narrativa/determinístico, sin cambios)."""
     if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO:
+        label = _label_sin_emoji_propio(spec.label)
         return [[
-            InlineKeyboardButton(_LABEL_VER_DATO, callback_data=f"xp:{context_id}:{code}"),
-            InlineKeyboardButton(_LABEL_PASO_A_PASO, callback_data=f"xp:{context_id}:p:{code}"),
+            InlineKeyboardButton(
+                f"{_PREFIX_VER_DATO} {label}", callback_data=f"xp:{context_id}:{code}"
+            ),
+            InlineKeyboardButton(
+                f"{_PREFIX_PASO_A_PASO} {label}", callback_data=f"xp:{context_id}:p:{code}"
+            ),
         ]]
     return [[InlineKeyboardButton(spec.label, callback_data=f"xp:{context_id}:{code}")]]
 

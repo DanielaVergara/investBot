@@ -820,6 +820,55 @@ async def test_rewrite_parts_end_to_end_estructura_json_invalida_fallback_comple
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
+async def test_rewrite_parts_reintenta_una_vez_y_se_recupera(caplog):
+    """Fix 2026-09-03: si la 1a respuesta de Ollama tiene estructura JSON
+    inesperada pero la 2a (reintento) es válida, `rewrite_parts` usa la
+    reescritura del 2o intento -- no cae al fallback -- y loguea el
+    reintento a INFO."""
+    section = "Prosa libre sin ningún dato protegido."
+    parts = ["*Adobe (ADBE)*", section]
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(200, json={"response": "esto no es json"})
+        return httpx.Response(200, json={"response": _section_response(["Prosa reescrita."])})
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.INFO):
+        outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+
+    assert call_count["n"] == 2
+    assert outcome.parts[1] == "Prosa reescrita."
+    assert outcome.used_ollama is True
+    assert any(
+        "reintentando" in r.message and r.levelno == logging.INFO for r in caplog.records
+    )
+
+
+async def test_rewrite_parts_ambos_intentos_fallan_cae_a_fallback(caplog):
+    """Fix 2026-09-03: si AMBOS intentos (original + reintento) devuelven
+    estructura JSON inesperada, se hacen exactamente 2 llamadas HTTP y el
+    resultado final es el fallback de siempre (texto original, WARNING)."""
+    section = "Prosa libre sin ningún dato protegido."
+    parts = ["*Adobe (ADBE)*", section]
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json={"response": "esto no es json"})
+
+    client = _client_with_handler(handler)
+    with caplog.at_level(logging.INFO):
+        outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+
+    assert call_count["n"] == 2
+    assert outcome.parts == parts
+    assert outcome.used_ollama is False
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 async def test_rewrite_parts_system_prompt_incluye_regla_6_de_placeholders():
     """Caso 45: el `SYSTEM_PROMPT` enviado incluye literalmente la regla 6
     nueva del Patch Iter-2 (instrucción sobre placeholders opacos)."""

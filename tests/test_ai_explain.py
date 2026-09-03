@@ -885,6 +885,22 @@ def test_guard_adversarial_numero_realmente_distinto_sigue_rechazado():
     assert ai_explain._no_new_protected_tokens({"405.63"}, "Vale $999.99.") is False
 
 
+def test_guard_normaliza_porcentaje_a_proporcion_decimal_mismo_valor_pasa():
+    """Caso real de producción 2026-09-03: `net_debt_to_ebitda` viaja al
+    payload de Ollama como proporción decimal cruda (`0.12`, no un
+    porcentaje -- es un múltiplo "0.12x") y Ollama lo redactó como "una
+    tasa cercana a 12%" -- mismo valor, otra representación (igual que el
+    caso ya cubierto de $/separador de miles), no una alucinación."""
+    assert ai_explain._no_new_protected_tokens({"0.12"}, "una tasa cercana a 12%") is True
+
+
+def test_guard_normalizacion_de_porcentaje_no_afloja_numero_realmente_distinto():
+    """La extensión de normalización no abre una puerta trasera -- un
+    porcentaje que no corresponde a NINGÚN dato real (ni como proporción
+    decimal ni como porcentaje textual) se sigue rechazando."""
+    assert ai_explain._no_new_protected_tokens({"0.12"}, "una tasa cercana a 87%") is False
+
+
 def test_normalize_numeric_token_no_toca_tokens_no_numericos():
     for token in ("✅", "❌", "SÍ", "NO", "ADBE"):
         assert ai_explain._normalize_numeric_token(token) == token
@@ -992,6 +1008,48 @@ async def test_fetch_explanation_json_sin_clave_respuesta(caplog):
         with pytest.raises(ai_explain._ExplainUnavailable):
             await ai_explain._fetch_explanation(**_fetch_kwargs(http_client=_client_with_handler(handler)))
     assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
+async def test_fetch_explanation_reintenta_una_vez_y_se_recupera(caplog):
+    """Fix 2026-09-03: si la 1a respuesta de Ollama tiene estructura JSON
+    inesperada pero la 2a (reintento) es válida, `_fetch_explanation`
+    devuelve la explicación del 2o intento -- no levanta
+    `_ExplainUnavailable` -- y loguea el reintento a INFO."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(200, json={"response": "esto no es json"})
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": "Explicación ok."})})
+
+    with caplog.at_level(logging.INFO):
+        resultado = await ai_explain._fetch_explanation(
+            **_fetch_kwargs(http_client=_client_with_handler(handler))
+        )
+
+    assert call_count["n"] == 2
+    assert resultado == "Explicación ok."
+    assert any("reintentando" in r.message for r in caplog.records)
+
+
+async def test_fetch_explanation_ambos_intentos_fallan_cae_a_unavailable(caplog):
+    """Fix 2026-09-03: si AMBOS intentos (original + reintento) devuelven
+    estructura JSON inesperada, se hacen exactamente 2 llamadas HTTP y el
+    resultado final sigue siendo `_ExplainUnavailable`."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json={"response": "esto no es json"})
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ai_explain._ExplainUnavailable):
+            await ai_explain._fetch_explanation(
+                **_fetch_kwargs(http_client=_client_with_handler(handler))
+            )
+
+    assert call_count["n"] == 2
 
 
 async def test_fetch_explanation_guard_falla_warning():
@@ -1642,17 +1700,41 @@ async def test_callback_paso_a_paso_con_code_inexistente_es_invalido():
 
 @pytest.mark.parametrize("code", _CODES_DATO_Y_PASO_A_PASO)
 def test_2_botones_ver_dato_y_paso_a_paso_para_cada_pregunta(code):
-    """Cada pregunta `dato_y_paso_a_paso` muestra 2 botones hermanos:
-    "📊 Ver dato" (`xp:{id}:{code}`) y "🎓 Explicame paso a paso"
-    (`xp:{id}:p:{code}`) -- test explícito por cada una de las 22 preguntas."""
+    """Cada pregunta `dato_y_paso_a_paso` muestra 2 botones hermanos, ambos
+    con el nombre propio de la pregunta (`spec.label`, sin duplicar su
+    emoji si ya trae uno) para distinguirse de las demás filas de su misma
+    categoría -- fix UX 2026-09-03 -- distinguidos entre sí por el prefijo
+    "📊"/"🎓" y por `callback_data` (`xp:{id}:{code}` vs `xp:{id}:p:{code}`)
+    -- test explícito por cada una de las 22 preguntas."""
     kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
     spec = ai_explain_content.all_questions(kind)[code]
     fila = ai_explain._leaf_rows("a1b2c3d4", code, spec)[0]
+    label = ai_explain._label_sin_emoji_propio(spec.label)
     assert len(fila) == 2
-    assert fila[0].text == ai_explain._LABEL_VER_DATO
+    assert fila[0].text == f"📊 {label}"
     assert fila[0].callback_data == f"xp:a1b2c3d4:{code}"
-    assert fila[1].text == ai_explain._LABEL_PASO_A_PASO
+    assert fila[1].text == f"🎓 {label}"
     assert fila[1].callback_data == f"xp:a1b2c3d4:p:{code}"
+
+
+def test_botones_distinguibles_entre_preguntas_de_una_misma_categoria():
+    """Bug de UX confirmado con captura de pantalla (2026-09-03): las 5
+    preguntas de la categoría "Valoración" (vf/gra/dcf/mul/rat) mostraban
+    filas de botones visualmente IDÉNTICAS ("Ver dato" | "Explicame paso a
+    paso" repetido 5 veces). Ahora cada fila debe ser identificable a
+    simple vista -- ningún par de preguntas comparte el mismo texto de
+    botón, ni en la columna "Ver dato" ni en la columna "paso a paso"."""
+    cat = ai_explain_content.CATEGORIES_TEXTO_LIBRE["val"]
+    questions = ai_explain_content.all_questions("texto_libre")
+    filas = [
+        ai_explain._leaf_rows("a1b2c3d4", code, questions[code])[0] for code in cat.question_codes
+    ]
+    assert len(cat.question_codes) == 5
+
+    textos_ver_dato = [fila[0].text for fila in filas]
+    textos_paso_a_paso = [fila[1].text for fila in filas]
+    assert len(set(textos_ver_dato)) == 5
+    assert len(set(textos_paso_a_paso)) == 5
 
 
 @pytest.mark.parametrize("code", _CODES_NARRATIVA_O_DETERMINISTICO)

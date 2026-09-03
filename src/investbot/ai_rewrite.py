@@ -378,47 +378,65 @@ async def rewrite_parts(
         pool=config.timeout_seconds,
     )
 
-    try:
-        response = await client.post(
-            f"{config.base_url}/api/generate",
-            json={
-                "model": config.model,
-                "system": SYSTEM_PROMPT,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"num_predict": MAX_OUTPUT_TOKENS},
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        # `response.json()` lanza `json.JSONDecodeError` sobre cuerpo
-        # no-JSON — es subclase de `ValueError` en la librería estándar de
-        # Python, por eso queda cubierta acá aunque no se nombre explícita
-        # (criterio de `security`, sección 4 — documentado para que un
-        # refactor futuro no la excluya pensando que `ValueError` sobra).
-        raw_text = data["response"]
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        # `asyncio.CancelledError` (y cualquier otro `BaseException`) NO
-        # queda atrapado acá — hereda de `BaseException`, no de `Exception`,
-        # así que se propaga normalmente (criterio de `security`, sección 4).
-        logger.info(
-            "Ollama no disponible o timeout — fallback a redacción original (%s)",
-            type(exc).__name__,
+    # Reintento único ante estructura JSON inesperada (evidencia de
+    # producción 2026-09-03: `qwen2.5:3b-instruct` a veces no respeta el
+    # contrato de formato en el primer intento). Se repite la llamada
+    # COMPLETA a Ollama (mismo `timeout_seconds` sin recortar, no toca el
+    # rate limiter) hasta 2 intentos en total — la segunda falla, por el
+    # motivo que sea, cae al fallback de siempre.
+    sections: Optional[list[str]] = None
+    for attempt in range(2):
+        try:
+            response = await client.post(
+                f"{config.base_url}/api/generate",
+                json={
+                    "model": config.model,
+                    "system": SYSTEM_PROMPT,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"num_predict": MAX_OUTPUT_TOKENS},
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            # `response.json()` lanza `json.JSONDecodeError` sobre cuerpo
+            # no-JSON — es subclase de `ValueError` en la librería estándar de
+            # Python, por eso queda cubierta acá aunque no se nombre explícita
+            # (criterio de `security`, sección 4 — documentado para que un
+            # refactor futuro no la excluya pensando que `ValueError` sobra).
+            raw_text = data["response"]
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            # `asyncio.CancelledError` (y cualquier otro `BaseException`) NO
+            # queda atrapado acá — hereda de `BaseException`, no de
+            # `Exception`, así que se propaga normalmente (criterio de
+            # `security`, sección 4).
+            logger.info(
+                "Ollama no disponible o timeout — fallback a redacción original (%s)",
+                type(exc).__name__,
+            )
+            return RewriteOutcome(parts=parts, used_ollama=False)
+
+        sections = _parse_json_sections(raw_text, len(body_parts))
+        if sections is not None:
+            break
+        if attempt == 0:
+            logger.info(
+                "Respuesta de Ollama con estructura JSON inesperada "
+                "(%d secciones esperadas) — reintentando una vez",
+                len(body_parts),
+            )
+            continue
+        logger.warning(
+            "Respuesta de Ollama con estructura JSON inesperada "
+            "(%d secciones esperadas) tras reintentar — fallback completo a "
+            "redacción original",
+            len(body_parts),
         )
         return RewriteOutcome(parts=parts, used_ollama=False)
 
     try:
-        sections = _parse_json_sections(raw_text, len(body_parts))
-        if sections is None:
-            logger.warning(
-                "Respuesta de Ollama con estructura JSON inesperada "
-                "(%d secciones esperadas) — fallback completo a redacción original",
-                len(body_parts),
-            )
-            return RewriteOutcome(parts=parts, used_ollama=False)
-
         result_body: list[str] = []
         any_rewritten = False
         for original_section, rewritten_section, line_map in zip(
