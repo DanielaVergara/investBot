@@ -892,6 +892,24 @@ def test_guard_normaliza_separador_de_miles_mismo_valor_pasa():
     assert ai_explain._no_new_protected_tokens({"1234.56"}, "Vale $1,234.56.") is True
 
 
+def test_guard_normaliza_coma_decimal_mismo_valor_pasa():
+    """Caso real de producción 2026-09-04: Ollama escribió "$285,75" (coma
+    como separador DECIMAL, no de miles) para un monto que en el dato real
+    es 285.75 -- mismo valor, otro convenio numérico, no una alucinación."""
+    assert ai_explain._no_new_protected_tokens({"285.75"}, "Vale $285,75.") is True
+
+
+def test_guard_coma_de_miles_sigue_funcionando_no_se_rompe_por_el_fix_decimal():
+    """La heurística de coma decimal (1-2 dígitos tras la coma) no debe
+    reabrir el caso ya cubierto de separador de miles (3 dígitos tras la
+    coma) -- "$1,234.56" sigue normalizando a "1234.56", no a "1.234.56"."""
+    assert ai_explain._no_new_protected_tokens({"1234.56"}, "Vale $1,234.56.") is True
+
+
+def test_guard_coma_decimal_numero_realmente_distinto_sigue_rechazado():
+    assert ai_explain._no_new_protected_tokens({"285.75"}, "Vale $999,99.") is False
+
+
 def test_guard_normaliza_signo_mas_mismo_valor_pasa():
     assert ai_explain._no_new_protected_tokens({"5.2%"}, "Subió +5.2%.") is True
 

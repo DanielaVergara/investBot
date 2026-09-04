@@ -1722,11 +1722,32 @@ _NUMERIC_TOKEN_RE = re.compile(r"^[+-]?\$?\d[\d.,]*%?$")
 
 
 def _normalize_numeric_token(token: str) -> str:
+    """Normaliza formato (no valor) para comparar contra los tokens
+    protegidos del payload real. Además del `$`/signo/separador de miles ya
+    cubiertos, distingue coma DECIMAL de coma de MILES (incidente de
+    producción 2026-09-04: Ollama a veces escribe montos con coma decimal,
+    ej. "$285,75" en vez de "285.75" -- mezcla de convenio numérico de otro
+    idioma/locale -- que antes se normalizaba mal a "28575", un valor
+    distinto, y disparaba un rechazo del guard sobre un número que en
+    realidad coincidía). Heurística segura (no hay forma exacta de
+    distinguir los dos casos en un string aislado en el caso general): con
+    EXACTAMENTE una coma en el número, si va seguida de 1-2 dígitos hasta
+    el final se interpreta como coma decimal (se convierte a "."); si va
+    seguida de 3 dígitos (patrón típico de miles, ej. "1,000") se sigue
+    tratando como separador de miles (se quita), igual que con 2+ comas."""
     if not _NUMERIC_TOKEN_RE.match(token):
         return token
     percent = token.endswith("%")
     body = token[:-1] if percent else token
-    body = body.lstrip("+-").lstrip("$").rstrip(".,").replace(",", "")
+    body = body.lstrip("+-").lstrip("$").rstrip(".,")
+    if body.count(",") == 1:
+        entero, _, decimales = body.partition(",")
+        if decimales.isdigit() and 1 <= len(decimales) <= 2:
+            body = f"{entero}.{decimales}"
+        else:
+            body = body.replace(",", "")
+    else:
+        body = body.replace(",", "")
     return body + "%" if percent else body
 
 
@@ -1891,13 +1912,19 @@ async def _fetch_explanation(
         pool=config.timeout_seconds,
     )
 
-    # Reintento único ante estructura JSON inesperada (evidencia de
-    # producción 2026-09-03: `qwen2.5:3b-instruct` a veces no respeta el
-    # contrato de formato en el primer intento). Se repite la llamada
-    # COMPLETA a Ollama (mismo `config.timeout_seconds` sin recortar, no
-    # toca el rate limiter) hasta 2 intentos en total -- si el segundo
-    # también falla (mismo motivo o timeout/conexión), se aplica el
-    # comportamiento de siempre (`_ExplainUnavailable`).
+    # Reintento único ante estructura JSON inesperada, eco del payload de
+    # entrada, mezcla de portugués, O invención de números/tickers no
+    # presentes en los datos reales (evidencia de producción 2026-09-03:
+    # `qwen2.5:3b-instruct` a veces no respeta el contrato de formato en el
+    # primer intento -- los otros 3 chequeos comparten el mismo patrón de
+    # reintento). El guard final de integridad (`_no_new_protected_tokens`)
+    # vivía FUERA de este loop y se rendía sin reintentar ante el primer
+    # fallo, inconsistente con los otros 3 -- fix 2026-09-04: mismo criterio
+    # para los 4 chequeos. Se repite la llamada COMPLETA a Ollama (mismo
+    # `config.timeout_seconds` sin recortar, no toca el rate limiter) hasta
+    # 2 intentos en total -- si el segundo también falla (por cualquiera de
+    # los 4 motivos, o timeout/conexión), se aplica el comportamiento de
+    # siempre (`_ExplainUnavailable`).
     respuesta: Optional[str] = None
     for attempt in range(2):
         try:
@@ -1931,8 +1958,6 @@ async def _fetch_explanation(
                 raise ValueError("respuesta contiene el eco del JSON de entrada")
             if _respuesta_tiene_portugues(respuesta_candidata):
                 raise ValueError("respuesta mezcla portugués en vez de español")
-            respuesta = respuesta_candidata
-            break
         except (json.JSONDecodeError, ValueError) as exc:
             if attempt == 0:
                 logger.info(
@@ -1949,13 +1974,28 @@ async def _fetch_explanation(
             )
             raise _ExplainUnavailable() from exc
 
-    if not _no_new_protected_tokens(datos_tokens, respuesta):
-        logger.warning(
-            "Explicación generada no pasó el guard de integridad -- "
-            "descartada. Respuesta cruda: %s", _sanitize_for_log(respuesta),
-        )
-        raise _ExplainUnavailable()
+        # Guard final de integridad -- movido DENTRO del loop de reintento
+        # (fix 2026-09-04): antes vivía fuera y se rendía sin reintentar en
+        # el primer fallo, inconsistente con los 3 chequeos de arriba.
+        if not _no_new_protected_tokens(datos_tokens, respuesta_candidata):
+            if attempt == 0:
+                logger.warning(
+                    "Explicación generada no pasó el guard de integridad -- "
+                    "descartada, reintentando una vez. Respuesta cruda: %s",
+                    _sanitize_for_log(respuesta_candidata),
+                )
+                continue
+            logger.warning(
+                "Explicación generada no pasó el guard de integridad -- "
+                "descartada tras reintentar. Respuesta cruda: %s",
+                _sanitize_for_log(respuesta_candidata),
+            )
+            raise _ExplainUnavailable()
 
+        respuesta = respuesta_candidata
+        break
+
+    assert respuesta is not None  # el loop siempre termina en `break` o `raise`
     return _enforce_brevity(respuesta)
 
 
