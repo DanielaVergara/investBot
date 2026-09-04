@@ -54,6 +54,7 @@ from typing import Callable, Optional
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from investbot import advanced_scoring, ai_explain_content, ai_rewrite, risk_fit, summary, valuation
@@ -77,6 +78,12 @@ EXPLAIN_UNAVAILABLE_MSG = "📋 Ollama no está disponible en este momento — p
 EXPLAIN_EXPIRED_MSG = "Este botón ya venció — pedí el análisis de nuevo para ver explicaciones."
 EXPLAIN_PENDING_MSG = "🤔 Pensando la explicación…"
 EXPLAIN_INVALID_MSG = "Ese botón no es válido — pedí el análisis de nuevo si querés una explicación."
+
+# Fix urgente 2026-09-04 — paridad con `query_handler.GENERIC_ERROR_MSG`: si
+# la entrega final de la explicación falla (`edit_message_text` sobre el
+# mensaje "🤔 Pensando…"), este es el último recurso para que el usuario no
+# se quede mirando ese mensaje para siempre sin ninguna respuesta.
+EXPLAIN_DELIVERY_FAILED_MSG = "⚠️ Algo salió mal generando la explicación. Probá de nuevo en un rato."
 
 # Prefijo de contenido 100% determinístico (Decisión de diseño #4 — `evt`/
 # `inf`, nunca pasan por Ollama). Mismo espíritu que
@@ -1954,9 +1961,31 @@ async def _dispatch_leaf(
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
     desglose = _build_desglose_block(stored.kind, question_code, datos_del_contexto, context=stored)
     texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose)
-    await bot.edit_message_text(
-        chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup
-    )
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup
+        )
+    except TelegramError as exc:
+        # Fix urgente 2026-09-04 (paridad con `query_handler._deliver_all`):
+        # antes, si esta edición fallaba (mensaje muy largo, Markdown roto
+        # -- no debería darse acá porque este módulo nunca usa
+        # `parse_mode`, o cualquier otro motivo de Telegram), la excepción
+        # subía sin capturar y el usuario se quedaba mirando "🤔 Pensando…"
+        # para siempre. Último recurso: un `send_message` nuevo con un
+        # aviso genérico -- si también falla, se loguea a WARNING y se
+        # descarta en silencio, nunca puede tumbar el callback por segunda
+        # vez.
+        logger.error(
+            "No se pudo entregar la explicación final para %s — se le avisa "
+            "al usuario con un mensaje genérico: %s", _sanitize_for_log(question_code), exc,
+        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=EXPLAIN_DELIVERY_FAILED_MSG)
+        except TelegramError:
+            logger.warning(
+                "Tampoco se pudo avisarle al usuario con el mensaje genérico "
+                "para la explicación de %s", _sanitize_for_log(question_code), exc_info=True,
+            )
 
 
 # --- Handler compartido -----------------------------------------------------

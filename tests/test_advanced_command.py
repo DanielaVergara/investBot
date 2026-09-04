@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop
 
 from investbot import advanced_command, query_handler, security
@@ -454,6 +455,51 @@ async def test_mensaje_final_se_envia_sin_parse_mode_markdown(empresa_completa, 
 
     for call in update.message.reply_text.call_args_list:
         assert "parse_mode" not in call.kwargs
+
+
+# ---------------------------------------------------------------------------
+# Fix urgente 2026-09-04 — paridad con `query_handler._deliver_all`: la
+# entrega del mensaje final de /avanzado nunca debe dejar al usuario sin
+# ninguna respuesta si Telegram rechaza el envío.
+# ---------------------------------------------------------------------------
+
+
+async def test_entrega_final_falla_avisa_con_mensaje_generico(
+    empresa_completa, empresa_asset_light, etf_profile, caplog
+):
+    clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    update.message.reply_text = AsyncMock(side_effect=[TelegramError("boom entrega"), None])
+
+    with caplog.at_level(logging.ERROR):
+        await callback(update, context)  # no debe propagar la excepción
+
+    assert update.message.reply_text.await_count == 2
+    generic_args, generic_kwargs = update.message.reply_text.call_args_list[1]
+    assert generic_args[0] == query_handler.GENERIC_ERROR_MSG
+    assert "parse_mode" not in generic_kwargs
+
+
+async def test_entrega_final_y_aviso_generico_fallan_no_lanza(
+    empresa_completa, empresa_asset_light, etf_profile, caplog
+):
+    """Peor caso: ni la entrega final ni el aviso genérico logran llegar --
+    igual no debe propagar la excepción; el fallo del aviso se loguea a
+    WARNING y se descarta en silencio."""
+    clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    update.message.reply_text = AsyncMock(
+        side_effect=[TelegramError("boom entrega"), TelegramError("boom generico")]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await callback(update, context)  # no debe lanzar
+
+    assert update.message.reply_text.await_count == 2
 
 
 # ---------------------------------------------------------------------------

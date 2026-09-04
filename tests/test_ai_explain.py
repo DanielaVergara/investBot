@@ -1259,6 +1259,54 @@ async def test_handler_leaf_ollama_camino_feliz_orden_de_bloques():
     assert "Conservador" in texto  # escenario elegido en el bloque Dato
 
 
+async def test_handler_leaf_falla_entrega_final_avisa_con_mensaje_generico():
+    """Fix urgente 2026-09-04 (paridad con `query_handler._deliver_all`):
+    si el `edit_message_text` final (sobre el mensaje "🤔 Pensando…") falla,
+    antes la excepción subía sin capturar y el usuario se quedaba mirando
+    ese mensaje para siempre, sin ninguna respuesta. Ahora se intenta un
+    `send_message` nuevo con `EXPLAIN_DELIVERY_FAILED_MSG`."""
+    from telegram.error import TelegramError
+
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    client = _client_with_handler(_ok_handler("Respuesta corta."))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:gra")
+    context.bot.edit_message_text = AsyncMock(side_effect=TelegramError("boom entrega"))
+    await callback(update, context)  # no debe propagar la excepción
+
+    context.bot.edit_message_text.assert_awaited_once()
+    assert context.bot.send_message.await_count == 2
+    pending_call, generic_call = context.bot.send_message.call_args_list
+    assert pending_call.kwargs["text"] == ai_explain.EXPLAIN_PENDING_MSG
+    assert generic_call.kwargs["text"] == ai_explain.EXPLAIN_DELIVERY_FAILED_MSG
+
+
+async def test_handler_leaf_falla_entrega_y_aviso_generico_no_lanza():
+    """Peor caso: ni la edición final ni el aviso genérico logran
+    entregarse -- igual no debe propagar la excepción."""
+    from telegram.error import TelegramError
+
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(_texto_libre_context())
+    client = _client_with_handler(_ok_handler("Respuesta corta."))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:gra")
+    context.bot.edit_message_text = AsyncMock(side_effect=TelegramError("boom entrega"))
+    # 1ra llamada real a `send_message` = "🤔 Pensando…" (debe seguir
+    # funcionando, devuelve el mensaje "pensando"); 2da = el aviso genérico
+    # de este fix, que en este test TAMBIÉN falla.
+    pensando_msg = SimpleNamespace(message_id=999)
+    context.bot.send_message = AsyncMock(side_effect=[pensando_msg, TelegramError("boom generico")])
+
+    await callback(update, context)  # no debe lanzar
+    assert context.bot.send_message.await_count == 2
+
+
 async def test_handler_leaf_dato_cambia_segun_ticker():
     """El bloque "📌 Dato" refleja el valor real del `ExplanationContext`
     guardado -- 2 tickers distintos, 2 datos distintos."""

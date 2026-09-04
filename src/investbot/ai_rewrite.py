@@ -175,6 +175,44 @@ def _is_safe_rewrite(original: str, rewritten: str) -> bool:
     return _protected_tokens(original) == _protected_tokens(rewritten)
 
 
+# --- Guard de balance de Markdown (incidente de producción 2026-09-04,
+# ADBE: `telegram.error.BadRequest: Can't parse entities`) -----------------
+#
+# `_is_safe_rewrite`/`_protected_tokens` de arriba comparan números/%/
+# tickers/✅/❌/SÍ/NO -- nunca compararon el conteo de los caracteres que
+# Telegram interpreta como delimitadores de entidad Markdown (`*`, `_`,
+# `` ` ``, `[`). Una línea de prosa 100% libre (sin ningún protected token,
+# ej. "*Veredicto:*" de `summary.build_veredicto_section`) puede llegar
+# intacta a Ollama para reescritura -- si el modelo parafrasea y dropea o
+# duplica UNO de esos caracteres (ej. "*Veredicto:*" -> "*Veredicto:"), el
+# guard de arriba no lo detecta porque ningún protected token cambió, pero
+# el mensaje final queda con un delimitador de negrita/itálica desparejado
+# y Telegram rechaza el `edit_text`/`send_message` completo con
+# `BadRequest: Can't parse entities` -- el usuario se queda sin respuesta.
+#
+# Se compara PARIDAD (conteo par/impar), no igualdad de conteo contra el
+# original: la regla 7 del prompt permite condensar libremente prosa libre,
+# incluso eliminando por completo una línea con Markdown propio (ej. un
+# título en negrita que se funde en una frase de resumen sin formato) — eso
+# es una reescritura legítima que cambia el conteo total sin dejar ningún
+# delimitador desparejado. Lo que nunca es legítimo es que la sección
+# reconstruida quede con un conteo IMPAR de `*`/`_`/`` ` `` (delimitador
+# que abre sin cerrar, o viceversa) — eso es lo que Telegram no puede
+# parsear. `[` se verifica igual por consistencia con el resto de
+# caracteres especiales de Markdown de Telegram, aunque en la práctica no
+# aparece en ninguna sección de este bot.
+_MARKDOWN_DELIMITER_CHARS = ("*", "_", "`", "[")
+
+
+def _markdown_balance_preserved(original: str, rewritten: str) -> bool:
+    """`original` no se usa en la comparación (se mantiene en la firma por
+    simetría con `_is_safe_rewrite` y porque documenta la intención: el
+    invariante que debe seguir cumpliendo `rewritten` es el mismo que ya
+    cumplía `original` antes de pasar por Ollama). Devuelve `False` si
+    algún delimitador de Markdown queda con conteo impar en `rewritten`."""
+    return all(rewritten.count(ch) % 2 == 0 for ch in _MARKDOWN_DELIMITER_CHARS)
+
+
 # --- Placeholder-y-restitución (Spec Patch [Iter-2]) ------------------------
 
 _PLACEHOLDER_RE = re.compile(r"⟦PH\d+⟧")
@@ -224,12 +262,16 @@ def _reconstruct_section(
 
     Capa 2 (defensa en profundidad, cierra huecos de clasificación no
     detectados por `_protected_tokens`): el resultado final debe seguir
-    pasando `_is_safe_rewrite` contra la sección original completa — por
-    construcción siempre debería pasar (todo el contenido protegido se
-    restituyó verbatim, el resto nunca tenía protected tokens), así que un
-    fallo acá indica un bug de clasificación o una alucinación del LLM en
-    una línea de prosa libre (sin placeholder), no un "swap" de
-    placeholders — se trata igual: fallback a la sección original completa.
+    pasando `_is_safe_rewrite` Y `_markdown_balance_preserved` contra la
+    sección original completa — por construcción ambos siempre deberían
+    pasar (todo el contenido protegido se restituyó verbatim, el resto
+    nunca tenía protected tokens), así que un fallo acá indica un bug de
+    clasificación o una alucinación del LLM en una línea de prosa libre
+    (sin placeholder) — ya sea un dato inventado (`_is_safe_rewrite`) o un
+    delimitador de Markdown de Telegram agregado/dropeado al parafrasear
+    (`_markdown_balance_preserved`, incidente de producción 2026-09-04) —,
+    no un "swap" de placeholders — se trata igual: fallback a la sección
+    original completa.
     """
     expected = set(line_map.keys())
     found = _PLACEHOLDER_RE.findall(rewritten)
@@ -242,6 +284,9 @@ def _reconstruct_section(
 
     if not _is_safe_rewrite(original, reconstructed):
         return None  # red de seguridad final
+
+    if not _markdown_balance_preserved(original, reconstructed):
+        return None  # delimitador de Markdown de Telegram desparejado
 
     return reconstructed
 

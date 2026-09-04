@@ -629,6 +629,64 @@ async def test_run_analysis_falla_edit_final_hace_fallback_a_reply_fn(
     assert final_kwargs.get("parse_mode") == "Markdown"
 
 
+async def test_run_analysis_falla_tambien_el_fallback_avisa_con_mensaje_generico(
+    adobe_fixtures, conn_factory
+):
+    """Fix urgente 2026-09-04 (incidente real ADBE): si el edit final SOBRE
+    el mensaje de carga falla Y el fallback a `reply_fn` (dentro de
+    `_deliver_all`) TAMBIÉN falla (ej. el mismo Markdown roto que rompió el
+    primer intento) -- antes la excepción subía sin capturar hasta el error
+    handler global y el usuario se quedaba mirando "🔄 Cargando..." sin
+    ninguna respuesta. Ahora `_deliver_all` hace un último intento con
+    `GENERIC_ERROR_MSG`, sin `parse_mode`, y ese último intento sí llega."""
+    _complete_onboarding(conn_factory)
+    clients = _make_clients(adobe_fixtures)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+
+    update_esc, _ = _fake_callback_update("esc:ADBE:conservador")
+    await handlers[2].callback(update_esc, context=SimpleNamespace())
+
+    loading_msg = _fake_message(edit_text=AsyncMock(side_effect=TelegramError("boom edit")))
+    edit_message_text = AsyncMock(
+        side_effect=[loading_msg, TelegramError("boom fallback"), None]
+    )
+    update_vent, query_vent = _fake_callback_update(
+        "vent:ADBE:conservador:20", edit_message_text=edit_message_text
+    )
+    await handlers[3].callback(update_vent, context=SimpleNamespace())  # no debe lanzar
+
+    assert query_vent.edit_message_text.await_count == 3
+    generic_args, generic_kwargs = query_vent.edit_message_text.call_args_list[2]
+    assert generic_args[0] == query_handler.GENERIC_ERROR_MSG
+    assert "parse_mode" not in generic_kwargs
+
+
+async def test_run_analysis_falla_todo_incluido_el_aviso_generico_nunca_lanza(
+    adobe_fixtures, conn_factory
+):
+    """Peor caso: ni el edit final, ni el fallback, ni el aviso genérico
+    logran entregarse (3 `TelegramError` consecutivos) -- `_run_analysis`
+    igual no debe lanzar; el fallo del aviso genérico se loguea a WARNING y
+    se descarta en silencio (red de seguridad final del propio aviso)."""
+    _complete_onboarding(conn_factory)
+    clients = _make_clients(adobe_fixtures)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+
+    update_esc, _ = _fake_callback_update("esc:ADBE:conservador")
+    await handlers[2].callback(update_esc, context=SimpleNamespace())
+
+    loading_msg = _fake_message(edit_text=AsyncMock(side_effect=TelegramError("boom edit")))
+    edit_message_text = AsyncMock(
+        side_effect=[loading_msg, TelegramError("boom fallback"), TelegramError("boom generico")]
+    )
+    update_vent, query_vent = _fake_callback_update(
+        "vent:ADBE:conservador:20", edit_message_text=edit_message_text
+    )
+    await handlers[3].callback(update_vent, context=SimpleNamespace())  # no debe lanzar
+
+    assert query_vent.edit_message_text.await_count == 3
+
+
 async def test_run_analysis_excepcion_no_telegram_en_envio_carga_se_propaga(
     adobe_fixtures, conn_factory
 ):

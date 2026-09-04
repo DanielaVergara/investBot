@@ -29,6 +29,7 @@ import re
 from typing import Optional
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import CommandHandler, ContextTypes
 
 from investbot import ai_explain, fmp_client, market_context, query_handler, rules
@@ -488,10 +489,32 @@ def build_advanced_command_handler(
         # (si corresponde) se adjunta ÚNICAMENTE al último chunk.
         chunks = query_handler.chunk_for_telegram([message])
         last_index = len(chunks) - 1
-        for idx, chunk in enumerate(chunks):
-            if idx == last_index and keyboard is not None:
-                await update.message.reply_text(chunk, reply_markup=keyboard)
-            else:
-                await update.message.reply_text(chunk)
+        try:
+            for idx, chunk in enumerate(chunks):
+                if idx == last_index and keyboard is not None:
+                    await update.message.reply_text(chunk, reply_markup=keyboard)
+                else:
+                    await update.message.reply_text(chunk)
+        except TelegramError as exc:
+            # Fix urgente 2026-09-04 (paridad con `query_handler._deliver_all`):
+            # si la entrega del mensaje final de `/avanzado` falla a mitad de
+            # camino, la excepción antes subía sin capturar hasta el error
+            # handler global y el usuario se quedaba sin ninguna respuesta.
+            # Último recurso: un intento de aviso genérico, sin `reply_markup`
+            # ni ningún dato del mensaje que falló -- si también falla, se
+            # loguea a WARNING y se descarta en silencio.
+            logger.error(
+                "No se pudo entregar el mensaje final de /avanzado para %s — "
+                "se le avisa al usuario con un mensaje genérico: %s",
+                query_handler.sanitize_for_log(ticker), exc,
+            )
+            try:
+                await update.message.reply_text(query_handler.GENERIC_ERROR_MSG)
+            except TelegramError:
+                logger.warning(
+                    "Tampoco se pudo avisarle al usuario con el mensaje "
+                    "genérico para /avanzado %s",
+                    query_handler.sanitize_for_log(ticker), exc_info=True,
+                )
 
     return CommandHandler("avanzado", avanzado)

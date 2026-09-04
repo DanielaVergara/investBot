@@ -731,6 +731,96 @@ def test_reconstruct_section_capa2_caso_artificial_bug_de_clasificacion():
     assert ai_rewrite._reconstruct_section(rewritten, line_map, original) is None
 
 
+def test_reconstruct_section_capa2_asterisco_desparejado_es_none():
+    """Incidente de producción 2026-09-04 (ADBE): la línea "*Veredicto:*"
+    de `summary.build_veredicto_section` no tiene ningún protected token
+    (ni número, ni %, ni ticker, ni ✅/❌/SÍ/NO) -> queda 100% libre para
+    que Ollama la reescriba. Si el modelo parafrasea y dropea uno de los
+    2 asteriscos ("*Veredicto:*" -> "*Veredicto:"), `_is_safe_rewrite`
+    NO lo detecta (ningún protected token cambió) -- pero el mensaje final
+    queda con un delimitador de negrita desparejado y Telegram rechaza el
+    `edit_text`/`send_message` completo (`BadRequest: Can't parse
+    entities`). La capa 2 nueva (`_markdown_balance_preserved`) tiene que
+    rechazar esta reescritura."""
+    original = "*Veredicto:*"
+    _, line_map = ai_rewrite._classify_lines(original)
+    assert line_map == {}  # nada protegido, toda la línea es prosa libre
+    rewritten = "*Veredicto:"  # el LLM dropeó el asterisco de cierre
+    assert ai_rewrite._reconstruct_section(rewritten, line_map, original) is None
+
+
+def test_reconstruct_section_capa2_asterisco_duplicado_es_none():
+    """Variante del caso anterior: el LLM agrega un asterisco extra en vez
+    de dropearlo (ej. "*Veredicto:**") -- conteo par pero DISTINTO al
+    original, también debe rechazarse."""
+    original = "*Veredicto:*"
+    _, line_map = ai_rewrite._classify_lines(original)
+    rewritten = "*Veredicto:**"
+    assert ai_rewrite._reconstruct_section(rewritten, line_map, original) is None
+
+
+def test_reconstruct_section_capa2_markdown_balanceado_pero_distinto_es_ok():
+    """Contraprueba: una reescritura de prosa libre que preserva el
+    conteo exacto de cada delimitador de Markdown (mismo `*` de negrita,
+    en otra posición del texto) sigue aceptándose -- la capa 2 nueva no
+    rechaza toda reescritura de prosa con Markdown, solo las que
+    desbalancean el conteo."""
+    original = "El *veredicto* es positivo en general"
+    _, line_map = ai_rewrite._classify_lines(original)
+    rewritten = "En general, el *veredicto* es positivo"
+    reconstructed = ai_rewrite._reconstruct_section(rewritten, line_map, original)
+    assert reconstructed == rewritten
+
+
+def test_reconstruct_section_capa2_guion_bajo_italica_desparejado_es_none():
+    """Mismo mecanismo con `_` (itálica de Telegram) en vez de `*`."""
+    original = "_Cuánta deuda tiene la empresa_"
+    _, line_map = ai_rewrite._classify_lines(original)
+    rewritten = "_Cuánta deuda tiene la empresa"  # dropeó el `_` de cierre
+    assert ai_rewrite._reconstruct_section(rewritten, line_map, original) is None
+
+
+async def test_rewrite_parts_end_to_end_veredicto_asterisco_desparejado_cae_a_original():
+    """Reproduce el incidente de producción 2026-09-04 (ADBE) de punta a
+    punta a través de `rewrite_parts`: la sección real que arma
+    `summary.build_veredicto_section` (título en negrita + líneas con
+    datos protegidos), Ollama reescribe "*Veredicto:*" rompiendo el
+    balance de asteriscos -> esa sección tiene que volver intacta a su
+    redacción original (nunca debe llegar al usuario un `*` desparejado),
+    y el resto del mensaje sigue su curso normal."""
+    veredicto_section = (
+        "*Veredicto:*\n"
+        "Parece *barata* según el valor justo estimado (escenario conservador), "
+        "con 3/4 pilares sólidos.\n"
+        "Encaje de riesgo: SÍ (detalle más abajo)."
+    )
+    parts = ["*Adobe (ADBE)*", veredicto_section]
+
+    _, line_map = ai_rewrite._classify_lines(veredicto_section)
+    # Único placeholder: la línea con "3/4" y "SÍ" -- "*Veredicto:*" queda
+    # como prosa 100% libre, sin placeholder.
+    ph = next(iter(line_map))
+
+    # El LLM reescribe la línea suelta de título dropeando el asterisco de
+    # cierre, y copia el placeholder protegido tal cual.
+    rewritten_section = f"Veredicto:*\n{ph}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"response": _section_response([rewritten_section])}
+        )
+
+    client = _client_with_handler(handler)
+    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
+
+    # La sección completa del veredicto vuelve a su redacción original --
+    # nunca se cuela un `*` desparejado al mensaje final que arma
+    # `_run_analysis`.
+    assert outcome.parts[1] == veredicto_section
+    assert outcome.parts[1].count("*") % 2 == 0
+    assert outcome.used_ollama is False
+
+
 # ---------------------------------------------------------------------------
 # G. rewrite_parts end-to-end (casos 42-46)
 # ---------------------------------------------------------------------------

@@ -36,12 +36,42 @@ def configure_logging() -> None:
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
+# Mensaje genérico ante cualquier error no manejado (fix urgente 2026-09-04,
+# incidente de producción: un `BadRequest` de Telegram al editar el mensaje
+# final de un análisis dejaba al usuario mirando "🔄 Cargando..." para
+# siempre, sin ninguna respuesta). Corto, sin tecnicismos, nunca un
+# traceback ni detalle interno — mismo estándar de `security` que ya rige
+# `transparency_line`/`AI_REWRITE_INDICATOR` (nunca revelar infraestructura).
+GENERIC_ERROR_MESSAGE = "⚠️ Algo salió mal procesando tu pedido. Probá de nuevo en un rato."
+
+
+async def _notify_user_of_error(update: object, context) -> None:
+    """Best-effort: si se puede identificar el chat que originó el error no
+    manejado, le avisa con `GENERIC_ERROR_MESSAGE`. Nunca lanza — el
+    llamador (`_on_error`) es el manejador de errores global, así que un
+    fallo acá (chat_id no disponible, `send_message` también falla, lo que
+    sea) se loguea a WARNING y se descarta en silencio, nunca puede tumbar
+    el error handler mismo."""
+    try:
+        chat_id = None
+        if isinstance(update, Update) and update.effective_chat is not None:
+            chat_id = update.effective_chat.id
+        if chat_id is None:
+            return
+        await context.bot.send_message(chat_id=chat_id, text=GENERIC_ERROR_MESSAGE)
+    except Exception:
+        logger.warning(
+            "No se pudo avisarle al usuario del error no manejado", exc_info=True
+        )
+
+
 async def _on_error(update: object, context) -> None:
     error = context.error
     if isinstance(error, Conflict):
         security.log_conflict_error(logger)
         return
     logger.exception("Error no manejado procesando un update", exc_info=error)
+    await _notify_user_of_error(update, context)
 
 
 def build_application(

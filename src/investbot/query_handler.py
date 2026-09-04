@@ -764,7 +764,32 @@ async def _deliver_all(
         first_kwargs = dict(kwargs)
         if len(chunks) == 1 and last_reply_markup is not None:
             first_kwargs["reply_markup"] = last_reply_markup
-        first_msg = await reply_fn(chunks[0], **first_kwargs)
+        try:
+            first_msg = await reply_fn(chunks[0], **first_kwargs)
+        except TelegramError as exc:
+            # Fix urgente 2026-09-04 (incidente real ADBE): este `reply_fn`
+            # es el intento de ENTREGA del análisis completo — si falla acá
+            # (el mismo `chunks[0]` que ya había fallado como edición del
+            # mensaje de carga, o cualquier otro motivo), antes la excepción
+            # subía sin capturar hasta el error handler global y el usuario
+            # se quedaba mirando "🔄 Cargando..." sin ninguna respuesta.
+            # Último recurso: un intento de `reply_fn` con el aviso
+            # genérico, SIN los `kwargs` originales (nunca `parse_mode`, por
+            # si el motivo del fallo fue justamente un Markdown roto) — si
+            # también falla, se loguea a WARNING y se descarta en silencio,
+            # nunca puede tumbar `_run_analysis` por segunda vez.
+            logger.error(
+                "No se pudo entregar el mensaje final del análisis de %s — "
+                "se le avisa al usuario con un mensaje genérico: %s", ticker, exc,
+            )
+            try:
+                await reply_fn(GENERIC_ERROR_MSG)
+            except TelegramError:
+                logger.warning(
+                    "Tampoco se pudo avisarle al usuario con el mensaje "
+                    "genérico para %s", ticker, exc_info=True,
+                )
+            return
         chunks = chunks[1:]
     total = len(chunks)
     for idx, chunk in enumerate(chunks):

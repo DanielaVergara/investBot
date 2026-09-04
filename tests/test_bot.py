@@ -5,9 +5,10 @@ logging de librerías ruidosas fijado a WARNING, manejo de Conflict (409).
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram import Update
 
 from investbot import bot, security
 
@@ -92,6 +93,81 @@ async def test_on_error_excepcion_generica_se_loguea(caplog):
     with caplog.at_level(logging.ERROR):
         await bot._on_error(update=None, context=context)
     assert "Error no manejado" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Fix urgente 2026-09-04 — red de seguridad: el usuario SIEMPRE tiene que
+# recibir alguna respuesta ante un error no manejado, nunca quedarse mirando
+# "🔄 Cargando..." sin ningún mensaje (incidente real: `BadRequest` de
+# Telegram al editar el mensaje final de un análisis para ADBE).
+# ---------------------------------------------------------------------------
+
+
+def _update_con_chat(chat_id: int) -> Update:
+    update = MagicMock(spec=Update)
+    update.effective_chat = MagicMock()
+    update.effective_chat.id = chat_id
+    return update
+
+
+async def test_on_error_excepcion_generica_le_avisa_al_usuario(caplog):
+    """El error handler global, ante cualquier excepción no manejada (no
+    `Conflict`), le manda al chat que originó el error un mensaje corto y
+    genérico -- nunca un traceback ni detalle técnico."""
+    context = AsyncMock()
+    context.error = RuntimeError("boom")
+    update = _update_con_chat(chat_id=12345)
+
+    with caplog.at_level(logging.ERROR):
+        await bot._on_error(update=update, context=context)
+
+    context.bot.send_message.assert_awaited_once_with(
+        chat_id=12345, text=bot.GENERIC_ERROR_MESSAGE
+    )
+    # El aviso al usuario nunca incluye el texto crudo de la excepción.
+    assert "boom" not in bot.GENERIC_ERROR_MESSAGE
+
+
+async def test_on_error_conflict_no_le_avisa_al_usuario():
+    """`Conflict` (409 de Telegram, uso concurrente del token) sigue sin
+    generar ningún mensaje al usuario -- es un problema de infraestructura,
+    no algo que el usuario pueda "reintentar"."""
+    from telegram.error import Conflict
+
+    context = AsyncMock()
+    context.error = Conflict("terminated by other getUpdates request")
+    update = _update_con_chat(chat_id=12345)
+
+    await bot._on_error(update=update, context=context)
+
+    context.bot.send_message.assert_not_awaited()
+
+
+async def test_on_error_update_sin_chat_no_intenta_avisar():
+    """`update=None` (o sin `effective_chat`) -- no hay a quién avisarle,
+    el error handler no intenta `send_message` y no lanza."""
+    context = AsyncMock()
+    context.error = RuntimeError("boom")
+
+    await bot._on_error(update=None, context=context)
+
+    context.bot.send_message.assert_not_awaited()
+
+
+async def test_on_error_send_message_tambien_falla_se_loguea_a_warning_sin_propagar(caplog):
+    """Red de seguridad del aviso mismo: si `context.bot.send_message`
+    también falla (ej. el bot fue bloqueado por el usuario), el error
+    handler global no puede romperse por eso -- se loguea a WARNING y se
+    descarta en silencio."""
+    context = AsyncMock()
+    context.error = RuntimeError("boom")
+    context.bot.send_message.side_effect = RuntimeError("chat blocked")
+    update = _update_con_chat(chat_id=12345)
+
+    with caplog.at_level(logging.WARNING):
+        await bot._on_error(update=update, context=context)  # no debe lanzar
+
+    assert "No se pudo avisarle al usuario del error no manejado" in caplog.text
 
 
 # ---------------------------------------------------------------------------
