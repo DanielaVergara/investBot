@@ -253,6 +253,21 @@ def _build_message(
                 roe=roe,
                 gross_margin=gross_margin,
                 beta=beta,
+                # SDD_desglose_universal.md, Grupo F, Cambio 1 -- mismo dict
+                # que ya arma query_handler.py:531-536 para texto libre,
+                # reutilizado tal cual, sin duplicar lógica nueva.
+                momentum={
+                    "pct_vs_year_high": momentum_result.pct_vs_year_high,
+                    "pct_vs_year_low": momentum_result.pct_vs_year_low,
+                    "pct_vs_avg_50": momentum_result.pct_vs_avg_50,
+                    "pct_vs_avg_200": momentum_result.pct_vs_avg_200,
+                    "etiqueta": momentum_result.etiqueta,
+                },
+                precio_actual=price,
+                year_high=quote.get("yearHigh"),
+                year_low=quote.get("yearLow"),
+                price_avg_50=quote.get("priceAvg50"),
+                price_avg_200=quote.get("priceAvg200"),
             )
         return "\n".join(lineas)
 
@@ -334,6 +349,21 @@ def _build_message(
             roe=roe,
             gross_margin=gross_margin,
             beta=beta,
+            # SDD_desglose_universal.md, Grupo F, Cambio 1 -- mismo dict que
+            # ya arma query_handler.py:531-536 para texto libre, reutilizado
+            # tal cual, sin duplicar lógica nueva.
+            momentum={
+                "pct_vs_year_high": momentum_result.pct_vs_year_high,
+                "pct_vs_year_low": momentum_result.pct_vs_year_low,
+                "pct_vs_avg_50": momentum_result.pct_vs_avg_50,
+                "pct_vs_avg_200": momentum_result.pct_vs_avg_200,
+                "etiqueta": momentum_result.etiqueta,
+            },
+            precio_actual=price,
+            year_high=quote.get("yearHigh"),
+            year_low=quote.get("yearLow"),
+            price_avg_50=quote.get("priceAvg50"),
+            price_avg_200=quote.get("priceAvg200"),
         )
 
     return "\n".join(lineas)
@@ -478,6 +508,15 @@ def build_advanced_command_handler(
                 roe=explain_context_sink["roe"],
                 gross_margin=explain_context_sink["gross_margin"],
                 beta=explain_context_sink["beta"],
+                # SDD_desglose_universal.md, Grupo F, Cambio 2 -- campos
+                # genéricos que `ExplanationContext` ya declaraba sin poblar
+                # para kind="avanzado" (ningún campo nuevo en el dataclass).
+                momentum=explain_context_sink["momentum"],
+                precio_actual=explain_context_sink["precio_actual"],
+                year_high=explain_context_sink["year_high"],
+                year_low=explain_context_sink["year_low"],
+                price_avg_50=explain_context_sink["price_avg_50"],
+                price_avg_200=explain_context_sink["price_avg_200"],
             )
             context_id = explanation_store.put(explanation_context)
             keyboard = ai_explain.build_keyboard("avanzado", context_id)

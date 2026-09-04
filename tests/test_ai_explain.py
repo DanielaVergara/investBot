@@ -761,7 +761,14 @@ def test_payload_aqv_aqm_aql_superficie_minima():
     ctx = _avanzado_context()
     aqv = ai_explain._build_explain_payload(ctx, "aqv")
     assert set(aqv) == {"modelo", "value", "earnings_yield", "umbral_alto", "umbral_bajo"}
-    assert set(ai_explain._build_explain_payload(ctx, "aqm")) == {"modelo", "momentum"}
+    # SDD_desglose_universal.md, Grupo F, Cambio 3 -- "aqm" gana 3 campos
+    # nuevos (precio_actual/price_avg_50/price_avg_200), pero NO
+    # year_high/year_low/pct_vs_* (superficie mínima, Decisión de diseño
+    # #11 original, sin aflojar).
+    aqm = ai_explain._build_explain_payload(ctx, "aqm")
+    assert set(aqm) == {"modelo", "momentum", "precio_actual", "price_avg_50", "price_avg_200"}
+    for campo_no_expuesto in ("year_high", "year_low", "pct_vs_year_high", "pct_vs_year_low"):
+        assert campo_no_expuesto not in aqm
     aql = ai_explain._build_explain_payload(ctx, "aql")
     assert set(aql) == {"modelo", "low_vol", "beta", "beta_umbral_bajo", "beta_umbral_alto"}
     assert aql["beta"] == ctx.beta
@@ -1198,6 +1205,121 @@ async def test_fetch_explanation_respuesta_limpia_sin_eco_pasa_normal():
     cual en el primer intento -- sin falsos positivos ni reintento."""
     call_count = {"n": 0}
     texto_real = "Graham + DCF miden el valor justo combinando múltiplos, flujo de caja y calidad fundamental."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+
+    resultado = await ai_explain._fetch_explanation(
+        **_fetch_kwargs(
+            http_client=_client_with_handler(handler),
+            datos=_DATOS_EVIDENCIA_REAL,
+            tokens=_tokens_de(_DATOS_EVIDENCIA_REAL),
+        )
+    )
+
+    assert call_count["n"] == 1
+    assert resultado == texto_real
+
+
+# ---------------------------------------------------------------------------
+# G ter. Mezcla de portugués -- incidente de producción 2026-09-04 (captura
+# de Daniela: `qwen2.5:3b-instruct` mezcló portugués a mitad de la
+# explicación de "Veredicto" pese a que el prompt pide español rioplatense).
+# ---------------------------------------------------------------------------
+
+# Texto EXACTO de la evidencia real de producción (2026-09-04).
+_RESPUESTA_PORTUGUES_EVIDENCIA_REAL = (
+    "Ésa é a tienda de limonada da perto do seu casa e o valor justo total "
+    "representa quanto ela valeria se todos sabiam que era boa negocio. O "
+    "veredicto da tienda d'áqui é barata, porque cê tá vendo-a por menos que "
+    "ela vale realmente (se sábem todas as coisas), como num leva de limonada "
+    "nesse bairro."
+)
+
+
+def test_respuesta_tiene_portugues_detecta_el_patron_exacto_de_la_evidencia_real():
+    assert ai_explain._respuesta_tiene_portugues(_RESPUESTA_PORTUGUES_EVIDENCIA_REAL) is True
+
+
+def test_respuesta_tiene_portugues_no_da_falso_positivo_en_respuesta_limpia():
+    """Respuesta normal en español rioplatense -- cuidado con palabras que
+    existen en ambos idiomas (ej. "también" en español, distinto de
+    "também" en portugués) para no disparar un falso positivo."""
+    respuesta = (
+        "Graham + DCF miden el valor justo combinando múltiplos, flujo de caja y "
+        "calidad fundamental. El veredicto de barata también depende de cuánto "
+        "vale hoy comparado con ese valor justo estimado."
+    )
+    assert ai_explain._respuesta_tiene_portugues(respuesta) is False
+
+
+async def test_fetch_explanation_portugues_reintenta_y_se_recupera(caplog):
+    """1er intento: el texto exacto de la evidencia real en portugués. 2o
+    intento (reintento): respuesta limpia en español. `_fetch_explanation`
+    NUNCA debe devolver la mezcla de portugués -- debe recuperarse con la
+    respuesta limpia del reintento."""
+    call_count = {"n": 0}
+    texto_real = "El veredicto de barata se basa en que el precio actual es menor al valor justo total."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                json={"response": json.dumps({"respuesta": _RESPUESTA_PORTUGUES_EVIDENCIA_REAL})},
+            )
+        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+
+    with caplog.at_level(logging.INFO):
+        resultado = await ai_explain._fetch_explanation(
+            **_fetch_kwargs(
+                http_client=_client_with_handler(handler),
+                datos=_DATOS_EVIDENCIA_REAL,
+                tokens=_tokens_de(_DATOS_EVIDENCIA_REAL),
+            )
+        )
+
+    assert call_count["n"] == 2
+    assert resultado == texto_real
+    assert resultado != _RESPUESTA_PORTUGUES_EVIDENCIA_REAL
+    assert any("reintentando" in r.message for r in caplog.records)
+
+
+async def test_fetch_explanation_portugues_en_ambos_intentos_cae_a_unavailable(caplog):
+    """Si la mezcla de portugués se repite en el reintento también, se
+    hacen exactamente 2 llamadas HTTP y el resultado final es
+    `_ExplainUnavailable` -- el texto en portugués nunca llega al usuario."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(
+            200,
+            json={"response": json.dumps({"respuesta": _RESPUESTA_PORTUGUES_EVIDENCIA_REAL})},
+        )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ai_explain._ExplainUnavailable):
+            await ai_explain._fetch_explanation(
+                **_fetch_kwargs(
+                    http_client=_client_with_handler(handler),
+                    datos=_DATOS_EVIDENCIA_REAL,
+                )
+            )
+
+    assert call_count["n"] == 2
+
+
+async def test_fetch_explanation_respuesta_limpia_sin_portugues_pasa_normal():
+    """Sin señales de portugués, una respuesta limpia en español sigue
+    devolviéndose tal cual en el primer intento -- sin falsos positivos ni
+    reintento."""
+    call_count = {"n": 0}
+    texto_real = (
+        "Graham + DCF miden el valor justo combinando múltiplos, flujo de caja y "
+        "calidad fundamental."
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
@@ -2311,11 +2433,45 @@ def test_cuenta_aqq_suma_de_sub_metricas():
     assert "→ alto" in cuenta
 
 
-def test_cuenta_aqm_reutiliza_etiqueta():
+def test_cuenta_aqm_sin_precio_avg_no_calculable():
+    """SDD_desglose_universal.md, Grupo F, Cambio 4 -- con el fixture por
+    defecto (sin `precio_actual`/`price_avg_50`/`price_avg_200`) `_cuenta_
+    aqm` ya no puede armar la comparación real -- `None`, mismo criterio de
+    "no calculable" que `market_context.calculate_momentum`."""
     ctx = _avanzado_context()
     datos = ai_explain._build_explain_payload(ctx, "aqm")
+    assert ai_explain._build_cuenta_line("avanzado", "aqm", datos) is None
+
+
+@pytest.mark.parametrize(
+    "precio, avg50, avg200, cmp50, cmp200",
+    [
+        (150.0, 140.0, 130.0, ">", ">"),
+        (150.0, 160.0, 130.0, "<", ">"),
+        (150.0, 140.0, 160.0, ">", "<"),
+        (150.0, 160.0, 170.0, "<", "<"),
+    ],
+)
+def test_cuenta_aqm_termino_a_termino_4_combinaciones(precio, avg50, avg200, cmp50, cmp200):
+    """Branch coverage 100% pedido por QA -- las 4 combinaciones posibles de
+    `>`/`<` para 50d y para 200d."""
+    ctx = _avanzado_context(precio_actual=precio, price_avg_50=avg50, price_avg_200=avg200)
+    datos = ai_explain._build_explain_payload(ctx, "aqm")
     cuenta = ai_explain._build_cuenta_line("avanzado", "aqm", datos)
-    assert cuenta == "Factor Momentum: medio"
+    assert cuenta == (
+        f"Precio {ai_explain._money(precio)} {cmp50} promedio 50d {ai_explain._money(avg50)} y "
+        f"{cmp200} promedio 200d {ai_explain._money(avg200)} → {datos['momentum']}"
+    )
+
+
+@pytest.mark.parametrize("campo_faltante", ["precio_actual", "price_avg_50", "price_avg_200"])
+def test_cuenta_aqm_1_campo_faltante_no_calculable(campo_faltante):
+    """QA -- los 3 casos por separado (no solo "todos ausentes")."""
+    overrides = {"precio_actual": 150.0, "price_avg_50": 140.0, "price_avg_200": 130.0}
+    overrides[campo_faltante] = None
+    ctx = _avanzado_context(**overrides)
+    datos = ai_explain._build_explain_payload(ctx, "aqm")
+    assert ai_explain._build_cuenta_line("avanzado", "aqm", datos) is None
 
 
 def test_cuenta_aql_beta_bucket():
@@ -2640,7 +2796,11 @@ def test_cuenta_4_modelos_todo_o_nada_no_calculables_sin_none_visible(code):
 # V. "🔍 Desglose" -- SDD_desglose_terminos_formula.md
 # ---------------------------------------------------------------------------
 
-_CODES_CON_DESGLOSE = ("alz", "azp", "pir", "pia", "pie", "mgr", "mge")
+_CODES_CON_DESGLOSE = (
+    "alz", "azp", "pir", "pia", "pie", "mgr", "mge",
+    # SDD_desglose_universal.md, Grupo E/F -- 4 factores AQR.
+    "aqv", "aqq", "aqm", "aql",
+)
 
 # SDD_desglose_valor_justo_total.md [Iter-2] -- "vf" (texto_libre) gana
 # desglose propio, distinto del mecanismo genérico de `_CODES_CON_DESGLOSE`
@@ -2648,9 +2808,13 @@ _CODES_CON_DESGLOSE = ("alz", "azp", "pir", "pia", "pie", "mgr", "mge")
 # llaman `ai_explain_content.desglose("avanzado", code)`/`_avanzado_context()`
 # a propósito). Se mantiene como constante separada, no se mezcla en
 # `_CODES_CON_DESGLOSE`, para no romper esos tests avanzado-específicos.
-_CODES_CON_DESGLOSE_TEXTO_LIBRE = ("vf",)
+# SDD_desglose_universal.md, Grupos A-D -- 9 preguntas nuevas de texto libre
+# (`ver` incluido, con su desglose liviano de 2 términos).
+_CODES_CON_DESGLOSE_TEXTO_LIBRE = (
+    "vf", "gra", "dcf", "mul", "rat", "pil", "rsk", "mom", "cmp", "ver",
+)
 
-# QA, "Fixtures mínimos que faltan" #2 -- lista explícita de las 19
+# QA, "Fixtures mínimos que faltan" #2 -- lista explícita de las 6
 # preguntas sin desglose, confirmada contra el código real (`_TODAS_LAS_
 # PREGUNTAS`, 27 codes) en vez de contra el conteo de la spec.
 _CODES_SIN_DESGLOSE = tuple(
@@ -2659,15 +2823,18 @@ _CODES_SIN_DESGLOSE = tuple(
 )
 
 
-def test_desglose_19_preguntas_sin_desglose_mas_7_avanzado_mas_1_texto_libre_suman_27():
-    assert len(_CODES_SIN_DESGLOSE) == 19
-    assert len(_CODES_CON_DESGLOSE) == 7
-    assert len(_CODES_CON_DESGLOSE_TEXTO_LIBRE) == 1
+def test_desglose_6_preguntas_sin_desglose_mas_11_avanzado_mas_10_texto_libre_suman_27():
+    """SDD_desglose_universal.md -- tras agregar las 12 preguntas nuevas
+    (11 de `/avanzado` + 10 de texto libre, incluyendo "vf"), quedan 6
+    preguntas sin desglose (`mod`, `ben`, `ren`, `evt`, `inf`, `pig`)."""
+    assert len(_CODES_SIN_DESGLOSE) == 6
+    assert len(_CODES_CON_DESGLOSE) == 11
+    assert len(_CODES_CON_DESGLOSE_TEXTO_LIBRE) == 10
     todos = set(_CODES_SIN_DESGLOSE) | set(_CODES_CON_DESGLOSE) | set(_CODES_CON_DESGLOSE_TEXTO_LIBRE)
     assert todos == set(_TODAS_LAS_PREGUNTAS)
 
 
-def test_desglose_avanzado_7_entradas_exactas():
+def test_desglose_avanzado_11_entradas_exactas():
     assert set(ai_explain_content.DESGLOSE_AVANZADO) == set(_CODES_CON_DESGLOSE)
 
 
@@ -2705,21 +2872,40 @@ def test_desglose_code_inexistente_o_vacio_devuelve_vacio(code):
 
 
 @pytest.mark.parametrize(
-    "code", [c for c in list(_TODAS_LAS_PREGUNTAS) + ["alz", "cualquier_cosa"] if c != "vf"],
+    "code",
+    [
+        c for c in list(_TODAS_LAS_PREGUNTAS) + ["alz", "cualquier_cosa"]
+        if c not in _CODES_CON_DESGLOSE_TEXTO_LIBRE
+    ],
 )
-def test_desglose_texto_libre_vacio_salvo_vf(code):
-    """`kind == "texto_libre"` devuelve `()` para cualquier `code` salvo "vf"
-    (SDD_desglose_valor_justo_total.md [Iter-2]), incluso uno que sí tiene
+def test_desglose_texto_libre_vacio_salvo_los_10_con_desglose(code):
+    """`kind == "texto_libre"` devuelve `()` para cualquier `code` fuera de
+    `_CODES_CON_DESGLOSE_TEXTO_LIBRE` (10 preguntas: "vf" +
+    SDD_desglose_universal.md, Grupos A-D), incluso uno que sí tiene
     entrada en `DESGLOSE_AVANZADO` (ej. "alz") -- ningún `code` de "avanzado"
     se filtra por error a la tabla de texto_libre."""
     assert ai_explain_content.desglose("texto_libre", code) == ()
 
 
 def test_desglose_texto_libre_vf_no_vacio():
-    """"vf" es la única entrada de `DESGLOSE_TEXTO_LIBRE` -- 3 términos
-    (Múltiplos/Graham/DCF), en ese orden."""
+    """"vf" es la única entrada de `DESGLOSE_TEXTO_LIBRE` con sub-cuentas
+    anidadas -- 3 términos (Múltiplos/Graham/DCF), en ese orden."""
     terminos = ai_explain_content.desglose("texto_libre", "vf")
     assert [t.letra for t in terminos] == ["Múltiplos", "Graham", "DCF"]
+
+
+def test_desglose_texto_libre_ver_2_terminos_livianos():
+    """SDD_desglose_universal.md, Grupo D -- "ver" tiene exactamente 2
+    `DesgloseTermino` (no 3, no un objeto anidado como "vf"), y ninguno de
+    los 2 `campo_origen` menciona los escenarios de "vf" -- evita que una
+    futura edición copie por error el patrón de sub-cuentas de "vf" dentro
+    de "ver"."""
+    terminos = ai_explain_content.desglose("texto_libre", "ver")
+    assert len(terminos) == 2
+    assert [t.letra for t in terminos] == ["Precio actual", "Valor Justo Total"]
+    for t in terminos:
+        for palabra in ("escenario", "conservador", "agresivo", "optimista"):
+            assert palabra not in t.campo_origen.lower()
 
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
@@ -2736,7 +2922,7 @@ def test_build_desglose_block_happy_path_sin_terminos_faltantes(code):
 
 
 @pytest.mark.parametrize("code", _CODES_SIN_DESGLOSE)
-def test_build_desglose_block_none_para_las_20_preguntas_sin_desglose(code):
+def test_build_desglose_block_none_para_las_6_preguntas_sin_desglose(code):
     kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
     assert ai_explain._build_desglose_block(kind, code, {}) is None
 
@@ -2761,11 +2947,15 @@ def test_build_leaf_message_sin_desglose_no_agrega_seccion():
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
 async def test_mensaje_paso_a_paso_muestra_cuenta_y_desglose_en_orden(code):
-    """Caso obligatorio de QA -- Happy path: para cada una de las 7
-    preguntas con desglose, el mensaje completo de "Explicame paso a paso"
-    muestra "🧮 Cuenta" seguido de "🔍 Desglose", ambos antes de la respuesta
-    de Ollama."""
-    ctx = _avanzado_context()
+    """Caso obligatorio de QA -- Happy path: para cada una de las 11
+    preguntas de `/avanzado` con desglose, el mensaje completo de "Explicame
+    paso a paso" muestra "🧮 Cuenta" seguido de "🔍 Desglose", ambos antes de
+    la respuesta de Ollama."""
+    ctx = _avanzado_context(
+        # SDD_desglose_universal.md, Grupo F -- "aqm" necesita estos 3
+        # campos para que su Cuenta/Desglose no sean `None`.
+        precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0,
+    )
     store = ai_explain.ExplanationContextStore()
     cid = store.put(ctx)
     respuesta = "Este modelo mide la salud financiera de la empresa en base a varios factores."
@@ -2786,9 +2976,38 @@ async def test_mensaje_paso_a_paso_muestra_cuenta_y_desglose_en_orden(code):
     assert "None" not in texto
 
 
+@pytest.mark.parametrize(
+    "code", [c for c in _CODES_CON_DESGLOSE_TEXTO_LIBRE if c != "vf"],
+)
+async def test_mensaje_paso_a_paso_texto_libre_muestra_cuenta_y_desglose_en_orden(code):
+    """Caso obligatorio de QA -- Happy path: para cada una de las 9
+    preguntas nuevas de texto libre con desglose (Grupos A-D), el mensaje
+    completo de "Explicame paso a paso" muestra "🧮 Cuenta" seguido de "🔍
+    Desglose", ambos antes de la respuesta de Ollama."""
+    ctx = _texto_libre_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "Este modelo mide la valoración de la empresa en base a varios factores."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:{code}")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    texto = kwargs["text"]
+    assert texto != ai_explain.EXPLAIN_UNAVAILABLE_MSG
+    assert "🧮 Cuenta" in texto
+    assert "🔍 Desglose" in texto
+    assert texto.index("🧮 Cuenta") < texto.index("🔍 Desglose") < texto.index(respuesta)
+    assert "None" not in texto
+
+
 @pytest.mark.parametrize("code", _CODES_SIN_DESGLOSE)
-async def test_mensaje_paso_a_paso_sin_desglose_para_las_20_preguntas_regresion(code):
-    """Regresión dirigida (QA, "Regression testing dirigida") -- las 20
+async def test_mensaje_paso_a_paso_sin_desglose_para_las_6_preguntas_regresion(code):
+    """Regresión dirigida (QA, "Regression testing dirigida") -- las 6
     preguntas sin desglose no muestran la sección nueva. Contexto avanzado
     con todos los campos para los `question_code` de avanzado, texto_libre
     para el resto."""
@@ -2815,12 +3034,23 @@ async def test_mensaje_paso_a_paso_sin_desglose_para_las_20_preguntas_regresion(
 
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
-async def test_ver_dato_nunca_incluye_desglose_ni_para_las_7_preguntas_con_desglose(code):
+async def test_ver_dato_nunca_incluye_desglose_ni_para_las_11_preguntas_avanzado_con_desglose(code):
     """El botón "📊 Ver dato" no cambia (decisión ya resuelta: el desglose
     queda solo en "Explicame paso a paso") -- verificado explícitamente
-    contra las 7 preguntas que SÍ tienen desglose, el caso de mayor riesgo
-    de regresión por ser justo donde "podría" agregarse por error."""
+    contra las 11 preguntas de `/avanzado` que SÍ tienen desglose, el caso
+    de mayor riesgo de regresión por ser justo donde "podría" agregarse por
+    error."""
     ctx = _avanzado_context()
+    contenido = ai_explain._build_ver_dato_content(ctx, code)
+    assert "🔍 Desglose" not in contenido
+    assert "🧮 Cuenta" not in contenido
+
+
+@pytest.mark.parametrize("code", _CODES_CON_DESGLOSE_TEXTO_LIBRE)
+async def test_ver_dato_nunca_incluye_desglose_ni_para_las_10_preguntas_texto_libre_con_desglose(code):
+    """Mismo criterio que arriba, para las 10 preguntas de texto libre con
+    desglose (SDD_desglose_universal.md, Grupos A-D + "vf")."""
+    ctx = _texto_libre_context()
     contenido = ai_explain._build_ver_dato_content(ctx, code)
     assert "🔍 Desglose" not in contenido
     assert "🧮 Cuenta" not in contenido
@@ -2843,13 +3073,30 @@ def test_max_desglose_chars_1201_se_omite_completo_no_trunca(caplog):
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
-def test_desglose_avanzado_7_entradas_todas_bajo_el_tope():
-    """Test parametrizado en el sentido que pide QA: recorre las 7 entradas
-    y hace un `assert` explícito por entrada, para que el mensaje de fallo
-    señale cuál entrada se pasó del límite, sin depurar las 7."""
+def test_desglose_avanzado_11_entradas_todas_bajo_el_tope():
+    """Test parametrizado en el sentido que pide QA: recorre las 11
+    entradas y hace un `assert` explícito por entrada, para que el mensaje
+    de fallo señale cuál entrada se pasó del límite, sin depurar las 11."""
+    ctx = _avanzado_context(precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0)
     for code, terminos in ai_explain_content.DESGLOSE_AVANZADO.items():
-        datos = ai_explain._build_explain_payload(_avanzado_context(), code)
+        datos = ai_explain._build_explain_payload(ctx, code)
         bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+        assert bloque is not None, f"{code}: desglose se omitió (excede el tope)"
+        assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS, (
+            f"{code}: desglose de {len(bloque)} caracteres excede "
+            f"_MAX_DESGLOSE_CHARS={ai_explain._MAX_DESGLOSE_CHARS}"
+        )
+
+
+def test_desglose_texto_libre_9_entradas_nuevas_todas_bajo_el_tope():
+    """Mismo criterio que arriba, para las 9 preguntas nuevas de texto libre
+    (Grupos A-D) -- "vf" queda afuera porque usa su propio mecanismo de
+    sub-cuentas anidadas (`_build_desglose_vf`), ya cubierto por sus tests
+    dedicados."""
+    ctx = _texto_libre_context()
+    for code in (c for c in _CODES_CON_DESGLOSE_TEXTO_LIBRE if c != "vf"):
+        datos = ai_explain._build_explain_payload(ctx, code)
+        bloque = ai_explain._build_desglose_block("texto_libre", code, datos)
         assert bloque is not None, f"{code}: desglose se omitió (excede el tope)"
         assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS, (
             f"{code}: desglose de {len(bloque)} caracteres excede "
@@ -3057,7 +3304,11 @@ def test_build_desglose_block_modelo_no_disponible_lineas_sin_valor(code):
     bloque = ai_explain._build_desglose_block("avanzado", code, datos)
     assert bloque is not None, f"{code}: el bloque no debería omitirse por dato faltante"
     assert "None" not in bloque
-    assert " = " not in bloque  # ninguna línea trae el segmento de valor
+    # Ninguna línea trae el segmento de valor `f" = {valor}"` -- ese
+    # segmento va siempre pegado al `)` que cierra el nombre del término
+    # (`") = "`); un `" = "` suelto puede venir del propio `que_mide` fijo
+    # (ej. "aql": "1.0 = igual de volátil"), no es un valor sustituido.
+    assert ") = " not in bloque
     terminos = ai_explain_content.desglose("avanzado", code)
     for t in terminos:
         assert f"• {t.letra} ({t.nombre}) — sale de" in bloque
@@ -3196,10 +3447,10 @@ def test_consistencia_cuenta_y_desglose_mge_mismos_4_valores():
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
 async def test_mensaje_paso_a_paso_desglose_muestra_valores_reales_no_solo_texto_fijo(code):
-    """Happy path por pregunta (7 casos, QA) -- en el mensaje real de
+    """Happy path por pregunta (11 casos, QA) -- en el mensaje real de
     "Explicame paso a paso" el bloque de Desglose ya no es 100% texto fijo:
     contiene al menos un valor real del ticker."""
-    ctx = _avanzado_context()
+    ctx = _avanzado_context(precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0)
     store = ai_explain.ExplanationContextStore()
     cid = store.put(ctx)
     respuesta = "Explicación genérica sin números inventados."
@@ -3524,12 +3775,30 @@ def test_build_desglose_block_avanzado_con_context_no_delega():
 
 def test_build_desglose_block_texto_libre_otro_code_con_context_no_delega():
     """Combinación "algún operando falso" #3: `question_code != "vf"` -- ni
-    siquiera con `context` presente, "gra" (que no tiene entrada en
+    siquiera con `context` presente, "ren" (que no tiene entrada en
     `DESGLOSE_TEXTO_LIBRE`) sigue devolviendo `None`, igual que las demás
-    21 preguntas de texto libre sin desglose."""
+    preguntas de texto libre sin desglose."""
     ctx = _texto_libre_context()
-    datos = ai_explain._build_explain_payload(ctx, "gra")
-    assert ai_explain._build_desglose_block("texto_libre", "gra", datos, context=ctx) is None
+    datos = ai_explain._build_explain_payload(ctx, "ren")
+    assert ai_explain._build_desglose_block("texto_libre", "ren", datos, context=ctx) is None
+
+
+def test_build_desglose_block_texto_libre_ver_con_context_no_delega_a_vf(monkeypatch):
+    """SDD_desglose_universal.md, Grupo D -- criterio de QA explícito:
+    agregar "ver" a `DESGLOSE_TEXTO_LIBRE` NO dispara la rama de delegación
+    especial de "vf" (`_build_desglose_vf`), aunque "ver" y "vf" convivan
+    en `texto_libre` y ambos reciban `context`."""
+    llamado = []
+    monkeypatch.setattr(
+        ai_explain, "_build_desglose_vf", lambda *a, **k: llamado.append(True) or "no debería usarse"
+    )
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    resultado = ai_explain._build_desglose_block("texto_libre", "ver", datos, context=ctx)
+    assert not llamado, "_build_desglose_vf no debe ejecutarse para 'ver'"
+    assert resultado is not None
+    assert resultado.startswith("🔍 Desglose:\n")
+    assert "Cuenta:" not in resultado
 
 
 @pytest.mark.parametrize("code", list(_CODES_SIN_DESGLOSE) + list(_CODES_CON_DESGLOSE))
@@ -3658,3 +3927,377 @@ def test_build_cuenta_line_vf_none_y_leaf_message_omite_cuenta_pero_incluye_desg
     )
     assert "🧮 Cuenta" not in texto
     assert "🔍 Desglose" in texto
+
+
+# ---------------------------------------------------------------------------
+# VII. "🔍 Desglose" universal -- SDD_desglose_universal.md (12 preguntas
+# nuevas: gra, dcf, mul, rat, pil, rsk, mom, cmp, ver, aqv, aqq, aqm, aql)
+# ---------------------------------------------------------------------------
+
+_CODES_GRUPO_F_AVANZADO = ("aqv", "aqq", "aqm", "aql")
+_CODES_NUEVOS_TEXTO_LIBRE = tuple(c for c in _CODES_CON_DESGLOSE_TEXTO_LIBRE if c != "vf")
+_CODES_12_NUEVAS = _CODES_NUEVOS_TEXTO_LIBRE + _CODES_GRUPO_F_AVANZADO
+
+
+# --- Valores reales, término a término, contra el fixture por defecto -----
+
+
+@pytest.mark.parametrize(
+    "code, letra, esperado",
+    [
+        ("gra", "EPS", "$8.20"),
+        ("gra", "g", "9.4%"),
+        ("gra", "Y", "4.2%"),
+        ("dcf", "FCF base", "$109.00"),
+        ("dcf", "WACC", "9.1%"),
+        ("dcf", "g", "8.3%"),
+        ("dcf", "Valor presente de los flujos", "$612.00"),
+        ("dcf", "Valor terminal descontado", "$2,100.00"),
+        ("dcf", "Valor de la empresa", "$2,712.00"),
+        ("mul", "EPS", "$8.20"),
+        ("mul", "PER promedio peers", "24.00"),
+        ("rat", "Liquidez", "1.80"),
+        ("rat", "Margen bruto", "65.0%"),
+        ("rat", "PER", "22.50"),
+        ("rat", "P/S", "6.20"),
+        ("pil", "Ingresos crecientes", "$1,000.00 > $800.00"),
+        ("pil", "Utilidades crecientes", "$200.00 > $150.00"),
+        ("pil", "Deuda controlada", "1.80"),
+        ("pil", "Precio razonable", "❌ No cumple"),
+        ("rsk", "Beta", "1.15"),
+        ("rsk", "Perfil de riesgo", "moderado"),
+        ("mom", "vs. máx. 52 semanas", "-8.2%"),
+        ("mom", "vs. mín. 52 semanas", "25.0%"),
+        ("mom", "vs. promedio 50 días", "3.1%"),
+        ("mom", "vs. promedio 200 días", "9.4%"),
+        ("cmp", "PER propio", "22.50"),
+        ("cmp", "PER promedio peers", "24.00"),
+        ("ver", "Precio actual", "$550.00"),
+        ("ver", "Valor Justo Total", "$496.00"),
+    ],
+)
+def test_valor_desglose_texto_libre_termino_a_termino_fixture_por_defecto(code, letra, esperado):
+    """QA -- valores reales, letra por letra, contra el fixture por
+    defecto de `_texto_libre_context()` (mismo patrón que
+    `test_valor_desglose_alz_termino_a_termino_ejemplo_de_daniela`)."""
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+    assert extractor(letra, datos) == esperado
+
+
+def test_valor_desglose_aqv_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aqv")
+    assert ai_explain._valor_desglose_aqv("Earnings Yield", datos) == "8.0%"
+    esperado_rango = ai_explain._rango_pct(
+        datos["earnings_yield"], datos["umbral_alto"], datos["umbral_bajo"]
+    )
+    assert ai_explain._valor_desglose_aqv("Umbrales", datos) == esperado_rango
+
+
+def test_valor_desglose_aqq_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aqq")
+    assert ai_explain._valor_desglose_aqq("ROE", datos) == "22.0%"
+    assert ai_explain._valor_desglose_aqq("Margen bruto", datos) == "55.0%"
+    assert ai_explain._valor_desglose_aqq("Ratio de Piotroski", datos) == "77.8%"
+
+
+def test_valor_desglose_aql_termino_a_termino():
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "aql")
+    assert ai_explain._valor_desglose_aql("Beta", datos) == "1.05"
+
+
+def test_valor_desglose_aqm_termino_a_termino():
+    ctx = _avanzado_context(precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0)
+    datos = ai_explain._build_explain_payload(ctx, "aqm")
+    assert ai_explain._valor_desglose_aqm("vs. promedio 50 días", datos) == "7.1%"
+    assert ai_explain._valor_desglose_aqm("vs. promedio 200 días", datos) == "15.4%"
+
+
+# --- Dato faltante (1 campo, no todos) -- solo esa línea se omite ---------
+
+
+@pytest.mark.parametrize(
+    "code, letra, campo_ausente",
+    [
+        ("gra", "EPS", "eps_ttm"),
+        ("dcf", "WACC", "dcf_wacc"),
+        ("mul", "PER promedio peers", "per_promedio_peers"),
+        ("rat", "PER", "per"),
+        ("pil", "Deuda controlada", "ratio_liquidez"),
+        ("rsk", "Beta", "beta"),
+        ("mom", "vs. máx. 52 semanas", "pct_vs_year_high"),
+        ("cmp", "PER promedio peers", "per_promedio_peers"),
+        ("ver", "Valor Justo Total", "valor_justo_total"),
+    ],
+)
+def test_valor_desglose_texto_libre_1_campo_faltante_omite_solo_esa_linea(code, letra, campo_ausente):
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    datos_con_hueco = dict(datos)
+    datos_con_hueco[campo_ausente] = None
+    extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+    assert extractor(letra, datos_con_hueco) is None
+    # Las demás letras del mismo término siguen mostrando su valor real.
+    bloque = ai_explain._build_desglose_block("texto_libre", code, datos_con_hueco)
+    assert bloque is not None
+    assert "None" not in bloque
+    otras_letras = [t.letra for t in ai_explain_content.desglose("texto_libre", code) if t.letra != letra]
+    for otra in otras_letras:
+        assert extractor(otra, datos) is not None, f"{code}/{otra}: se esperaba un valor real en el fixture"
+
+
+@pytest.mark.parametrize(
+    "code, letra, campo_ausente",
+    [
+        ("aqv", "Earnings Yield", "earnings_yield"),
+        ("aqq", "ROE", "roe"),
+        ("aql", "Beta", "beta"),
+    ],
+)
+def test_valor_desglose_avanzado_1_campo_faltante_omite_solo_esa_linea(code, letra, campo_ausente):
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    datos_con_hueco = dict(datos)
+    datos_con_hueco[campo_ausente] = None
+    extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+    assert extractor(letra, datos_con_hueco) is None
+    bloque = ai_explain._build_desglose_block("avanzado", code, datos_con_hueco)
+    assert bloque is not None
+    assert "None" not in bloque
+
+
+@pytest.mark.parametrize("campo_ausente", ["precio_actual", "price_avg_50", "price_avg_200"])
+def test_valor_desglose_aqm_1_campo_faltante_omite_solo_esa_linea(campo_ausente):
+    ctx = _avanzado_context(precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0)
+    datos = ai_explain._build_explain_payload(ctx, "aqm")
+    datos_con_hueco = dict(datos)
+    datos_con_hueco[campo_ausente] = None
+    assert ai_explain._valor_desglose_aqm("vs. promedio 50 días", datos_con_hueco) == (
+        None if campo_ausente in ("precio_actual", "price_avg_50") else "7.1%"
+    )
+    bloque = ai_explain._build_desglose_block("avanzado", "aqm", datos_con_hueco)
+    assert bloque is not None
+    assert "None" not in bloque
+
+
+# --- Consistencia "🧮 Cuenta" vs. "🔍 Desglose" -----------------------------
+
+
+@pytest.mark.parametrize("code", _CODES_NUEVOS_TEXTO_LIBRE)
+def test_consistencia_cuenta_y_desglose_texto_libre_mismo_valor_termino_a_termino(code):
+    """QA -- criterio agregado: el valor mostrado en cada línea del
+    Desglose coincide EXACTAMENTE (mismo formato, mismo redondeo) con el
+    que ya muestra la Cuenta de la misma pregunta."""
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    cuenta = ai_explain._build_cuenta_line("texto_libre", code, datos)
+    bloque = ai_explain._build_desglose_block("texto_libre", code, datos)
+    assert cuenta is not None
+    assert bloque is not None
+    extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+    for t in ai_explain_content.desglose("texto_libre", code):
+        if code == "rsk" and t.letra == "Perfil de riesgo":
+            # No es un término de la fórmula -- es el perfil que el propio
+            # usuario eligió con /start, `_cuenta_rsk` nunca lo muestra
+            # (muestra el perfil "implícito" derivado del beta, un dato
+            # distinto por diseño). Ver Grupo C de la spec.
+            continue
+        if code == "pil" and t.letra == "Precio razonable":
+            # `_cuenta_pil` usa el texto "razonable"/"no razonable"; el
+            # Desglose usa ✅/❌ (mismo patrón que los criterios de
+            # Piotroski, Grupo B de la spec) -- vocabulario distinto a
+            # propósito, no una inconsistencia de valor.
+            continue
+        valor = extractor(t.letra, datos)
+        if valor is None:
+            continue
+        if code == "gra" and t.letra in ("g", "Y"):
+            # La Cuenta muestra `g`/`Y` sin el sufijo "%" (`2×{g_pct:.1f}`,
+            # `/ {y_pct:.1f}`), el Desglose lo muestra con "%" para que la
+            # línea sea legible de forma autocontenida. Mismo número, mismo
+            # redondeo -- se compara el núcleo numérico, no el sufijo.
+            assert valor[:-1] in cuenta, (
+                f"{code}/{t.letra}: {valor!r} del Desglose no aparece en la Cuenta {cuenta!r}"
+            )
+        elif code == "pil" and " > " in valor:
+            # "$200.00 > $150.00" en el Desglose vs. "$200.00 > 0 y >
+            # $150.00" en la Cuenta -- mismos 2 montos, con un chequeo
+            # intermedio adicional en la Cuenta que el Desglose no repite
+            # (Decisión de diseño de `_cuenta_pil`). Se verifican los 2
+            # montos por separado, no la substring contigua.
+            for parte in valor.split(" > "):
+                assert parte in cuenta, (
+                    f"{code}/{t.letra}: {parte!r} (de {valor!r}) no aparece en la Cuenta {cuenta!r}"
+                )
+        else:
+            assert valor in cuenta, (
+                f"{code}/{t.letra}: {valor!r} del Desglose no aparece en la Cuenta {cuenta!r}"
+            )
+
+
+@pytest.mark.parametrize("code", _CODES_GRUPO_F_AVANZADO)
+def test_consistencia_cuenta_y_desglose_grupo_f_avanzado_mismo_valor_termino_a_termino(code):
+    ctx = _avanzado_context(precio_actual=150.0, price_avg_50=140.0, price_avg_200=130.0)
+    datos = ai_explain._build_explain_payload(ctx, code)
+    cuenta = ai_explain._build_cuenta_line("avanzado", code, datos)
+    bloque = ai_explain._build_desglose_block("avanzado", code, datos)
+    assert cuenta is not None
+    assert bloque is not None
+    if code == "aqm":
+        # "aqm" -- Cuenta y Desglose comparten literalmente los mismos 3
+        # campos crudos (precio_actual/price_avg_50/price_avg_200), pero se
+        # muestran en formatos distintos ($ en la Cuenta, % en el Desglose)
+        # -- la consistencia acá es "mismos campos crudos", no "mismo
+        # string", ver Grupo F de la spec.
+        for campo in ("precio_actual", "price_avg_50", "price_avg_200"):
+            assert ai_explain._money(datos[campo]) in cuenta
+        return
+    extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+    for t in ai_explain_content.desglose("avanzado", code):
+        valor = extractor(t.letra, datos)
+        if valor is not None:
+            assert valor in cuenta, f"{code}/{t.letra}: {valor!r} del Desglose no aparece en la Cuenta {cuenta!r}"
+
+
+# --- "ver" -- no delega a `_build_desglose_vf` (cubierto arriba también) --
+# --- ya cubierto por test_desglose_texto_libre_ver_2_terminos_livianos y
+# --- test_build_desglose_block_texto_libre_ver_con_context_no_delega_a_vf.
+
+
+# --- "cmp" -- longitud constante, sin importar la cantidad de peers -------
+
+
+def test_build_desglose_block_cmp_longitud_constante_sin_importar_cantidad_de_peers():
+    """Test explícitamente pedido por Daniela -- el Desglose de "cmp" no
+    crece con la cantidad de comparables disponibles (2, 5, 20 peers dan
+    exactamente el mismo largo)."""
+
+    def _bloque_con(cantidad_peers: int) -> str:
+        peers = [f"PEER{i}" for i in range(cantidad_peers)]
+        ctx = _texto_libre_context(
+            peer_comparison={
+                "per_propio": 22.5, "per_minimo_peers": 18.0, "per_promedio_peers": 24.0,
+                "per_maximo_peers": 30.0, "peers_usados": peers,
+                "posicion": "en_linea", "motivo_no_comparable": None,
+            }
+        )
+        datos = ai_explain._build_explain_payload(ctx, "cmp")
+        return ai_explain._build_desglose_block("texto_libre", "cmp", datos)
+
+    bloque_2 = _bloque_con(2)
+    bloque_5 = _bloque_con(5)
+    bloque_20 = _bloque_con(20)
+    assert bloque_2 is not None
+    assert len(bloque_2) == len(bloque_5) == len(bloque_20)
+
+
+def test_build_desglose_block_cmp_ningun_peer_individual_aparece_en_el_texto():
+    """No solo la longitud constante -- ningún ticker de `peers_usados`
+    (ni su nombre) se filtra al texto del Desglose por otro extractor mal
+    escrito."""
+    peers = ["MSFT", "CRM", "ORCL", "SAP", "NOW"]
+    ctx = _texto_libre_context(
+        peer_comparison={
+            "per_propio": 22.5, "per_minimo_peers": 18.0, "per_promedio_peers": 24.0,
+            "per_maximo_peers": 30.0, "peers_usados": peers,
+            "posicion": "en_linea", "motivo_no_comparable": None,
+        }
+    )
+    datos = ai_explain._build_explain_payload(ctx, "cmp")
+    bloque = ai_explain._build_desglose_block("texto_libre", "cmp", datos)
+    assert bloque is not None
+    for peer in peers:
+        assert peer not in bloque
+
+
+# --- Presupuesto de longitud, peor caso para "dcf" (medido, no estimado) --
+
+
+def test_build_desglose_block_dcf_peor_caso_montos_extremos_bajo_el_tope():
+    """QA -- número real medido, no una estimación en comentario. Montos de
+    9-10 cifras + WACC/g con decimales largos."""
+    scenarios_extremos = {
+        "pesimista": {
+            "valor_justo_multiplos": 1.0, "valor_justo_graham": 1.0, "valor_justo_dcf": 1.0,
+            "valor_justo_total": 1.0, "graham_g_aplicado": 0.01,
+            "dcf_wacc": 0.08, "dcf_g_fcf": 0.03, "dcf_fcf_base": 1.0,
+            "dcf_valor_presente_flujos": 1.0, "dcf_valor_terminal_descontado": 1.0,
+            "dcf_equity_value": 1.0,
+        },
+        "conservador": {
+            "valor_justo_multiplos": 144.40, "valor_justo_graham": 130.00,
+            "valor_justo_dcf": 999_999_999.99,
+            "valor_justo_total": (144.40 + 130.00 + 999_999_999.99) / 3,
+            "graham_g_aplicado": 0.091234,
+            "dcf_wacc": 0.091234, "dcf_g_fcf": 0.091234, "dcf_fcf_base": 999_999_999.99,
+            "dcf_valor_presente_flujos": 999_999_999.99,
+            "dcf_valor_terminal_descontado": 999_999_999.99,
+            "dcf_equity_value": 1_999_999_999.98,
+        },
+        "optimista": {
+            "valor_justo_multiplos": 1.0, "valor_justo_graham": 1.0, "valor_justo_dcf": 1.0,
+            "valor_justo_total": 1.0, "graham_g_aplicado": 0.01,
+            "dcf_wacc": 0.08, "dcf_g_fcf": 0.03, "dcf_fcf_base": 1.0,
+            "dcf_valor_presente_flujos": 1.0, "dcf_valor_terminal_descontado": 1.0,
+            "dcf_equity_value": 1.0,
+        },
+    }
+    ctx = _texto_libre_context(scenarios=scenarios_extremos)
+    datos = ai_explain._build_explain_payload(ctx, "dcf")
+    bloque = ai_explain._build_desglose_block("texto_libre", "dcf", datos)
+    assert bloque is not None, "el Desglose de 'dcf' se omitió por exceder el tope"
+    assert len(bloque) < ai_explain._MAX_DESGLOSE_CHARS
+
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "dcf", datos)
+    dato_line = ai_explain._build_dato_line("texto_libre", "dcf", datos)
+    formula = ai_explain_content.formulas("texto_libre").get("dcf")
+    fuente = ai_explain_content.fuentes("texto_libre").get("dcf")
+    respuesta = "x" * ai_explain._MAX_EXPLANATION_CHARS
+    mensaje_completo = ai_explain._build_leaf_message(
+        dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=bloque,
+    )
+    assert len(mensaje_completo) < TELEGRAM_MESSAGE_LIMIT
+
+
+# --- Funciones puras, sin I/O (extendido a las 13 preguntas nuevas) -------
+
+
+def test_build_desglose_block_extractores_nuevos_son_funciones_puras_sin_io():
+    import inspect
+    for code in _CODES_12_NUEVAS:
+        extractor = ai_explain._DESGLOSE_VALOR_EXTRACTORS[code]
+        assert not inspect.iscoroutinefunction(extractor), f"{code}: extractor no debería ser async"
+
+
+def test_cuenta_aqm_es_funcion_pura_dict_a_str_o_none():
+    import inspect
+    assert not inspect.iscoroutinefunction(ai_explain._cuenta_aqm)
+    sig = inspect.signature(ai_explain._cuenta_aqm)
+    assert list(sig.parameters) == ["datos"]
+
+
+# --- Regresión "mom" (texto libre) -- no afectado por el cambio de "aqm" --
+
+
+def test_cuenta_y_desglose_mom_sin_cambios_por_el_cambio_de_aqm():
+    """Grupo F -- "aqm" ahora también popula `context.momentum`/`context.
+    precio_actual`/etc. para `kind="avanzado"`, pero "mom" (texto libre)
+    sigue usando exactamente el mismo `context.momentum` dict y el mismo
+    resultado que antes del cambio."""
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "mom")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "mom", datos)
+    bloque = ai_explain._build_desglose_block("texto_libre", "mom", datos)
+    assert cuenta == (
+        "($550.00 − $600.00) / $600.00 × 100 = -8.2% vs. máx. 52 sem. · "
+        "($550.00 − $400.00) / $400.00 × 100 = 25.0% vs. mín. 52 sem. · "
+        "($550.00 − $540.00) / $540.00 × 100 = 3.1% vs. promedio 50d · "
+        "($550.00 − $520.00) / $520.00 × 100 = 9.4% vs. promedio 200d"
+    )
+    assert bloque is not None
+    assert "-8.2%" in bloque
+    assert "25.0%" in bloque

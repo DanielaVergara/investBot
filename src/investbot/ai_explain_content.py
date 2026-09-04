@@ -664,6 +664,65 @@ DESGLOSE_AVANZADO: dict[str, tuple[DesgloseTermino, ...]] = {
             que_mide="Cuánta plata líquida tiene disponible ahora mismo",
         ),
     ),
+    # SDD_desglose_universal.md, Grupo E -- Factores AQR con dato ya expuesto.
+    "aqv": (
+        DesgloseTermino(
+            letra="Earnings Yield",
+            campo_origen="magic.earnings_yield — mismo cálculo que «Earnings Yield» de la Magic Formula (EBIT/EV)",
+            nombre="Earnings Yield",
+            que_mide="Cuánta ganancia operativa genera la empresa por cada dólar de su valor total (deuda incluida)",
+        ),
+        DesgloseTermino(
+            letra="Umbrales",
+            campo_origen='advanced_scoring.FACTOR_UMBRALES["value_earnings_yield"]',
+            nombre="Umbrales de clasificación",
+            que_mide="Los cortes fijos que definen si el Earnings Yield es alto, medio o bajo",
+        ),
+    ),
+    "aqq": (
+        DesgloseTermino(
+            letra="ROE",
+            campo_origen="roe — /key-metrics de FMP",
+            nombre="ROE (Retorno sobre el Patrimonio)",
+            que_mide="Cuánta ganancia genera la empresa por cada dólar que pusieron sus dueños",
+        ),
+        DesgloseTermino(
+            letra="Margen bruto",
+            campo_origen="gross_margin — estado de resultados",
+            nombre="Margen bruto",
+            que_mide="Cuánto le queda de cada venta después del costo directo de producir/vender",
+        ),
+        DesgloseTermino(
+            letra="Ratio de Piotroski",
+            campo_origen="piotroski_ratio — criterios cumplidos / evaluables del F-Score",
+            nombre="Ratio de Piotroski",
+            que_mide="Qué proporción de los criterios de calidad del F-Score cumplió la empresa",
+        ),
+    ),
+    # SDD_desglose_universal.md, Grupo F -- único caso que expone un dato
+    # nuevo (reutilizando campos ya declarados en ExplanationContext).
+    "aqm": (
+        DesgloseTermino(
+            letra="vs. promedio 50 días",
+            campo_origen="precio_actual vs. price_avg_50 — cotización (quote) de FMP",
+            nombre="Precio vs. promedio de 50 días",
+            que_mide="Cómo está el precio de hoy respecto a su tendencia de corto plazo",
+        ),
+        DesgloseTermino(
+            letra="vs. promedio 200 días",
+            campo_origen="precio_actual vs. price_avg_200 — cotización (quote) de FMP",
+            nombre="Precio vs. promedio de 200 días",
+            que_mide="Cómo está el precio de hoy respecto a su tendencia de largo plazo",
+        ),
+    ),
+    "aql": (
+        DesgloseTermino(
+            letra="Beta",
+            campo_origen="beta — dato de FMP (profile.beta)",
+            nombre="Beta",
+            que_mide="Qué tan volátil es la acción comparada con el mercado en general (1.0 = igual de volátil)",
+        ),
+    ),
 }
 
 
@@ -695,6 +754,207 @@ DESGLOSE_TEXTO_LIBRE: dict[str, tuple[DesgloseTermino, ...]] = {
                 "cuánto vale la empresa hoy si se suma todo el efectivo que se espera "
                 "que genere en el futuro, traído a valor de hoy"
             ),
+        ),
+    ),
+    # SDD_desglose_universal.md, Grupo A -- Valoración con cuenta ya resuelta.
+    "gra": (
+        DesgloseTermino(
+            letra="EPS",
+            campo_origen="eps_ttm — estado de resultados (TTM, calculado por el bot)",
+            nombre="EPS (Ganancia por Acción)",
+            que_mide="Cuánto ganó la empresa por cada acción en los últimos 12 meses",
+        ),
+        DesgloseTermino(
+            letra="g",
+            campo_origen="g_aplicado del escenario elegido — CAGR histórico de EPS, con techo de 15% (valuation.py)",
+            nombre="Crecimiento aplicado",
+            que_mide="Qué tan rápido se espera que crezcan las ganancias por acción, según el historial",
+        ),
+        DesgloseTermino(
+            letra="Y",
+            campo_origen="y_value — tasa del bono del Tesoro a 10 años (FRED/Treasury.gov)",
+            nombre="Tasa del bono a 10 años",
+            que_mide='El retorno "sin riesgo" contra el que se compara la inversión en la acción',
+        ),
+    ),
+    # Textos deliberadamente compactos (no el mismo detalle que la spec en
+    # prosa): "dcf" es la única con 6 términos -- sin acortar campo_origen/
+    # que_mide, el bloque supera `_MAX_DESGLOSE_CHARS=1200` con montos de
+    # magnitud realista (medido, ver test de presupuesto de longitud).
+    "dcf": (
+        DesgloseTermino(
+            letra="FCF base",
+            campo_origen="dcf_fcf_base — Operativo − CapEx",
+            nombre="Flujo de Caja Libre base",
+            que_mide="Efectivo libre que le queda a la empresa tras operar e invertir",
+        ),
+        DesgloseTermino(
+            letra="WACC",
+            campo_origen="dcf_wacc — beta, deuda e impuestos",
+            nombre="Costo de capital",
+            que_mide="Tasa a la que se descuentan los flujos futuros",
+        ),
+        DesgloseTermino(
+            letra="g",
+            campo_origen="dcf_g_fcf — proyectado a 5 años",
+            nombre="Crecimiento del FCF",
+            que_mide="Qué tan rápido se espera que crezca el flujo de caja",
+        ),
+        DesgloseTermino(
+            letra="Valor presente de los flujos",
+            campo_origen="dcf_valor_presente_flujos — 5 años descontados al WACC",
+            nombre="VP de los flujos",
+            que_mide="Cuánto valen hoy los flujos de los próximos 5 años",
+        ),
+        DesgloseTermino(
+            letra="Valor terminal descontado",
+            campo_origen="dcf_valor_terminal_descontado — año 5+ descontado",
+            nombre="Valor terminal",
+            que_mide="Cuánto vale hoy lo que la empresa genere después del año 5",
+        ),
+        DesgloseTermino(
+            letra="Valor de la empresa",
+            campo_origen="dcf_equity_value — suma de los dos anteriores",
+            nombre="Empresa (equity)",
+            que_mide="Valor total estimado de la empresa hoy",
+        ),
+    ),
+    "mul": (
+        DesgloseTermino(
+            letra="EPS",
+            campo_origen="eps_ttm — estado de resultados (TTM, calculado por el bot)",
+            nombre="EPS (Ganancia por Acción)",
+            que_mide="Cuánto ganó la empresa por cada acción en los últimos 12 meses",
+        ),
+        DesgloseTermino(
+            letra="PER promedio peers",
+            campo_origen="per_promedio_peers — 1/earningsYield de cada peer del sector (/key-metrics de FMP)",
+            nombre="PER promedio de los comparables",
+            que_mide="A cuántas veces sus ganancias cotizan, en promedio, empresas parecidas del mismo sector",
+        ),
+    ),
+    # SDD_desglose_universal.md, Grupo B -- Ratios y pilares.
+    "rat": (
+        DesgloseTermino(
+            letra="Liquidez",
+            campo_origen="current_assets / current_liabilities — balance general",
+            nombre="Liquidez corriente",
+            que_mide="Si la empresa puede pagar sus deudas de corto plazo con lo que tiene a mano",
+        ),
+        DesgloseTermino(
+            letra="Margen bruto",
+            campo_origen="(revenue − cost_of_revenue) / revenue — estado de resultados",
+            nombre="Margen bruto",
+            que_mide="Cuánto le queda de cada venta después del costo directo de producir/vender",
+        ),
+        DesgloseTermino(
+            letra="PER",
+            campo_origen="precio_actual / eps_ttm — cotización + estado de resultados",
+            nombre="PER (Precio/Ganancia)",
+            que_mide="A cuántas veces sus ganancias anuales cotiza la acción hoy",
+        ),
+        DesgloseTermino(
+            letra="P/S",
+            campo_origen="market_cap / revenue — cotización + estado de resultados",
+            nombre="P/S (Precio/Ventas)",
+            que_mide="A cuántas veces sus ventas anuales está valuada la empresa en bolsa",
+        ),
+    ),
+    "pil": (
+        DesgloseTermino(
+            letra="Ingresos crecientes",
+            campo_origen="revenue_reciente vs. revenue_antiguo — estado de resultados",
+            nombre="Ingresos crecientes",
+            que_mide="Si la empresa factura más ahora que al principio de su historial",
+        ),
+        DesgloseTermino(
+            letra="Utilidades crecientes",
+            campo_origen="net_income_reciente vs. net_income_antiguo — estado de resultados",
+            nombre="Utilidades crecientes",
+            que_mide="Si la empresa gana más plata ahora que al principio de su historial, y no está perdiendo",
+        ),
+        DesgloseTermino(
+            letra="Deuda controlada",
+            campo_origen="ratio_liquidez > 1 — balance general",
+            nombre="Deuda controlada",
+            que_mide="Si la empresa puede cubrir sus deudas de corto plazo con lo que tiene a mano",
+        ),
+        DesgloseTermino(
+            letra="Precio razonable",
+            campo_origen="clasificación barata/cara del escenario Conservador — botón «⚖️ Veredicto»",
+            nombre="Precio razonable",
+            que_mide="Si, según el modelo del bot, la acción cotiza por debajo de lo que vale hoy",
+        ),
+    ),
+    # SDD_desglose_universal.md, Grupo C -- Riesgo y mercado.
+    "rsk": (
+        DesgloseTermino(
+            letra="Beta",
+            campo_origen="beta — dato de FMP (profile.beta)",
+            nombre="Beta",
+            que_mide="Qué tan volátil es la acción comparada con el mercado en general (1.0 = igual de volátil)",
+        ),
+        DesgloseTermino(
+            letra="Perfil de riesgo",
+            campo_origen="perfil guardado con /start",
+            nombre="Perfil de riesgo",
+            que_mide="El nivel de riesgo que el usuario eligió tolerar al configurar el bot",
+        ),
+    ),
+    "mom": (
+        DesgloseTermino(
+            letra="vs. máx. 52 semanas",
+            campo_origen="precio_actual vs. year_high — cotización (quote) de FMP",
+            nombre="Precio vs. máximo anual",
+            que_mide="Qué tan lejos está el precio de hoy de su punto más alto en el último año",
+        ),
+        DesgloseTermino(
+            letra="vs. mín. 52 semanas",
+            campo_origen="precio_actual vs. year_low — cotización (quote) de FMP",
+            nombre="Precio vs. mínimo anual",
+            que_mide="Qué tan lejos está el precio de hoy de su punto más bajo en el último año",
+        ),
+        DesgloseTermino(
+            letra="vs. promedio 50 días",
+            campo_origen="precio_actual vs. price_avg_50 — cotización (quote) de FMP",
+            nombre="Precio vs. promedio de 50 días",
+            que_mide="Cómo está el precio de hoy respecto a su tendencia de corto plazo",
+        ),
+        DesgloseTermino(
+            letra="vs. promedio 200 días",
+            campo_origen="precio_actual vs. price_avg_200 — cotización (quote) de FMP",
+            nombre="Precio vs. promedio de 200 días",
+            que_mide="Cómo está el precio de hoy respecto a su tendencia de largo plazo",
+        ),
+    ),
+    "cmp": (
+        DesgloseTermino(
+            letra="PER propio",
+            campo_origen="precio_actual / eps_ttm — cotización + estado de resultados",
+            nombre="PER propio",
+            que_mide="A cuántas veces sus ganancias anuales cotiza esta acción hoy",
+        ),
+        DesgloseTermino(
+            letra="PER promedio peers",
+            campo_origen="per_promedio_peers — 1/earningsYield de cada peer (/key-metrics de FMP)",
+            nombre="PER promedio de los comparables",
+            que_mide="A cuántas veces sus ganancias cotizan, en promedio, empresas parecidas del mismo sector",
+        ),
+    ),
+    # SDD_desglose_universal.md, Grupo D -- `ver` recibe un desglose liviano
+    # de 2 términos "puntero corto" (no repite el desglose completo de "vf").
+    "ver": (
+        DesgloseTermino(
+            letra="Precio actual",
+            campo_origen="precio_actual — cotización (quote) de FMP",
+            nombre="Precio actual",
+            que_mide="Lo que cuesta hoy 1 acción de la empresa en el mercado",
+        ),
+        DesgloseTermino(
+            letra="Valor Justo Total",
+            campo_origen="cálculo completo: botón «💰 Valor Justo Total»",
+            nombre="Valor Justo Total",
+            que_mide="Cuánto debería valer la acción según el promedio de los modelos calculables del bot",
         ),
     ),
 }

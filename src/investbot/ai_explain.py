@@ -570,8 +570,17 @@ def _payload_avanzado(context: ExplanationContext, question_code: str) -> dict:
             "piotroski_ratio_umbral_bajo": pr_bajo,
         }
     if question_code == "aqm":
+        # SDD_desglose_universal.md, Grupo F, Cambio 3 -- superficie mínima
+        # (Decisión de diseño #11 original, sin aflojar): solo los 3 campos
+        # que determinan la etiqueta, no `year_high`/`year_low`/`pct_vs_*`.
         factors = context.factors or {}
-        return {"modelo": "Factor Momentum (AQR)", "momentum": factors.get("momentum")}
+        return {
+            "modelo": "Factor Momentum (AQR)",
+            "momentum": factors.get("momentum"),
+            "precio_actual": context.precio_actual,
+            "price_avg_50": context.price_avg_50,
+            "price_avg_200": context.price_avg_200,
+        }
     if question_code == "aql":
         factors = context.factors or {}
         return {
@@ -885,11 +894,200 @@ def _valor_desglose_mge(letra: str, datos: dict) -> Optional[str]:
     return _money(v) if v is not None else None
 
 
+# --- SDD_desglose_universal.md -- extractores de las 12 preguntas nuevas ---
+# Mismo patrón genérico (1 valor por término, `try/except` amplio en
+# `_build_desglose_block`) salvo lo documentado por grupo.
+
+
+def _valor_desglose_gra(letra: str, datos: dict) -> Optional[str]:
+    if letra == "EPS":
+        v = datos.get("eps_ttm")
+        return _money(v) if v is not None else None
+    if letra == "g":
+        v = datos.get("g_aplicado")
+        return _pct1(v) if v is not None else None
+    if letra == "Y":
+        v = datos.get("y_value")
+        return _pct1(v) if v is not None else None
+    return None
+
+
+def _valor_desglose_dcf(letra: str, datos: dict) -> Optional[str]:
+    campo_fmt = {
+        "FCF base": ("dcf_fcf_base", _money),
+        "WACC": ("dcf_wacc", _pct1),
+        "g": ("dcf_g_fcf", _pct1),
+        "Valor presente de los flujos": ("dcf_valor_presente_flujos", _money),
+        "Valor terminal descontado": ("dcf_valor_terminal_descontado", _money),
+        "Valor de la empresa": ("dcf_equity_value", _money),
+    }.get(letra)
+    if campo_fmt is None:
+        return None
+    campo, fmt = campo_fmt
+    v = datos.get(campo)
+    return fmt(v) if v is not None else None
+
+
+def _valor_desglose_mul(letra: str, datos: dict) -> Optional[str]:
+    if letra == "EPS":
+        v = datos.get("eps_ttm")
+        return _money(v) if v is not None else None
+    if letra == "PER promedio peers":
+        v = datos.get("per_promedio_peers")
+        return _ratio2(v) if v is not None else None
+    return None
+
+
+def _valor_desglose_rat(letra: str, datos: dict) -> Optional[str]:
+    """Reusa exactamente las mismas condiciones que `_cuenta_rat` -- un
+    término sin dato disponible se omite de la línea (PER omitido si
+    `per_no_aplicable`, liquidez omitida si `current_liabilities` es
+    0/`None`, mismo criterio que la Cuenta)."""
+    if letra == "Liquidez":
+        ca, cl = datos.get("current_assets"), datos.get("current_liabilities")
+        if ca is None or not cl or datos.get("ratio_liquidez") is None:
+            return None
+        return _ratio2(datos["ratio_liquidez"])
+    if letra == "Margen bruto":
+        rev, cor = datos.get("revenue"), datos.get("cost_of_revenue")
+        if not rev or cor is None or datos.get("margen_bruto") is None:
+            return None
+        return _pct1(datos["margen_bruto"])
+    if letra == "PER":
+        precio, eps = datos.get("precio_actual"), datos.get("eps_ttm")
+        if (
+            precio is None or not eps or datos.get("per") is None
+            or datos.get("per_no_aplicable")
+        ):
+            return None
+        return _ratio2(datos["per"])
+    if letra == "P/S":
+        mc, rev = datos.get("market_cap"), datos.get("revenue")
+        if mc is None or not rev or datos.get("ps") is None:
+            return None
+        return _ratio2(datos["ps"])
+    return None
+
+
+def _valor_desglose_pil(letra: str, datos: dict) -> Optional[str]:
+    """Mismo formato `"{a} > {b}"` que `_cuenta_pil` para "Ingresos
+    crecientes"/"Utilidades crecientes" (consistencia Cuenta↔Desglose)."""
+    pillars = datos.get("pillars") or {}
+    if letra == "Ingresos crecientes":
+        r, a = datos.get("revenue_reciente"), datos.get("revenue_antiguo")
+        return f"{_money(r)} > {_money(a)}" if r is not None and a is not None else None
+    if letra == "Utilidades crecientes":
+        r, a = datos.get("net_income_reciente"), datos.get("net_income_antiguo")
+        return f"{_money(r)} > {_money(a)}" if r is not None and a is not None else None
+    if letra == "Deuda controlada":
+        rl = datos.get("ratio_liquidez")
+        return _ratio2(rl) if rl is not None else None
+    if letra == "Precio razonable":
+        v = pillars.get("precio_razonable")
+        if v is None:
+            return None
+        return "✅ Cumple" if v else "❌ No cumple"
+    return None
+
+
+def _valor_desglose_rsk(letra: str, datos: dict) -> Optional[str]:
+    if letra == "Beta":
+        v = datos.get("beta")
+        return _ratio2(v) if v is not None else None
+    if letra == "Perfil de riesgo":
+        v = datos.get("perfil")
+        return str(v) if v else None
+    return None
+
+
+def _valor_desglose_mom(letra: str, datos: dict) -> Optional[str]:
+    """Los `pct_vs_*` del payload de `mom` ya están en puntos porcentuales
+    (`market_context._pct_vs` ya multiplica por 100) -- se formatean
+    directamente, igual que `_cuenta_mom`, sin volver a pasar por `_pct1`
+    (que multiplicaría por 100 una segunda vez)."""
+    campo = {
+        "vs. máx. 52 semanas": "pct_vs_year_high",
+        "vs. mín. 52 semanas": "pct_vs_year_low",
+        "vs. promedio 50 días": "pct_vs_avg_50",
+        "vs. promedio 200 días": "pct_vs_avg_200",
+    }.get(letra)
+    v = datos.get(campo) if campo else None
+    return f"{v:.1f}%" if v is not None else None
+
+
+def _valor_desglose_cmp(letra: str, datos: dict) -> Optional[str]:
+    if letra == "PER propio":
+        v = datos.get("per_propio")
+        return _ratio2(v) if v is not None else None
+    if letra == "PER promedio peers":
+        v = datos.get("per_promedio_peers")
+        return _ratio2(v) if v is not None else None
+    return None
+
+
+def _valor_desglose_ver(letra: str, datos: dict) -> Optional[str]:
+    """Patrón genérico de 1-valor-por-término (Grupo D) -- NO delega en
+    `_build_desglose_vf`, `ver` no repite las sub-cuentas de "vf"."""
+    if letra == "Precio actual":
+        v = datos.get("precio_actual")
+        return _money(v) if v is not None else None
+    if letra == "Valor Justo Total":
+        v = datos.get("valor_justo_total")
+        return _money(v) if v is not None else None
+    return None
+
+
+def _valor_desglose_aqv(letra: str, datos: dict) -> Optional[str]:
+    if letra == "Earnings Yield":
+        v = datos.get("earnings_yield")
+        return _pct1(v) if v is not None else None
+    if letra == "Umbrales":
+        ey, alto, bajo = datos.get("earnings_yield"), datos.get("umbral_alto"), datos.get("umbral_bajo")
+        if None in (ey, alto, bajo):
+            return None
+        return _rango_pct(ey, alto, bajo)
+    return None
+
+
+def _valor_desglose_aqq(letra: str, datos: dict) -> Optional[str]:
+    campo = {
+        "ROE": "roe", "Margen bruto": "gross_margin", "Ratio de Piotroski": "piotroski_ratio",
+    }.get(letra)
+    v = datos.get(campo) if campo else None
+    return _pct1(v) if v is not None else None
+
+
+def _valor_desglose_aqm(letra: str, datos: dict) -> Optional[str]:
+    """A diferencia de `mom`, acá se calcula el cociente directamente desde
+    `precio_actual`/`price_avg_50`/`price_avg_200` (no reutiliza
+    `context.momentum`, que trae `pct_vs_year_high/low` -- esos 2 campos NO
+    participan de la clasificación de Momentum AQR, ver Grupo F de la
+    spec)."""
+    precio = datos.get("precio_actual")
+    campo = {"vs. promedio 50 días": "price_avg_50", "vs. promedio 200 días": "price_avg_200"}.get(letra)
+    avg = datos.get(campo) if campo else None
+    if precio is None or not avg:
+        return None
+    return _pct1((precio - avg) / avg)
+
+
+def _valor_desglose_aql(letra: str, datos: dict) -> Optional[str]:
+    if letra == "Beta":
+        v = datos.get("beta")
+        return _ratio2(v) if v is not None else None
+    return None
+
+
 _DESGLOSE_VALOR_EXTRACTORS = {
     "alz": _valor_desglose_alz, "azp": _valor_desglose_azp,
     "pir": _valor_desglose_piotroski, "pia": _valor_desglose_piotroski,
     "pie": _valor_desglose_piotroski,
     "mgr": _valor_desglose_mgr, "mge": _valor_desglose_mge,
+    "gra": _valor_desglose_gra, "dcf": _valor_desglose_dcf, "mul": _valor_desglose_mul,
+    "rat": _valor_desglose_rat, "pil": _valor_desglose_pil, "rsk": _valor_desglose_rsk,
+    "mom": _valor_desglose_mom, "cmp": _valor_desglose_cmp, "ver": _valor_desglose_ver,
+    "aqv": _valor_desglose_aqv, "aqq": _valor_desglose_aqq, "aqm": _valor_desglose_aqm,
+    "aql": _valor_desglose_aql,
 }
 
 
@@ -1308,17 +1506,22 @@ def _cuenta_mge(datos: dict) -> Optional[str]:
     )
 
 
+def _rango_pct(valor: float, alto: float, bajo: float) -> str:
+    """Compartido entre `_cuenta_aqv` y `_valor_desglose_aqv` (SDD_desglose_
+    universal.md, Grupo E) -- misma lógica de rango, no se reescribe."""
+    if valor > alto:
+        return f"> {_pct1(alto)}"
+    if valor < bajo:
+        return f"< {_pct1(bajo)}"
+    return f"entre {_pct1(bajo)} y {_pct1(alto)}"
+
+
 def _cuenta_aqv(datos: dict) -> Optional[str]:
     ey = datos.get("earnings_yield")
     alto, bajo, etiqueta = datos.get("umbral_alto"), datos.get("umbral_bajo"), datos.get("value")
     if ey is None or alto is None or bajo is None:
         return None
-    if ey > alto:
-        rango = f"> {_pct1(alto)}"
-    elif ey < bajo:
-        rango = f"< {_pct1(bajo)}"
-    else:
-        rango = f"entre {_pct1(bajo)} y {_pct1(alto)}"
+    rango = _rango_pct(ey, alto, bajo)
     return f"Earnings Yield {_pct1(ey)} está {rango} → {etiqueta}"
 
 
@@ -1361,10 +1564,22 @@ def _cuenta_aqq(datos: dict) -> Optional[str]:
 
 
 def _cuenta_aqm(datos: dict) -> Optional[str]:
-    momentum = datos.get("momentum")
-    if momentum is None:
+    """SDD_desglose_universal.md, Grupo F, Cambio 4 -- deja de ser trivial:
+    muestra la comparación real que determina la etiqueta (precio vs.
+    promedio 50d y vs. promedio 200d), mismo criterio de "no calculable" que
+    `market_context.calculate_momentum` (etiqueta="no_disponible" si falta
+    `price_avg_50` o `price_avg_200`)."""
+    precio = datos.get("precio_actual")
+    avg50, avg200 = datos.get("price_avg_50"), datos.get("price_avg_200")
+    etiqueta = datos.get("momentum")
+    if None in (precio, avg50, avg200):
         return None
-    return f"Factor Momentum: {momentum}"
+    cmp50 = ">" if precio > avg50 else "<"
+    cmp200 = ">" if precio > avg200 else "<"
+    return (
+        f"Precio {_money(precio)} {cmp50} promedio 50d {_money(avg50)} y "
+        f"{cmp200} promedio 200d {_money(avg200)} → {etiqueta}"
+    )
 
 
 def _cuenta_aql(datos: dict) -> Optional[str]:
@@ -1450,6 +1665,8 @@ SYSTEM_PROMPT_EXPLAIN = (
     "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
     "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
     "   de él.\n"
+    "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
+    "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
 )
 
 # Decisión de diseño #4 de SDD_explicacion_paso_a_paso.md -- NO reemplaza
@@ -1486,6 +1703,8 @@ SYSTEM_PROMPT_PASO_A_PASO = (
     "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
     "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
     "   de él.\n"
+    "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
+    "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
 )
 
 MAX_EXPLANATION_OUTPUT_TOKENS = 220
@@ -1595,6 +1814,56 @@ def _respuesta_es_eco_del_payload(respuesta: str, datos_del_contexto: dict) -> b
     return False
 
 
+# --- Detección de mezcla de portugués (incidente de producción
+# 2026-09-04, captura de Daniela): `qwen2.5:3b-instruct` a veces "cambia de
+# idioma" a mitad de una respuesta y redacta parte o toda la explicación en
+# portugués aunque el prompt pida español -- problema conocido de modelos
+# chicos con contextos de entrenamiento multilingües. Tratado igual que el
+# eco del payload: reintento único, y si el reintento también da el mismo
+# patrón, `_ExplainUnavailable`.
+#
+# Esto es una HEURÍSTICA simple, no un detector de idioma completo ni
+# exhaustivo -- el objetivo es atrapar los casos obvios (como el de la
+# evidencia real de abajo), no garantizar 100% de precisión. Se apoya en
+# dos señales que NUNCA aparecen en español estándar:
+# 1. Caracteres exclusivos del portugués (ã/õ/ç) -- el español no los usa.
+# 2. Palabras/patrones característicos del portugués sin equivalente
+#    ortográfico en español (não, você, cê, também, muito, quanto, coisas,
+#    sabiam, áqui, "é" como verbo "ser" aislado -- distinto del "es"
+#    español). Se evitan a propósito palabras que EXISTEN en ambos idiomas
+#    (ej. "también"/"também" difieren en la vocal final -- solo se matchea
+#    la forma portuguesa) para no generar falsos positivos. -----------------
+
+_CARACTERES_EXCLUSIVOS_PORTUGUES = ("ã", "õ", "ç", "Ã", "Õ", "Ç")
+
+_PATRONES_PORTUGUES = [
+    re.compile(patron)
+    for patron in (
+        r"\bnão\b",
+        r"\bvocê\b",
+        r"\bcê\b",
+        r"\btambém\b",
+        r"\bmuito\b",
+        r"\bquanto\b",
+        r"\bcoisas\b",
+        r"\bsabiam\b",
+        r"\báqui\b",
+        r"\bé\b",
+    )
+]
+
+
+def _respuesta_tiene_portugues(respuesta: str) -> bool:
+    """`True` si `respuesta` contiene alguna señal característica de
+    portugués (ver comentario arriba). Heurística por lista de patrones,
+    no exhaustiva -- pensada para atrapar casos obvios de mezcla de
+    idioma, no para cubrir todo el espacio posible."""
+    if any(ch in respuesta for ch in _CARACTERES_EXCLUSIVOS_PORTUGUES):
+        return True
+    texto = respuesta.lower()
+    return any(patron.search(texto) for patron in _PATRONES_PORTUGUES)
+
+
 class _ExplainUnavailable(Exception):
     """Señal interna -- cualquier fallo de red/estructura/guard converge
     acá y nunca se propaga fuera de `build_explain_handler`."""
@@ -1660,19 +1929,23 @@ async def _fetch_explanation(
             respuesta_candidata = parsed["respuesta"]
             if _respuesta_es_eco_del_payload(respuesta_candidata, datos_del_contexto):
                 raise ValueError("respuesta contiene el eco del JSON de entrada")
+            if _respuesta_tiene_portugues(respuesta_candidata):
+                raise ValueError("respuesta mezcla portugués en vez de español")
             respuesta = respuesta_candidata
             break
         except (json.JSONDecodeError, ValueError) as exc:
             if attempt == 0:
                 logger.info(
-                    "Respuesta de Ollama con estructura JSON inesperada o con eco del "
-                    "JSON de entrada generando explicación (%s) — reintentando una vez",
+                    "Respuesta de Ollama con estructura JSON inesperada, con eco del "
+                    "JSON de entrada, o mezclando portugués generando explicación (%s) "
+                    "— reintentando una vez",
                     type(exc).__name__,
                 )
                 continue
             logger.info(
-                "Respuesta de Ollama con estructura JSON inesperada o con eco del JSON "
-                "de entrada generando explicación tras reintentar (%s)", type(exc).__name__,
+                "Respuesta de Ollama con estructura JSON inesperada, con eco del JSON "
+                "de entrada, o mezclando portugués generando explicación tras "
+                "reintentar (%s)", type(exc).__name__,
             )
             raise _ExplainUnavailable() from exc
 

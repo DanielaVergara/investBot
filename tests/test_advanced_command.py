@@ -665,6 +665,65 @@ async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_re
     assert f"[Z'':" not in mensaje
 
 
+async def test_explanation_context_avanzado_propaga_los_6_campos_de_aqm_sin_llamadas_http_nuevas(
+    empresa_completa, empresa_asset_light, etf_profile
+):
+    """SDD_desglose_universal.md, Grupo F -- `explain_context_sink` y
+    `ExplanationContext(kind="avanzado", ...)` llevan `momentum`/
+    `precio_actual`/`year_high`/`year_low`/`price_avg_50`/`price_avg_200`
+    con el mismo valor que `momentum_result`/`quote`/`price` ya calculados
+    en `_run_analysis` -- con `request_log` contando invocaciones reales a
+    FMP, para probar "cero llamadas HTTP nuevas" con evidencia."""
+    from investbot import ai_explain
+
+    request_log: list = []
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, request_log,
+        ollama_config=_enabled_ollama_config(),
+    )
+    store = ai_explain.ExplanationContextStore()
+    callback = _handler_callback(clients, FakeRateLimiter(), store)
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    # Mismas 5 llamadas de siempre (profile/quote/income/balance/cash-flow)
+    # -- ninguna nueva por los 6 campos de Grupo F, que solo reutilizan el
+    # `quote`/`momentum_result` ya calculados en esta misma corrida.
+    assert request_log == ["MFG"] * 5
+
+    assert len(store._entries) == 1
+    ((_, entry),) = store._entries.items()
+    ctx = entry.context
+    quote = empresa_completa["quote"]
+    assert ctx.precio_actual == quote["price"]
+    assert ctx.year_high == quote["yearHigh"]
+    assert ctx.year_low == quote["yearLow"]
+    assert ctx.price_avg_50 == quote["priceAvg50"]
+    assert ctx.price_avg_200 == quote["priceAvg200"]
+    assert ctx.momentum is not None
+    assert set(ctx.momentum) == {
+        "pct_vs_year_high", "pct_vs_year_low", "pct_vs_avg_50", "pct_vs_avg_200", "etiqueta",
+    }
+    # Mismo cálculo que `market_context.calculate_momentum` ya hace en
+    # `_run_analysis` -- no se recalcula acá, se compara contra el mismo
+    # resultado esperado con los datos crudos del fixture.
+    from investbot import market_context
+    esperado = market_context.calculate_momentum(
+        price=quote["price"], year_high=quote["yearHigh"], year_low=quote["yearLow"],
+        price_avg_50=quote["priceAvg50"], price_avg_200=quote["priceAvg200"],
+    )
+    assert ctx.momentum["pct_vs_avg_50"] == esperado.pct_vs_avg_50
+    assert ctx.momentum["pct_vs_avg_200"] == esperado.pct_vs_avg_200
+    assert ctx.momentum["etiqueta"] == esperado.etiqueta
+
+    # Y el payload que ve Ollama para "aqm" expone esos mismos 3 campos.
+    datos_aqm = ai_explain._build_explain_payload(ctx, "aqm")
+    assert datos_aqm["precio_actual"] == quote["price"]
+    assert datos_aqm["price_avg_50"] == quote["priceAvg50"]
+    assert datos_aqm["price_avg_200"] == quote["priceAvg200"]
+
+
 async def test_reply_markup_con_5_botones_solo_en_ultimo_chunk(
     empresa_completa, empresa_asset_light, etf_profile
 ):
