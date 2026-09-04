@@ -902,14 +902,25 @@ def _enforce_desglose_length(bloque: str) -> Optional[str]:
     return bloque
 
 
-def _build_desglose_block(kind: str, question_code: str, datos: dict) -> Optional[str]:
+def _build_desglose_block(
+    kind: str, question_code: str, datos: dict, context: Optional["ExplanationContext"] = None,
+) -> Optional[str]:
     """Descripción fija (Decisión de diseño #3 de la spec original) + valor
     real puntual del ticker (SDD_desglose_con_valores_reales.md) por línea.
     No hace I/O. `None` si la pregunta no tiene desglose (20 de 27
     preguntas) -- comportamiento sin cambios. Un valor puntual faltante o un
     extractor que falla nunca le quita la línea a las demás letras, solo le
     quita el número a esa letra -- mismo `try/except` amplio que
-    `_build_cuenta_line`."""
+    `_build_cuenta_line`.
+
+    SDD_desglose_valor_justo_total.md [Iter-2]: caso especial de "vf" -- a
+    diferencia del resto de las preguntas con Desglose, acá cada término
+    necesita su propia cuenta resuelta completa, no solo 1 valor. Ese caso se
+    delega a `_build_desglose_vf`, que recibe el `context` completo (opcional,
+    `None` por default, retrocompatible con todos los call sites existentes
+    que no lo pasan)."""
+    if kind == "texto_libre" and question_code == "vf" and context is not None:
+        return _build_desglose_vf(context, datos)
     terminos = ai_explain_content.desglose(kind, question_code)
     if not terminos:
         return None
@@ -924,6 +935,60 @@ def _build_desglose_block(kind: str, question_code: str, datos: dict) -> Optiona
                 valor = None
         prefijo_valor = f" = {valor}" if valor else ""
         lineas.append(f"• {t.letra} ({t.nombre}){prefijo_valor} — sale de {t.campo_origen}. {t.que_mide}.")
+    bloque = "🔍 Desglose:\n" + "\n".join(lineas)
+    return _enforce_desglose_length(bloque)
+
+
+_VF_SUB_MODELO_CODE = {"Múltiplos": "mul", "Graham": "gra", "DCF": "dcf"}
+
+
+def _valor_desglose_vf_de_datos(letra: str, datos_vf: dict) -> Optional[str]:
+    """Lee del `datos` de "vf" (`datos_vf`), nunca del `datos_sub` armado
+    para la cuenta de cada sub-modelo -- el valor mostrado entre paréntesis
+    tiene que ser exactamente el mismo número que ya muestra la Cuenta de
+    "vf" (`_cuenta_vf`) para ese término (Decisión de diseño #3)."""
+    campo = {
+        "Múltiplos": "valor_justo_multiplos",
+        "Graham": "valor_justo_graham",
+        "DCF": "valor_justo_dcf",
+    }.get(letra)
+    v = datos_vf.get(campo) if campo else None
+    return _money(v) if v is not None else None
+
+
+def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optional[str]:
+    """Caso especial de "vf" (SDD_desglose_valor_justo_total.md [Iter-2]): a
+    diferencia del resto de las preguntas con Desglose (Altman/Piotroski/
+    Magic Formula), acá cada término necesita su propia cuenta resuelta
+    completa, no solo 1 valor -- y esa cuenta la arma una función que ya
+    existe (`_cuenta_gra`/`_cuenta_mul`/`_cuenta_dcf`) pero que espera un
+    `datos` propio de su pregunta, distinto del `datos` de "vf". Ese `datos`
+    propio se arma con la MISMA `_payload_texto_libre(context, code)` que ya
+    usa `_build_explain_payload` cuando el usuario toca el botón individual
+    -- no se inventa ninguna fuente de dato nueva, y ese `datos` intermedio
+    NUNCA se mezcla con `datos_del_contexto` (el que ve Ollama para "vf") --
+    se descarta apenas se usa para armar el texto del Desglose, que se
+    inserta DESPUÉS de la respuesta de Ollama, igual que el resto del
+    mecanismo."""
+    terminos = ai_explain_content.desglose("texto_libre", "vf")
+    if not terminos:
+        return None
+    lineas = []
+    for t in terminos:
+        code = _VF_SUB_MODELO_CODE[t.letra]
+        try:
+            datos_sub = _payload_texto_libre(context, code)
+            cuenta_sub = _CUENTA_TEXTO_LIBRE[code](datos_sub)
+        except Exception:  # noqa: BLE001 -- misma red de seguridad que _build_cuenta_line
+            cuenta_sub = None
+        if cuenta_sub is None:
+            lineas.append(f"• {t.nombre} — no calculable con los datos disponibles.")
+            continue
+        valor = _valor_desglose_vf_de_datos(t.letra, datos_vf)
+        prefijo_valor = f" ({valor})" if valor else ""
+        lineas.append(
+            f"• {t.nombre}{prefijo_valor} — {t.que_mide}.\n  Cuenta: {cuenta_sub}"
+        )
     bloque = "🔍 Desglose:\n" + "\n".join(lineas)
     return _enforce_desglose_length(bloque)
 
@@ -1887,7 +1952,7 @@ async def _dispatch_leaf(
     dato_line = _build_dato_line(stored.kind, question_code, datos_del_contexto)
     formula = ai_explain_content.formulas(stored.kind).get(question_code)
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
-    desglose = _build_desglose_block(stored.kind, question_code, datos_del_contexto)
+    desglose = _build_desglose_block(stored.kind, question_code, datos_del_contexto, context=stored)
     texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose)
     await bot.edit_message_text(
         chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup

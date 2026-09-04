@@ -667,14 +667,50 @@ DESGLOSE_AVANZADO: dict[str, tuple[DesgloseTermino, ...]] = {
 }
 
 
+DESGLOSE_TEXTO_LIBRE: dict[str, tuple[DesgloseTermino, ...]] = {
+    "vf": (
+        DesgloseTermino(
+            letra="Múltiplos",
+            campo_origen="fórmula y fuente completas: botón «Múltiplos»",
+            nombre="Múltiplos",
+            que_mide=(
+                "cuánto debería valer la acción si cotizara al mismo múltiplo de "
+                "ganancias (PER) que empresas parecidas del mismo sector"
+            ),
+        ),
+        DesgloseTermino(
+            letra="Graham",
+            campo_origen="fórmula y fuente completas: botón «Graham»",
+            nombre="Graham (EPS)",
+            que_mide=(
+                "cuánto debería valer la acción según una fórmula clásica que combina "
+                "ganancias por acción y crecimiento histórico"
+            ),
+        ),
+        DesgloseTermino(
+            letra="DCF",
+            campo_origen="fórmula y fuente completas: botón «DCF»",
+            nombre="DCF (Flujo de Caja Descontado)",
+            que_mide=(
+                "cuánto vale la empresa hoy si se suma todo el efectivo que se espera "
+                "que genere en el futuro, traído a valor de hoy"
+            ),
+        ),
+    ),
+}
+
+
 def desglose(kind: str, code: str) -> tuple[DesgloseTermino, ...]:
-    """`()` para `kind == "texto_libre"` o cualquier `code` sin entrada --
-    las 20 preguntas sin desglose no rompen nada, se comportan como hoy
-    (Decisión de diseño #1: `pig` es una de esas 20 -- se apoya en
-    pir/pia/pie, no tiene desglose propio)."""
-    if kind != "avanzado":
-        return ()
-    return DESGLOSE_AVANZADO.get(code, ())
+    """`()` para cualquier `code` sin entrada en la tabla correspondiente --
+    las 20 preguntas de `/avanzado` y las 21 de texto libre sin desglose no
+    rompen nada, se comportan como hoy (Decisión de diseño #1: `pig` es una
+    de esas 20 -- se apoya en pir/pia/pie, no tiene desglose propio).
+    SDD_desglose_valor_justo_total.md [Iter-2]: agrega la rama `texto_libre`
+    con el mismo criterio (`dict.get(code, ())`) que ya usaba `avanzado` --
+    ninguna de las 21 preguntas de texto libre sin entrada nueva (todas menos
+    `vf`) cambia de comportamiento."""
+    tabla = DESGLOSE_AVANZADO if kind == "avanzado" else DESGLOSE_TEXTO_LIBRE
+    return tabla.get(code, ())
 
 
 def all_questions(kind: str) -> dict[str, QuestionSpec]:

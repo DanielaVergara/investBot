@@ -11,6 +11,7 @@ contra 8, 3 formas de `callback_data` contra 1).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -21,6 +22,7 @@ import httpx
 import pytest
 
 from investbot import ai_explain, ai_explain_content, ai_rewrite
+from investbot.query_handler import TELEGRAM_MESSAGE_LIMIT
 from investbot.summary import DISCLAIMER_NO_ASESORAMIENTO
 
 
@@ -2592,16 +2594,29 @@ def test_cuenta_4_modelos_todo_o_nada_no_calculables_sin_none_visible(code):
 
 _CODES_CON_DESGLOSE = ("alz", "azp", "pir", "pia", "pie", "mgr", "mge")
 
-# QA, "Fixtures mínimos que faltan" #2 -- lista explícita de las 20
+# SDD_desglose_valor_justo_total.md [Iter-2] -- "vf" (texto_libre) gana
+# desglose propio, distinto del mecanismo genérico de `_CODES_CON_DESGLOSE`
+# (que sigue siendo exclusivamente de `/avanzado`, ver los tests de abajo que
+# llaman `ai_explain_content.desglose("avanzado", code)`/`_avanzado_context()`
+# a propósito). Se mantiene como constante separada, no se mezcla en
+# `_CODES_CON_DESGLOSE`, para no romper esos tests avanzado-específicos.
+_CODES_CON_DESGLOSE_TEXTO_LIBRE = ("vf",)
+
+# QA, "Fixtures mínimos que faltan" #2 -- lista explícita de las 19
 # preguntas sin desglose, confirmada contra el código real (`_TODAS_LAS_
 # PREGUNTAS`, 27 codes) en vez de contra el conteo de la spec.
-_CODES_SIN_DESGLOSE = tuple(c for c in _TODAS_LAS_PREGUNTAS if c not in _CODES_CON_DESGLOSE)
+_CODES_SIN_DESGLOSE = tuple(
+    c for c in _TODAS_LAS_PREGUNTAS
+    if c not in _CODES_CON_DESGLOSE and c not in _CODES_CON_DESGLOSE_TEXTO_LIBRE
+)
 
 
-def test_desglose_20_preguntas_sin_desglose_mas_7_con_desglose_suman_27():
-    assert len(_CODES_SIN_DESGLOSE) == 20
+def test_desglose_19_preguntas_sin_desglose_mas_7_avanzado_mas_1_texto_libre_suman_27():
+    assert len(_CODES_SIN_DESGLOSE) == 19
     assert len(_CODES_CON_DESGLOSE) == 7
-    assert set(_CODES_SIN_DESGLOSE) | set(_CODES_CON_DESGLOSE) == set(_TODAS_LAS_PREGUNTAS)
+    assert len(_CODES_CON_DESGLOSE_TEXTO_LIBRE) == 1
+    todos = set(_CODES_SIN_DESGLOSE) | set(_CODES_CON_DESGLOSE) | set(_CODES_CON_DESGLOSE_TEXTO_LIBRE)
+    assert todos == set(_TODAS_LAS_PREGUNTAS)
 
 
 def test_desglose_avanzado_7_entradas_exactas():
@@ -2641,11 +2656,22 @@ def test_desglose_code_inexistente_o_vacio_devuelve_vacio(code):
     assert ai_explain_content.desglose("avanzado", code) == ()
 
 
-@pytest.mark.parametrize("code", list(_TODAS_LAS_PREGUNTAS) + ["alz", "cualquier_cosa"])
-def test_desglose_texto_libre_siempre_vacio(code):
-    """`kind == "texto_libre"` devuelve `()` para cualquier `code`, incluso
-    uno que sí tiene entrada en `DESGLOSE_AVANZADO` (ej. "alz")."""
+@pytest.mark.parametrize(
+    "code", [c for c in list(_TODAS_LAS_PREGUNTAS) + ["alz", "cualquier_cosa"] if c != "vf"],
+)
+def test_desglose_texto_libre_vacio_salvo_vf(code):
+    """`kind == "texto_libre"` devuelve `()` para cualquier `code` salvo "vf"
+    (SDD_desglose_valor_justo_total.md [Iter-2]), incluso uno que sí tiene
+    entrada en `DESGLOSE_AVANZADO` (ej. "alz") -- ningún `code` de "avanzado"
+    se filtra por error a la tabla de texto_libre."""
     assert ai_explain_content.desglose("texto_libre", code) == ()
+
+
+def test_desglose_texto_libre_vf_no_vacio():
+    """"vf" es la única entrada de `DESGLOSE_TEXTO_LIBRE` -- 3 términos
+    (Múltiplos/Graham/DCF), en ese orden."""
+    terminos = ai_explain_content.desglose("texto_libre", "vf")
+    assert [t.letra for t in terminos] == ["Múltiplos", "Graham", "DCF"]
 
 
 @pytest.mark.parametrize("code", _CODES_CON_DESGLOSE)
@@ -3143,3 +3169,444 @@ async def test_mensaje_paso_a_paso_desglose_muestra_valores_reales_no_solo_texto
     bloque_desglose = texto[idx_desglose:texto.index(respuesta)]
     assert " = " in bloque_desglose, f"{code}: el Desglose no muestra ningún valor real"
     assert "None" not in bloque_desglose
+
+
+# ---------------------------------------------------------------------------
+# VII. "🔍 Desglose" de "vf" (💰 Valor Justo Total) --
+# SDD_desglose_valor_justo_total.md [Iter-2]
+# ---------------------------------------------------------------------------
+
+
+def _vf_context(escenario_overrides: dict, *, escenario_elegido: str = "conservador", **top_overrides):
+    """Fixture base de "vf": parte de `_texto_libre_context()` (ADBE,
+    escenario "conservador" con Múltiplos $500.00/Graham $480.00/DCF
+    $510.00/Total $496.00 por default) y permite pisar el sub-dict del
+    escenario elegido (para forzar "no calculable" en 1/2/3 sub-modelos)
+    y/o campos de nivel superior."""
+    ctx_base = _texto_libre_context()
+    scenarios = copy.deepcopy(ctx_base.scenarios)
+    scenarios[escenario_elegido].update(escenario_overrides)
+    overrides = {"scenarios": scenarios, "escenario_elegido": escenario_elegido, **top_overrides}
+    return _texto_libre_context(**overrides)
+
+
+def _desglose_vf(ctx: ai_explain.ExplanationContext) -> str:
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    return bloque
+
+
+# --- Fixtures mínimos que pide QA (Ticker A-E + escenario variable) --------
+
+
+def test_build_desglose_vf_ticker_a_3_modelos_calculables_3_subsecciones_en_orden():
+    """Ticker A -- happy path, las 3 sub-secciones en orden Múltiplos ->
+    Graham -> DCF, cada una con valor entre paréntesis, 1 línea de "qué
+    mide" y su cuenta resuelta completa."""
+    ctx = _texto_libre_context()
+    bloque = _desglose_vf(ctx)
+    assert bloque.startswith("🔍 Desglose:\n")
+    idx_mul = bloque.index("• Múltiplos")
+    idx_gra = bloque.index("• Graham (EPS)")
+    idx_dcf = bloque.index("• DCF (Flujo de Caja Descontado)")
+    assert idx_mul < idx_gra < idx_dcf
+    assert "• Múltiplos ($500.00) — cuánto debería valer la acción si cotizara" in bloque
+    assert "Cuenta: $8.20 × 24.00 = $500.00" in bloque
+    assert "• Graham (EPS) ($480.00) — cuánto debería valer la acción según" in bloque
+    assert "Cuenta: $8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00" in bloque
+    assert "• DCF (Flujo de Caja Descontado) ($510.00) — cuánto vale la empresa hoy" in bloque
+    assert "Cuenta: FCF base $109.00" in bloque
+    assert "no calculable" not in bloque
+    assert "None" not in bloque
+
+
+@pytest.mark.parametrize(
+    "code,nombre",
+    [("mul", "Múltiplos"), ("gra", "Graham (EPS)"), ("dcf", "DCF (Flujo de Caja Descontado)")],
+)
+def test_build_desglose_vf_cuenta_identica_byte_a_byte_al_boton_individual(code, nombre):
+    """Caso obligatorio de QA -- la sub-cuenta de cada modelo dentro del
+    Desglose de "vf" tiene que ser EXACTAMENTE la misma cuenta (comparación
+    de string completa) que arma hoy el botón individual («Múltiplos»/
+    «Graham»/«DCF») con el mismo `_payload_texto_libre`/`_cuenta_*`."""
+    ctx = _texto_libre_context()
+    bloque = _desglose_vf(ctx)
+    esperado = ai_explain._CUENTA_TEXTO_LIBRE[code](ai_explain._payload_texto_libre(ctx, code))
+    assert esperado is not None
+    assert f"• {nombre}" in bloque
+    assert f"Cuenta: {esperado}" in bloque
+
+
+def test_build_desglose_vf_valor_entre_parentesis_igual_a_valor_de_cuenta_vf():
+    """Caso obligatorio de QA -- el número entre paréntesis de cada
+    sub-sección (`_valor_desglose_vf_de_datos`, que lee de `datos_vf`) debe
+    coincidir con el número correspondiente que ya muestra la "🧮 Cuenta" de
+    "vf" (`_cuenta_vf`, mismo `datos_vf`)."""
+    ctx = _texto_libre_context()
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    cuenta_vf = ai_explain._cuenta_vf(datos_vf)
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert cuenta_vf == "($500.00 + $480.00 + $510.00) / 3 = $496.00"
+    assert "($500.00)" in bloque
+    assert "($480.00)" in bloque
+    assert "($510.00)" in bloque
+
+
+def test_build_desglose_vf_ticker_b_multiplos_no_calculable():
+    """Ticker B -- 1 modelo no calculable (Múltiplos, escenario elegido sin
+    valor_justo_multiplos): la línea se reemplaza completa por el texto
+    explícito, nunca desaparece, nunca muestra "None" ni un valor
+    inventado. Graham y DCF siguen con su cuenta completa. La Cuenta de
+    "vf" refleja el promedio de los 2 calculables."""
+    ctx = _vf_context({"valor_justo_multiplos": None, "valor_justo_total": (480.00 + 510.00) / 2})
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    assert "• Múltiplos — no calculable con los datos disponibles." in bloque
+    assert "• Graham (EPS) ($480.00) —" in bloque
+    assert "Cuenta: $8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00" in bloque
+    assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in bloque
+    assert "None" not in bloque
+    cuenta_vf = ai_explain._cuenta_vf(datos_vf)
+    assert cuenta_vf == "($480.00 + $510.00) / 2 = $495.00"
+
+
+def test_build_desglose_vf_ticker_c_2_modelos_no_calculables():
+    """Ticker C -- 2 modelos no calculables (Múltiplos y Graham), DCF
+    calculable -- evita el sesgo de solo probar "1 de 3 falla"."""
+    ctx = _vf_context({
+        "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_total": 510.00,
+    })
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    assert "• Múltiplos — no calculable con los datos disponibles." in bloque
+    assert "• Graham (EPS) — no calculable con los datos disponibles." in bloque
+    assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in bloque
+    assert "Cuenta: FCF base $109.00" in bloque
+    assert "None" not in bloque
+    cuenta_vf = ai_explain._cuenta_vf(datos_vf)
+    assert cuenta_vf == "($510.00) / 1 = $510.00"
+
+
+def test_build_desglose_vf_ticker_d_3_modelos_no_calculables_sigue_mostrando_el_bloque():
+    """Ticker D (caso extremo agregado por `qa`, resuelto por `architect`,
+    Decisión de diseño #5) -- el Desglose se sigue mostrando completo (3
+    líneas "no calculable"), aunque la Cuenta de "vf" sea `None`. Confirma
+    que `_build_desglose_vf` no depende de `_cuenta_vf` para decidir si
+    renderizarse."""
+    ctx = _vf_context({
+        "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_dcf": None,
+        "valor_justo_total": None,
+    })
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    assert ai_explain._cuenta_vf(datos_vf) is None
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    assert bloque.count("no calculable con los datos disponibles") == 3
+    assert "None" not in bloque
+
+
+@pytest.mark.parametrize("escenario", ["pesimista", "conservador", "optimista"])
+def test_build_desglose_vf_fixture_escenario_variable_usa_siempre_el_mismo_escenario(escenario):
+    """Fixture #6 de QA -- mismo ticker, `escenario_elegido` variando entre
+    los 3 posibles: el valor entre paréntesis y la Cuenta usan siempre el
+    mismo escenario elegido, sin importar cuál sea."""
+    ctx = _texto_libre_context(escenario_elegido=escenario)
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    cuenta_vf = ai_explain._cuenta_vf(datos_vf)
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    esperado = ctx.scenarios[escenario]
+    assert f"(${esperado['valor_justo_multiplos']:,.2f})" in bloque
+    assert f"(${esperado['valor_justo_graham']:,.2f})" in bloque
+    assert f"(${esperado['valor_justo_dcf']:,.2f})" in bloque
+    assert f"${esperado['valor_justo_multiplos']:,.2f}" in cuenta_vf
+    assert f"${esperado['valor_justo_graham']:,.2f}" in cuenta_vf
+    assert f"${esperado['valor_justo_dcf']:,.2f}" in cuenta_vf
+
+
+def test_build_desglose_vf_ticker_e_peor_caso_montos_extremos_bajo_el_tope():
+    """Ticker E -- montos extremos (9-10 cifras en DCF, WACC/g de 2
+    dígitos): mide el largo real del bloque con un test, no solo con el
+    script Python que corrió `architect` una vez."""
+    base_pequena = {
+        "valor_justo_multiplos": 1.0, "valor_justo_graham": 1.0, "valor_justo_dcf": 1.0,
+        "valor_justo_total": 1.0, "graham_g_aplicado": 0.01,
+        "dcf_wacc": 0.08, "dcf_g_fcf": 0.03, "dcf_fcf_base": 1.0,
+        "dcf_valor_presente_flujos": 1.0, "dcf_valor_terminal_descontado": 1.0, "dcf_equity_value": 1.0,
+    }
+    scenarios_extremos = {
+        "pesimista": dict(base_pequena),
+        "conservador": {
+            "valor_justo_multiplos": 144.40, "valor_justo_graham": 130.00,
+            "valor_justo_dcf": 999_999_999.99,
+            "valor_justo_total": (144.40 + 130.00 + 999_999_999.99) / 3,
+            "graham_g_aplicado": 0.035,
+            "dcf_wacc": 0.999, "dcf_g_fcf": 0.999, "dcf_fcf_base": 999_999_999.99,
+            "dcf_valor_presente_flujos": 999_999_999.99, "dcf_valor_terminal_descontado": 999_999_999.99,
+            "dcf_equity_value": 1_999_999_999.98,
+        },
+        "optimista": dict(base_pequena),
+    }
+    ctx = _texto_libre_context(
+        scenarios=scenarios_extremos, eps_ttm=9.50, y_value=0.082,
+        peer_comparison={"per_promedio_peers": 15.20},
+    )
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS
+
+    cuenta = ai_explain._cuenta_vf(datos_vf)
+    dato_line = ai_explain._build_dato_line("texto_libre", "vf", datos_vf)
+    formula = ai_explain_content.formulas("texto_libre").get("vf")
+    fuente = ai_explain_content.fuentes("texto_libre").get("vf")
+    respuesta = "x" * ai_explain._MAX_EXPLANATION_CHARS
+    mensaje_completo = ai_explain._build_leaf_message(
+        dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=bloque,
+    )
+    assert len(mensaje_completo) <= TELEGRAM_MESSAGE_LIMIT
+
+
+def test_build_desglose_vf_excepcion_en_un_sub_modelo_cae_a_no_calculable(monkeypatch):
+    """Caso de error obligatorio de QA -- forzar que uno de los 3 sub-`datos`
+    lance una excepción al construirse: esa sub-sección cae a "no
+    calculable" en vez de propagar el error y romper todo el mensaje de
+    "vf" (mismo `try/except` amplio que el resto del mecanismo de
+    Desglose)."""
+    ctx = _texto_libre_context()
+    original = ai_explain._payload_texto_libre
+
+    def _payload_que_falla_en_gra(context, code):
+        if code == "gra":
+            raise RuntimeError("fallo simulado de _payload_texto_libre")
+        return original(context, code)
+
+    monkeypatch.setattr(ai_explain, "_payload_texto_libre", _payload_que_falla_en_gra)
+    datos_vf = original(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert bloque is not None
+    assert "• Graham (EPS) — no calculable con los datos disponibles." in bloque
+    assert "• Múltiplos ($500.00) —" in bloque
+    assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in bloque
+
+
+def test_build_desglose_vf_no_muta_datos_vf():
+    """El `datos_sub` intermedio (`_payload_texto_libre(context,
+    "mul"/"gra"/"dcf")`) nunca se mezcla con `datos_vf` -- `_build_desglose_vf`
+    no escribe ni retorna nada que se asigne de vuelta a `datos_vf` (que es
+    `datos_del_contexto`, el que ve Ollama)."""
+    ctx = _texto_libre_context()
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    snapshot = dict(datos_vf)
+    ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert datos_vf == snapshot
+
+
+def test_payload_texto_libre_vf_sin_cambios_antes_y_despues_de_construir_el_desglose():
+    """"Ningún campo nuevo en `datos_del_contexto` (el payload que ve
+    Ollama para "vf")" -- `_payload_texto_libre(context, "vf")` devuelve
+    exactamente el mismo dict antes y después de ejercitar el mecanismo
+    nuevo."""
+    ctx = _texto_libre_context()
+    datos_vf_1 = ai_explain._payload_texto_libre(ctx, "vf")
+    ai_explain._build_desglose_vf(ctx, datos_vf_1)
+    datos_vf_2 = ai_explain._payload_texto_libre(ctx, "vf")
+    assert datos_vf_1 == datos_vf_2
+    assert set(datos_vf_2) == {
+        "modelo", "escenario_elegido", "precio_actual",
+        "valor_justo_multiplos", "valor_justo_graham", "valor_justo_dcf", "valor_justo_total",
+    }
+
+
+# --- `_build_desglose_block` -- firma retrocompatible + rama de delegación -
+
+
+def test_build_desglose_block_avanzado_3_posicionales_sin_context_sigue_igual():
+    """Retrocompatibilidad de firma -- los tests existentes que llaman
+    `_build_desglose_block("avanzado", code, datos)` con 3 argumentos
+    posicionales (sin `context`) siguen pasando sin modificar ni una
+    línea."""
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "alz")
+    assert ai_explain._build_desglose_block("avanzado", "alz", datos) is not None
+
+
+def test_build_desglose_block_texto_libre_vf_con_context_delega_a_build_desglose_vf():
+    """Rama de delegación, combinación completa (las 3 condiciones AND
+    verdaderas): `kind == "texto_libre" and question_code == "vf" and
+    context is not None`."""
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "vf")
+    resultado = ai_explain._build_desglose_block("texto_libre", "vf", datos, context=ctx)
+    assert resultado is not None
+    assert "Cuenta: $8.20 × 24.00 = $500.00" in resultado
+
+
+def test_build_desglose_block_texto_libre_vf_sin_context_no_delega(monkeypatch):
+    """Combinación "algún operando falso" #1: `context is None` (el
+    default) -- no activa el caso especial de "vf", `_build_desglose_vf`
+    nunca se ejecuta. El mecanismo genérico (mismo que Altman/Magic
+    Formula) sigue corriendo con la entrada de `DESGLOSE_TEXTO_LIBRE["vf"]`
+    -- no arma sub-cuentas (esas son exclusivas de `_build_desglose_vf`),
+    pero tampoco rompe ni propaga excepción."""
+    llamado = []
+    monkeypatch.setattr(
+        ai_explain, "_build_desglose_vf", lambda *a, **k: llamado.append(True) or "no debería usarse"
+    )
+    resultado = ai_explain._build_desglose_block("texto_libre", "vf", {}, context=None)
+    assert not llamado, "_build_desglose_vf no debe ejecutarse sin context"
+    assert resultado is not None
+    assert "Cuenta:" not in resultado
+
+
+def test_build_desglose_block_avanzado_con_context_no_delega():
+    """Combinación "algún operando falso" #2: `kind == "avanzado"` (no
+    `"texto_libre"`) -- pasar `context` no le cambia nada, mismo resultado
+    que sin `context` (comportamiento real del call site de
+    `handle_explain`, que pasa `context=stored` siempre, para las 27
+    preguntas)."""
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "alz")
+    sin_context = ai_explain._build_desglose_block("avanzado", "alz", datos)
+    con_context = ai_explain._build_desglose_block("avanzado", "alz", datos, context=ctx)
+    assert sin_context == con_context
+
+
+def test_build_desglose_block_texto_libre_otro_code_con_context_no_delega():
+    """Combinación "algún operando falso" #3: `question_code != "vf"` -- ni
+    siquiera con `context` presente, "gra" (que no tiene entrada en
+    `DESGLOSE_TEXTO_LIBRE`) sigue devolviendo `None`, igual que las demás
+    21 preguntas de texto libre sin desglose."""
+    ctx = _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, "gra")
+    assert ai_explain._build_desglose_block("texto_libre", "gra", datos, context=ctx) is None
+
+
+@pytest.mark.parametrize("code", list(_CODES_SIN_DESGLOSE) + list(_CODES_CON_DESGLOSE))
+def test_build_desglose_block_context_no_cambia_resultado_para_las_26_preguntas_restantes(code):
+    """Regresión de las 26 preguntas restantes (7 de `/avanzado` con
+    desglose + 19 sin desglose, "vf" aparte con su propio mecanismo) --
+    `_build_desglose_block(kind, code, datos, context=stored)` (con
+    `context` siempre pasado, como queda el call site real de
+    `handle_explain`) devuelve exactamente lo mismo que devolvía
+    `_build_desglose_block(kind, code, datos)` sin `context` antes del
+    cambio."""
+    kind = "texto_libre" if code in ai_explain_content.QUESTIONS_TEXTO_LIBRE else "avanzado"
+    spec = ai_explain_content.all_questions(kind)[code]
+    if spec.variant == ai_explain_content.VARIANT_DETERMINISTICO:
+        pytest.skip("evt/inf nunca pasan por _build_explain_payload/_build_desglose_block")
+    ctx = _avanzado_context() if kind == "avanzado" else _texto_libre_context()
+    datos = ai_explain._build_explain_payload(ctx, code)
+    sin_context = ai_explain._build_desglose_block(kind, code, datos)
+    con_context = ai_explain._build_desglose_block(kind, code, datos, context=ctx)
+    assert sin_context == con_context
+
+
+# --- "📊 Ver dato" de "vf" -- no cambia ------------------------------------
+
+
+def test_ver_dato_vf_no_incluye_cuenta_ni_desglose():
+    """"📊 Ver dato" de "vf" no cambia (sigue sin Cuenta ni Desglose) --
+    ese flujo nunca llama a `_build_desglose_block` ni a
+    `_build_desglose_vf`."""
+    ctx = _texto_libre_context()
+    contenido = ai_explain._build_ver_dato_content(ctx, "vf")
+    assert "🔍 Desglose" not in contenido
+    assert "🧮 Cuenta" not in contenido
+    assert "📌 Dato:" in contenido
+
+
+def test_build_ver_dato_content_nunca_llama_a_build_desglose_vf(monkeypatch):
+    llamado = []
+    monkeypatch.setattr(ai_explain, "_build_desglose_vf", lambda *a, **k: llamado.append(True))
+    ai_explain._build_ver_dato_content(_texto_libre_context(), "vf")
+    assert not llamado
+
+
+# --- Mensaje completo "🎓 Explicame paso a paso" de "vf" (end-to-end) ------
+
+
+async def test_mensaje_paso_a_paso_vf_muestra_cuenta_y_desglose_con_3_subcuentas():
+    """Criterio de aceptación -- para un ticker con los 3 modelos
+    calculables, "🎓 Explicame paso a paso" de "vf" muestra 🧮 Cuenta seguido
+    de 🔍 Desglose (en ese orden, antes de la respuesta de Ollama), con 3
+    sub-secciones."""
+    ctx = _texto_libre_context()
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "Los tres modelos coinciden en un rango de valor similar para esta acción."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    texto = kwargs["text"]
+    assert texto != ai_explain.EXPLAIN_UNAVAILABLE_MSG
+    assert "🧮 Cuenta" in texto
+    assert "🔍 Desglose" in texto
+    assert texto.index("🧮 Cuenta") < texto.index("🔍 Desglose") < texto.index(respuesta)
+    assert "None" not in texto
+    assert "• Múltiplos ($500.00) —" in texto
+    assert "• Graham (EPS) ($480.00) —" in texto
+    assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in texto
+    assert len(texto) <= TELEGRAM_MESSAGE_LIMIT
+
+
+async def test_mensaje_paso_a_paso_vf_3_no_calculables_omite_cuenta_pero_muestra_desglose():
+    """[x] Criterio agregado por `qa`, resuelto por `architect` (Decisión
+    de diseño #5) -- 3 sub-modelos no calculables: la "🧮 Cuenta" de "vf" se
+    omite del mensaje en silencio (sin texto placeholder), y la "🔍
+    Desglose" se sigue mostrando completa, con sus 3 sub-secciones en "no
+    calculable"."""
+    ctx = _vf_context({
+        "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_dcf": None,
+        "valor_justo_total": None,
+    })
+    store = ai_explain.ExplanationContextStore()
+    cid = store.put(ctx)
+    respuesta = "No fue posible estimar un valor justo con los modelos disponibles para este ticker."
+    client = _client_with_handler(_ok_handler(respuesta))
+    clients = _make_clients(http_client=client, ollama_config=_enabled_config())
+    callback = _build_callback(clients, FakeRateLimiter(), store)
+
+    update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
+    await callback(update, context)
+
+    context.bot.edit_message_text.assert_awaited_once()
+    _, kwargs = context.bot.edit_message_text.call_args
+    texto = kwargs["text"]
+    assert "🧮 Cuenta" not in texto
+    assert "🔍 Desglose" in texto
+    assert texto.count("no calculable con los datos disponibles") == 3
+    assert "None" not in texto
+
+
+def test_build_cuenta_line_vf_none_y_leaf_message_omite_cuenta_pero_incluye_desglose_3_no_calculables():
+    """Test de regresión dirigido, no end-to-end -- exactamente el que pide
+    el criterio de aceptación nuevo: `_build_cuenta_line("texto_libre",
+    "vf", datos)` devuelve `None` para el fixture de 3 no calculables, y
+    `_build_leaf_message(..., cuenta=None, desglose=<bloque completo>)` no
+    incluye la substring "🧮 Cuenta" en su salida."""
+    ctx = _vf_context({
+        "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_dcf": None,
+        "valor_justo_total": None,
+    })
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "vf", datos_vf)
+    assert cuenta is None
+
+    desglose = ai_explain._build_desglose_vf(ctx, datos_vf)
+    assert desglose is not None
+    assert desglose.count("no calculable con los datos disponibles") == 3
+
+    texto = ai_explain._build_leaf_message(
+        "Dato de prueba", "Respuesta.", None, None, cuenta=cuenta, desglose=desglose,
+    )
+    assert "🧮 Cuenta" not in texto
+    assert "🔍 Desglose" in texto
