@@ -67,9 +67,16 @@ def _disabled_config() -> ai_rewrite.OllamaConfig:
     )
 
 
+def _texto_plano_con_marcador(respuesta_text: str) -> str:
+    """`SDD_ollama_texto_plano.md` -- helper análogo al viejo
+    `json.dumps({"respuesta": ...})`, ahora armando el texto plano con el
+    marcador `###RESPUESTA###` que `_extraer_respuesta_plana` reconoce."""
+    return f"###RESPUESTA###\n{respuesta_text}"
+
+
 def _ok_handler(respuesta_text: str):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": respuesta_text})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(respuesta_text)})
 
     return handler
 
@@ -989,6 +996,101 @@ def test_enforce_brevity_texto_largo_sin_punto_corte_duro_con_puntos_suspensivos
 
 
 # ---------------------------------------------------------------------------
+# F bis. Extracción de texto plano (`_extraer_respuesta_plana`) --
+# `SDD_ollama_texto_plano.md`. Función pura, testeada de forma aislada sin
+# mocks (Testabilidad de `qa`) -- branch coverage 100% de las 3 ramas:
+# marcador presente y completo, marcador ausente (fallback total), marcador
+# truncado a la mitad (fallback parcial, Caso 5 obligatorio de `qa`).
+# ---------------------------------------------------------------------------
+
+
+def test_extraer_respuesta_plana_marcador_presente_y_completo():
+    """Caso 1 de `qa` -- happy path."""
+    raw_text = "###RESPUESTA###\nExplicación real."
+    assert ai_explain._extraer_respuesta_plana(raw_text) == "Explicación real."
+
+
+def test_extraer_respuesta_plana_con_preambulo_antes_del_marcador():
+    """Caso 2 de `qa` -- un modelo 3B puede anteponer preámbulos sin ancla
+    JSON; el marcador descarta ese preámbulo."""
+    raw_text = "Claro, acá va:\n###RESPUESTA###\nExplicación real."
+    assert ai_explain._extraer_respuesta_plana(raw_text) == "Explicación real."
+
+
+def test_extraer_respuesta_plana_marcador_duplicado_por_eco_del_system_prompt():
+    """Punto 6 de `security` -- el marcador `###RESPUESTA###` aparece
+    textualmente dentro de las instrucciones del system prompt como ejemplo
+    de formato. Si el modelo ecoa parte de esas instrucciones (mismo patrón
+    de eco ya documentado para `qwen2.5:3b-instruct`) antes de responder de
+    verdad, `raw_text` puede contener el marcador DOS veces: una en el eco
+    de las instrucciones, y otra precediendo la respuesta real. Tomar la
+    PRIMERA ocurrencia filtraría hacia el usuario el resto de las
+    instrucciones ecoadas mezcladas con la respuesta real -- debe tomarse la
+    ÚLTIMA ocurrencia."""
+    raw_text = (
+        "Recordá responder siempre después de ###RESPUESTA### con el texto "
+        "final.\n"
+        "###RESPUESTA###\n"
+        "Explicación real."
+    )
+    assert ai_explain._extraer_respuesta_plana(raw_text) == "Explicación real."
+
+
+def test_extraer_respuesta_plana_con_relleno_despues_de_la_explicacion():
+    """Caso 3 de `qa` -- la spec (Decisión #3) no recorta el final: todo lo
+    que sigue al marcador es la respuesta, sin ambigüedad. No es un bug,
+    documentado con test explícito para que no se confunda con una
+    regresión."""
+    raw_text = "###RESPUESTA###\nExplicación real.\n\nEspero que te sirva!"
+    assert (
+        ai_explain._extraer_respuesta_plana(raw_text)
+        == "Explicación real.\n\nEspero que te sirva!"
+    )
+
+
+def test_extraer_respuesta_plana_marcador_ausente_por_completo(caplog):
+    """Caso 4 de `qa` -- degradación con gracia: sin el marcador en ningún
+    lado, se usa el texto completo, logueado a INFO (no WARNING)."""
+    raw_text = "Una respuesta normal sin ningún marcador."
+    with caplog.at_level(logging.INFO):
+        resultado = ai_explain._extraer_respuesta_plana(raw_text)
+    assert resultado == raw_text
+    assert any(r.levelno == logging.INFO for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.parametrize("marcador_truncado", ["###", "###RESP", "###RESPUESTA#"])
+def test_extraer_respuesta_plana_marcador_truncado_a_la_mitad(marcador_truncado, caplog):
+    """Caso 5 de `qa` -- OBLIGATORIO (mejora de `security`, Punto 4, vuelta
+    bloqueante por `qa`): si `num_predict`/un stop-token corta la
+    generación a mitad del marcador, ningún fragmento del marcador parcial
+    debe quedar presente en el resultado."""
+    with caplog.at_level(logging.INFO):
+        resultado = ai_explain._extraer_respuesta_plana(marcador_truncado)
+    assert marcador_truncado not in resultado
+    assert resultado == ""
+    assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
+def test_extraer_respuesta_plana_marcador_truncado_con_texto_despues():
+    """Variante del Caso 5: el corte del marcador no consume texto real que
+    venga después del fragmento parcial."""
+    raw_text = "###RESP Explicación real."
+    resultado = ai_explain._extraer_respuesta_plana(raw_text)
+    assert "###RESP" not in resultado
+    assert resultado == "Explicación real."
+
+
+def test_extraer_respuesta_plana_es_funcion_pura_sin_efectos_colaterales():
+    """Testabilidad de `qa` -- `str -> str`, sin I/O ni estado, misma
+    llamada da siempre el mismo resultado."""
+    raw_text = "###RESPUESTA###\nExplicación real."
+    assert ai_explain._extraer_respuesta_plana(raw_text) == ai_explain._extraer_respuesta_plana(
+        raw_text
+    )
+
+
+# ---------------------------------------------------------------------------
 # G. Llamada a Ollama -- timeout y fallback (`_fetch_explanation`)
 # ---------------------------------------------------------------------------
 
@@ -1033,9 +1135,15 @@ async def test_fetch_explanation_cuerpo_no_json(caplog):
     assert any(r.levelno == logging.INFO for r in caplog.records)
 
 
-async def test_fetch_explanation_json_sin_clave_respuesta(caplog):
+async def test_fetch_explanation_respuesta_vacia_tras_extraccion(caplog):
+    """`SDD_ollama_texto_plano.md`, Decisión #5 -- reemplaza al viejo test
+    de "estructura JSON inesperada": sin `format: json`, el chequeo que
+    reemplaza a la clave `respuesta` ausente es respuesta vacía tras
+    `_extraer_respuesta_plana` (ej. el modelo solo emitió el marcador y
+    cortó ahí, sin texto real después)."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": json.dumps({"otra_clave": "algo"})})
+        return httpx.Response(200, json={"response": "###RESPUESTA###"})
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(ai_explain._ExplainUnavailable):
@@ -1044,8 +1152,9 @@ async def test_fetch_explanation_json_sin_clave_respuesta(caplog):
 
 
 async def test_fetch_explanation_reintenta_una_vez_y_se_recupera(caplog):
-    """Fix 2026-09-03: si la 1a respuesta de Ollama tiene estructura JSON
-    inesperada pero la 2a (reintento) es válida, `_fetch_explanation`
+    """Fix 2026-09-03 (contrato JSON histórico); `SDD_ollama_texto_plano.md`
+    preserva el mecanismo: si la 1a respuesta de Ollama da respuesta vacía
+    tras extracción pero la 2a (reintento) es válida, `_fetch_explanation`
     devuelve la explicación del 2o intento -- no levanta
     `_ExplainUnavailable` -- y loguea el reintento a INFO."""
     call_count = {"n": 0}
@@ -1053,8 +1162,8 @@ async def test_fetch_explanation_reintenta_una_vez_y_se_recupera(caplog):
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return httpx.Response(200, json={"response": "esto no es json"})
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": "Explicación ok."})})
+            return httpx.Response(200, json={"response": "   "})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador("Explicación ok.")})
 
     with caplog.at_level(logging.INFO):
         resultado = await ai_explain._fetch_explanation(
@@ -1067,14 +1176,15 @@ async def test_fetch_explanation_reintenta_una_vez_y_se_recupera(caplog):
 
 
 async def test_fetch_explanation_ambos_intentos_fallan_cae_a_unavailable(caplog):
-    """Fix 2026-09-03: si AMBOS intentos (original + reintento) devuelven
-    estructura JSON inesperada, se hacen exactamente 2 llamadas HTTP y el
-    resultado final sigue siendo `_ExplainUnavailable`."""
+    """Fix 2026-09-03 (contrato JSON histórico); `SDD_ollama_texto_plano.md`
+    preserva el mecanismo: si AMBOS intentos (original + reintento) dan
+    respuesta vacía tras extracción, se hacen exactamente 2 llamadas HTTP y
+    el resultado final sigue siendo `_ExplainUnavailable`."""
     call_count = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
-        return httpx.Response(200, json={"response": "esto no es json"})
+        return httpx.Response(200, json={"response": ""})
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(ai_explain._ExplainUnavailable):
@@ -1094,17 +1204,20 @@ async def test_fetch_explanation_guard_falla_warning():
 
 
 async def test_fetch_explanation_num_predict_y_formato_correctos():
+    """`SDD_ollama_texto_plano.md`, criterio de aceptación -- `"format":
+    "json"` ya NO se manda en el payload de `_fetch_explanation` (a
+    diferencia de `rewrite_parts`, ver Caso 6 en `test_ai_rewrite.py`)."""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": "Corto."})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador("Corto.")})
 
     client = _client_with_handler(handler)
     await ai_explain._fetch_explanation(**_fetch_kwargs(http_client=client))
 
     assert captured["body"]["options"]["num_predict"] == 220
-    assert captured["body"]["format"] == "json"
+    assert "format" not in captured["body"]
     assert captured["body"]["stream"] is False
 
 
@@ -1161,6 +1274,15 @@ def test_respuesta_es_eco_no_da_falso_positivo_en_respuesta_limpia():
     assert ai_explain._respuesta_es_eco_del_payload(respuesta, _DATOS_EVIDENCIA_REAL) is False
 
 
+def test_respuesta_es_eco_senal_2_ampliada_detecta_salto_de_linea_sin_guiones():
+    """Caso 9 de `qa` -- `_ECO_SEPARADOR_RE` ampliada (Decisión #4 de
+    `SDD_ollama_texto_plano.md`): sin envoltura JSON de salida, un eco
+    terminado en "}\\n" (salto de línea, sin "--") también debe detectarse
+    -- la regex vieja NO lo detectaba."""
+    respuesta = '{"otro": "valor"}\nEsto es la explicación real después del salto de línea.'
+    assert ai_explain._respuesta_es_eco_del_payload(respuesta, _DATOS_EVIDENCIA_REAL) is True
+
+
 async def test_fetch_explanation_eco_del_payload_reintenta_y_se_recupera(caplog):
     """1er intento: mismo patrón exacto de la evidencia real (JSON de
     entrada + " -- " + explicación). 2o intento (reintento): respuesta
@@ -1176,8 +1298,8 @@ async def test_fetch_explanation_eco_del_payload_reintenta_y_se_recupera(caplog)
         call_count["n"] += 1
         if call_count["n"] == 1:
             eco = _respuesta_con_eco(_DATOS_EVIDENCIA_REAL, texto_real)
-            return httpx.Response(200, json={"response": json.dumps({"respuesta": eco})})
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+            return httpx.Response(200, json={"response": _texto_plano_con_marcador(eco)})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(texto_real)})
 
     with caplog.at_level(logging.INFO):
         resultado = await ai_explain._fetch_explanation(
@@ -1204,7 +1326,7 @@ async def test_fetch_explanation_eco_del_payload_en_ambos_intentos_cae_a_unavail
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
         eco = _respuesta_con_eco(_DATOS_EVIDENCIA_REAL, texto_real)
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": eco})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(eco)})
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(ai_explain._ExplainUnavailable):
@@ -1226,7 +1348,7 @@ async def test_fetch_explanation_respuesta_limpia_sin_eco_pasa_normal():
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(texto_real)})
 
     resultado = await ai_explain._fetch_explanation(
         **_fetch_kwargs(
@@ -1285,9 +1407,9 @@ async def test_fetch_explanation_portugues_reintenta_y_se_recupera(caplog):
         if call_count["n"] == 1:
             return httpx.Response(
                 200,
-                json={"response": json.dumps({"respuesta": _RESPUESTA_PORTUGUES_EVIDENCIA_REAL})},
+                json={"response": _texto_plano_con_marcador(_RESPUESTA_PORTUGUES_EVIDENCIA_REAL)},
             )
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(texto_real)})
 
     with caplog.at_level(logging.INFO):
         resultado = await ai_explain._fetch_explanation(
@@ -1314,7 +1436,7 @@ async def test_fetch_explanation_portugues_en_ambos_intentos_cae_a_unavailable(c
         call_count["n"] += 1
         return httpx.Response(
             200,
-            json={"response": json.dumps({"respuesta": _RESPUESTA_PORTUGUES_EVIDENCIA_REAL})},
+            json={"response": _texto_plano_con_marcador(_RESPUESTA_PORTUGUES_EVIDENCIA_REAL)},
         )
 
     with caplog.at_level(logging.INFO):
@@ -1341,7 +1463,7 @@ async def test_fetch_explanation_respuesta_limpia_sin_portugues_pasa_normal():
 
     def handler(request: httpx.Request) -> httpx.Response:
         call_count["n"] += 1
-        return httpx.Response(200, json={"response": json.dumps({"respuesta": texto_real})})
+        return httpx.Response(200, json={"response": _texto_plano_con_marcador(texto_real)})
 
     resultado = await ai_explain._fetch_explanation(
         **_fetch_kwargs(
@@ -1890,8 +2012,12 @@ def test_mensajes_no_revelan_infraestructura():
         assert "11434" not in msg
 
 
-def test_system_prompt_explain_pide_json_y_brevedad():
-    assert "{\"respuesta\"" in ai_explain.SYSTEM_PROMPT_EXPLAIN
+def test_system_prompt_explain_pide_texto_plano_con_marcador_y_brevedad():
+    """`SDD_ollama_texto_plano.md` -- el prompt ya no exige el objeto JSON
+    `{"respuesta": "..."}`, pide texto plano anclado con el marcador
+    `###RESPUESTA###`."""
+    assert "{\"respuesta\"" not in ai_explain.SYSTEM_PROMPT_EXPLAIN
+    assert ai_explain._MARCADOR_RESPUESTA in ai_explain.SYSTEM_PROMPT_EXPLAIN
     assert "2 a 4 oraciones" in ai_explain.SYSTEM_PROMPT_EXPLAIN
 
 
@@ -3282,8 +3408,12 @@ async def test_system_prompt_explain_usado_en_narrativa():
     assert captured["body"]["system"] == ai_explain.SYSTEM_PROMPT_EXPLAIN
 
 
-def test_system_prompt_paso_a_paso_pide_json_y_no_recalcular():
-    assert "{\"respuesta\"" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+def test_system_prompt_paso_a_paso_pide_texto_plano_con_marcador_y_no_recalcular():
+    """`SDD_ollama_texto_plano.md` -- mismo ajuste que
+    `SYSTEM_PROMPT_EXPLAIN`: ya no exige `{"respuesta": "..."}`, pide texto
+    plano anclado con `###RESPUESTA###`."""
+    assert "{\"respuesta\"" not in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
+    assert ai_explain._MARCADOR_RESPUESTA in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
     assert "cuenta" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
     assert "YA ESTÁ CALCULADA" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
 

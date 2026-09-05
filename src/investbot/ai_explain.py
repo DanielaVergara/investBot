@@ -259,6 +259,17 @@ _ALL_QUESTIONS_COMBINED: dict[str, ai_explain_content.QuestionSpec] = {
 
 # --- Sanitización de sector/industry (hallazgo 1 BLOQUEANTE de `security`,
 # spec anterior — sin cambios) -----------------------------------------
+#
+# Punto 2 de la revisión de `security` en `SDD_ollama_texto_plano.md`: hoy
+# `datos_del_contexto` no tiene NINGÚN campo de texto libre no sanitizado
+# (todo lo demás son enums cerrados o numéricos) -- por eso la secuencia
+# literal del marcador de extracción (`_MARCADOR_RESPUESTA`,
+# "###RESPUESTA###") no puede colarse hoy vía `sector` ni ningún otro campo.
+# Si en el futuro se agrega un campo de texto libre nuevo (ej. una
+# descripción de FMP sin allowlist) a `datos_del_contexto`, este mismo
+# análisis debe repetirse ANTES de sumarlo al payload: un atacante que
+# controlara ese texto podría anteponer su propio `_MARCADOR_RESPUESTA` para
+# hacer que `_extraer_respuesta_plana` corte donde el atacante eligiera.
 
 _SECTOR_ALLOWLIST = frozenset(
     {
@@ -1896,16 +1907,18 @@ SYSTEM_PROMPT_EXPLAIN = (
     "   inventes, estimes ni completes un dato que no esté ahí.\n"
     "3. Nunca dés una recomendación de compra/venta ni asesoramiento\n"
     "   financiero personalizado — solo explicá qué significa el dato.\n"
-    "4. Respondé ÚNICAMENTE con un objeto JSON de la forma\n"
-    "   {\"respuesta\": \"...\"}, sin texto antes ni después.\n"
+    "4. Empezá tu respuesta completa, sin nada antes, con el texto exacto\n"
+    "   ###RESPUESTA### seguido de un salto de línea, y a continuación tu\n"
+    "   explicación en prosa. No agregues saludos, aclaraciones, ni texto de\n"
+    "   ningún tipo antes de ###RESPUESTA### ni después de terminar tu\n"
+    "   explicación.\n"
     "5. Con tono de análisis de inversionista: si el JSON trae la clave\n"
     "   \"modelo\" o \"modelos\", nombrá ese/esos modelo(s) financiero(s) al\n"
     "   principio de tu respuesta y decí en general qué mide -- sin salirte\n"
     "   de las 2 a 4 oraciones de la regla 1.\n"
     "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
-    "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
-    "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
-    "   de él.\n"
+    "   respuesta — tu respuesta, después de ###RESPUESTA###, es SOLO la\n"
+    "   explicación en prosa, nunca el JSON de entrada ni fragmentos de él.\n"
     "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
     "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
 )
@@ -1935,15 +1948,17 @@ SYSTEM_PROMPT_PASO_A_PASO = (
     "   estimes ni completes un dato que no esté ahí.\n"
     "3. Nunca dés una recomendación de compra/venta ni asesoramiento financiero\n"
     "   personalizado — solo explicá qué significa el resultado.\n"
-    "4. Respondé ÚNICAMENTE con un objeto JSON de la forma\n"
-    "   {\"respuesta\": \"...\"}, sin texto antes ni después.\n"
+    "4. Empezá tu respuesta completa, sin nada antes, con el texto exacto\n"
+    "   ###RESPUESTA### seguido de un salto de línea, y a continuación tu\n"
+    "   explicación en prosa. No agregues saludos, aclaraciones, ni texto de\n"
+    "   ningún tipo antes de ###RESPUESTA### ni después de terminar tu\n"
+    "   explicación.\n"
     "5. Con tono de análisis de inversionista: nombrá el modelo financiero\n"
     "   (\"modelo\"/\"modelos\" en el JSON) al principio de tu respuesta y decí en\n"
     "   general qué mide -- sin salirte de las 2 a 4 oraciones de la regla 1.\n"
     "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
-    "   respuesta — tu respuesta es SOLO el objeto {\"respuesta\": \"...\"}\n"
-    "   con la explicación en prosa, nunca el JSON de entrada ni fragmentos\n"
-    "   de él.\n"
+    "   respuesta — tu respuesta, después de ###RESPUESTA###, es SOLO la\n"
+    "   explicación en prosa, nunca el JSON de entrada ni fragmentos de él.\n"
     "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
     "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
 )
@@ -2028,16 +2043,27 @@ def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
 
 
 # --- Detección de eco del JSON de entrada (incidente de producción
-# 2026-09-03, captura de Daniela): `qwen2.5:3b-instruct` a veces devuelve
+# 2026-09-03, captura de Daniela, con el contrato JSON de salida vigente en
+# ese momento): `qwen2.5:3b-instruct` a veces devolvía
 # `{"respuesta": "<datos_del_contexto repetido> -- <explicación real>"}` --
-# el parseo del contrato `{"respuesta": "..."}` es válido (no dispara
-# `json.JSONDecodeError`/`ValueError`/`KeyError`), pero el CONTENIDO de
-# `respuesta` es el eco del payload que le mandamos, no una explicación.
-# Tratado igual que una estructura JSON inesperada: reintento único, y si
-# el reintento también da el mismo patrón, `_ExplainUnavailable`. -----------
+# el parseo del contrato de esa época era válido, pero el CONTENIDO de
+# `respuesta` era el eco del payload que le mandamos, no una explicación.
+# `SDD_ollama_texto_plano.md` -- esta detección opera igual sobre el texto ya
+# extraído por `_extraer_respuesta_plana`, ahora sin envoltura JSON de salida
+# que nombrar. Tratado igual que respuesta vacía tras extracción: reintento
+# único, y si el reintento también da el mismo patrón, `_ExplainUnavailable`.
+# ---------------------------------------------------------------------------
 
 _ECO_PREFIX_CHARS = 50
-_ECO_SEPARADOR_RE = re.compile(r"\}\s*--\s*")
+# Ampliada (Decisión #4 de `SDD_ollama_texto_plano.md`): sin envoltura JSON de
+# salida, un eco del `prompt` de entrada sigue terminando en "}" (el prompt es
+# JSON y siempre cierra así) pero ya no hay motivo para que el modelo agregue
+# el separador literal "--" -- ese separador era un artefacto de cómo fusionaba
+# el eco con su propia respuesta DENTRO de la sintaxis JSON que antes se le
+# exigía. Se acepta también salto(s) de línea como separador válido (ajuste
+# preventivo, sin evidencia empírica todavía en texto plano -- revisar con
+# logs reales tras el primer despliegue).
+_ECO_SEPARADOR_RE = re.compile(r"\}\s*(--\s*|\n+)")
 
 
 def _normalizar_para_comparar_eco(texto: str) -> str:
@@ -2053,9 +2079,11 @@ def _respuesta_es_eco_del_payload(respuesta: str, datos_del_contexto: dict) -> b
        contexto` serializado (sin espacios) -- comparación real contra lo
        que se envió, no solo "empieza con {" (evita falsos positivos si
        alguna vez una respuesta legítima arrancara con una llave).
-    2. Aparece el separador visto en la evidencia real ("} -- "/"}-- ")
-       cerca del principio de `respuesta`, con contenido real después --
-       señal tolerante para el caso en que el eco no sea 100% textual.
+    2. Aparece el separador visto en la evidencia real ("} -- "/"}-- ") O
+       un salto de línea tras el "}" de cierre del eco (`_ECO_SEPARADOR_RE`,
+       ampliada por `SDD_ollama_texto_plano.md`) cerca del principio de
+       `respuesta`, con contenido real después -- señal tolerante para el
+       caso en que el eco no sea 100% textual.
     """
     texto = respuesta.strip()
     if not texto:
@@ -2126,6 +2154,77 @@ def _respuesta_tiene_portugues(respuesta: str) -> bool:
     return any(patron.search(texto) for patron in _PATRONES_PORTUGUES)
 
 
+# --- Extracción de texto plano (Decisión #2/#3 de `SDD_ollama_texto_plano.md`
+# -- reemplaza el `json.loads` + acceso a la clave "respuesta" del contrato
+# JSON anterior): sin `format: "json"` forzando el primer carácter, Ollama
+# puede anteponer preámbulos -- se reproduce el mismo efecto de ancla con un
+# marcador literal fijo, mucho más simple de reproducir para un modelo 3B que
+# sintaxis JSON válida completa. -------------------------------------------
+
+_MARCADOR_RESPUESTA = "###RESPUESTA###"
+
+# Mejora no bloqueante de `security` (Punto 4), vuelta OBLIGATORIA por `qa`
+# (Caso 5): si `num_predict`/un stop-token corta la generación a mitad del
+# marcador (ej. el modelo emite "###RESP" y se corta ahí sin completar
+# "###RESPUESTA###"), NO se debe dejar que ese fragmento parcial del marcador
+# quede al principio del texto entregado al usuario. Esta regex detecta un
+# prefijo de "#" + letras (con o sin "#" de cierre parcial) al inicio del
+# texto -- solo puede matchear cuando el texto empieza con "#", así que nunca
+# se aplica sobre una respuesta legítima que no intentó reproducir el
+# marcador.
+_MARCADOR_PARCIAL_RE = re.compile(r"^#{1,}[A-ZÁÉÍÓÚÑa-záéíóúñ]*#{0,}\s*")
+
+
+def _extraer_respuesta_plana(raw_text: str) -> str:
+    """Función pura (`str -> str`, sin I/O ni estado): extrae el texto útil
+    de la respuesta cruda de Ollama, tolerante a que el modelo no reproduzca
+    el marcador `_MARCADOR_RESPUESTA` exactamente (mismo principio de
+    degradación con gracia que `_respuesta_es_eco_del_payload`/
+    `_respuesta_tiene_portugues` -- nunca se rechaza la respuesta solo por
+    faltar el marcador).
+
+    3 ramas:
+    1. Marcador completo presente en cualquier posición -> todo lo que sigue
+       a la ÚLTIMA ocurrencia (no la primera). El marcador aparece
+       textualmente dentro de las instrucciones del system prompt
+       (`SYSTEM_PROMPT_EXPLAIN`/`SYSTEM_PROMPT_PASO_A_PASO`, como ejemplo de
+       formato); si el modelo ecoa parte de esas instrucciones antes de
+       responder de verdad (mismo patrón de eco ya documentado para
+       `qwen2.5:3b-instruct`), el texto crudo puede contener el marcador dos
+       veces. Tomar la primera ocurrencia filtraría hacia el usuario el
+       resto de las instrucciones ecoadas + el marcador real mezclados con
+       la respuesta. La última ocurrencia es siempre la que precede a la
+       respuesta real; en el caso normal de una sola ocurrencia, coincide
+       con la primera y no cambia nada.
+    2. Marcador ausente pero el texto empieza con un prefijo parcial de "#"
+       (corte a mitad del marcador, ej. num_predict cortando la generación)
+       -> se descarta ese fragmento parcial antes de devolver el resto,
+       para que nunca se cuele hacia el usuario (Caso 5 obligatorio de `qa`).
+    3. Marcador ausente por completo, sin prefijo de "#" -> se devuelve
+       `raw_text.strip()` completo (degradación con gracia).
+    """
+    if _MARCADOR_RESPUESTA in raw_text:
+        idx = raw_text.rfind(_MARCADOR_RESPUESTA)
+        return raw_text[idx + len(_MARCADOR_RESPUESTA):].strip()
+
+    texto = raw_text.strip()
+    match = _MARCADOR_PARCIAL_RE.match(texto)
+    if match is not None:
+        logger.info(
+            "Respuesta de Ollama con el marcador %s truncado a la mitad -- "
+            "descartando el fragmento parcial",
+            _MARCADOR_RESPUESTA,
+        )
+        return texto[match.end():].strip()
+
+    logger.info(
+        "Respuesta de Ollama sin el marcador %s -- usando el texto completo "
+        "como respuesta (degradación con gracia)",
+        _MARCADOR_RESPUESTA,
+    )
+    return texto
+
+
 class _ExplainUnavailable(Exception):
     """Señal interna -- cualquier fallo de red/estructura/guard converge
     acá y nunca se propaga fuera de `build_explain_handler`."""
@@ -2153,7 +2252,7 @@ async def _fetch_explanation(
         pool=config.timeout_seconds,
     )
 
-    # Reintento único ante estructura JSON inesperada, eco del payload de
+    # Reintento único ante respuesta vacía tras extracción, eco del payload de
     # entrada, mezcla de portugués, O invención de números/tickers no
     # presentes en los datos reales (evidencia de producción 2026-09-03:
     # `qwen2.5:3b-instruct` a veces no respeta el contrato de formato en el
@@ -2166,6 +2265,11 @@ async def _fetch_explanation(
     # 2 intentos en total -- si el segundo también falla (por cualquiera de
     # los 4 motivos, o timeout/conexión), se aplica el comportamiento de
     # siempre (`_ExplainUnavailable`).
+    #
+    # `SDD_ollama_texto_plano.md` -- ya no se exige `"format": "json"`: sin la
+    # grammar constraint, Ollama genera texto libre en prosa (más confiable
+    # para un modelo 3B que JSON estricto), anclado por el marcador
+    # `_MARCADOR_RESPUESTA` que `_extraer_respuesta_plana` reconoce.
     respuesta: Optional[str] = None
     for attempt in range(2):
         try:
@@ -2176,7 +2280,6 @@ async def _fetch_explanation(
                     "system": system_prompt,
                     "prompt": prompt,
                     "stream": False,
-                    "format": "json",
                     "options": {"num_predict": MAX_EXPLANATION_OUTPUT_TOKENS},
                 },
                 timeout=timeout,
@@ -2191,26 +2294,25 @@ async def _fetch_explanation(
             raise _ExplainUnavailable() from exc
 
         try:
-            parsed = json.loads(raw_text)
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("respuesta"), str):
-                raise ValueError("estructura inesperada -- falta la clave 'respuesta' string")
-            respuesta_candidata = parsed["respuesta"]
+            respuesta_candidata = _extraer_respuesta_plana(raw_text)
+            if not respuesta_candidata:
+                raise ValueError("respuesta vacía tras extracción")
             if _respuesta_es_eco_del_payload(respuesta_candidata, datos_del_contexto):
                 raise ValueError("respuesta contiene el eco del JSON de entrada")
             if _respuesta_tiene_portugues(respuesta_candidata):
                 raise ValueError("respuesta mezcla portugués en vez de español")
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             if attempt == 0:
                 logger.info(
-                    "Respuesta de Ollama con estructura JSON inesperada, con eco del "
-                    "JSON de entrada, o mezclando portugués generando explicación (%s) "
+                    "Respuesta de Ollama vacía tras extracción, con eco del JSON de "
+                    "entrada, o mezclando portugués generando explicación (%s) "
                     "— reintentando una vez",
                     type(exc).__name__,
                 )
                 continue
             logger.info(
-                "Respuesta de Ollama con estructura JSON inesperada, con eco del JSON "
-                "de entrada, o mezclando portugués generando explicación tras "
+                "Respuesta de Ollama vacía tras extracción, con eco del JSON de "
+                "entrada, o mezclando portugués generando explicación tras "
                 "reintentar (%s)", type(exc).__name__,
             )
             raise _ExplainUnavailable() from exc
