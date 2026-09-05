@@ -782,7 +782,10 @@ def _build_ver_dato_content(context: ExplanationContext, question_code: str) -> 
 # no calculable para ese ticker), devuelve `None` -- nunca arma un string
 # con "None" visible.
 
-_MAX_CUENTA_CHARS = 400
+_MAX_CUENTA_CHARS = 800  # antes 400 -- todas las Cuentas de dato_y_paso_a_paso son narración en
+                          # prosa después de SDD_cuenta_narrada_universal.md (peor caso medido: 671,
+                          # margen ~19%), salvo "vf" (fórmula corta, muy por debajo). Reemplaza a
+                          # `_MAX_CUENTA_NARRADA_CHARS`, que se retira (dejó de ser una excepción).
 
 
 def _money(x: float) -> str:
@@ -797,18 +800,19 @@ def _pct1(x: float) -> str:
     return f"{x * 100:.1f}%"
 
 
-def _enforce_cuenta_length(cuenta: str) -> Optional[str]:
-    """`_MAX_CUENTA_CHARS=400` (Decisión de diseño #8). Mejora recomendada
-    (c) de `security`: a diferencia de la prosa de Ollama, la "cuenta" es
-    aritmética -- cortarla a mitad de un número mostraría un resultado
-    incompleto y potencialmente engañoso. Si el límite se excede (no debería
-    pasar con tickers reales, margen 2.5x sobre el caso más largo conocido),
-    se omite el bloque completo (mismo tratamiento que "no calculable") en
-    vez de truncar un número a la mitad."""
-    if len(cuenta) > _MAX_CUENTA_CHARS:
+def _enforce_cuenta_length(cuenta: str, max_chars: int = _MAX_CUENTA_CHARS) -> Optional[str]:
+    """`_MAX_CUENTA_CHARS=800` (Decisión de diseño #8, retomada como tope
+    único por SDD_cuenta_narrada_universal.md Decisión #4). Mejora
+    recomendada (c) de `security`: a diferencia de la prosa de Ollama, la
+    "cuenta" es aritmética -- cortarla a mitad de un número mostraría un
+    resultado incompleto y potencialmente engañoso. Si el límite se excede
+    (no debería pasar con tickers reales, peor caso medido 671, margen
+    ~19%), se omite el bloque completo (mismo tratamiento que "no
+    calculable") en vez de truncar un número a la mitad."""
+    if len(cuenta) > max_chars:
         logger.warning(
-            "Cuenta de %d caracteres excede _MAX_CUENTA_CHARS=%d -- bloque omitido",
-            len(cuenta), _MAX_CUENTA_CHARS,
+            "Cuenta de %d caracteres excede max_chars=%d -- bloque omitido",
+            len(cuenta), max_chars,
         )
         return None
     return cuenta
@@ -1183,7 +1187,7 @@ def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optiona
         code = _VF_SUB_MODELO_CODE[t.letra]
         try:
             datos_sub = _payload_texto_libre(context, code)
-            cuenta_sub = _CUENTA_TEXTO_LIBRE[code](datos_sub)
+            cuenta_sub = _VF_SUB_MODELO_CUENTA[code](datos_sub)
         except Exception:  # noqa: BLE001 -- misma red de seguridad que _build_cuenta_line
             cuenta_sub = None
         if cuenta_sub is None:
@@ -1202,11 +1206,22 @@ def _cuenta_ver(datos: dict) -> Optional[str]:
     precio = datos.get("precio_actual")
     total = datos.get("valor_justo_total")
     veredicto = datos.get("veredicto_barata")
-    if precio is None or total is None or veredicto is None:
+    precio_ok, total_ok = precio is not None, total is not None
+    if not precio_ok and not total_ok:
         return None
-    op = "<" if veredicto else ">"
-    etiqueta = "Barata" if veredicto else "Cara"
-    return f"Precio actual {_money(precio)} {op} Valor Justo Total {_money(total)} → {etiqueta}"
+    precio_txt = _money(precio) if precio_ok else "no disponible"
+    total_txt = _money(total) if total_ok else "no disponible"
+    if precio_ok and total_ok and veredicto is not None:
+        op = "<" if veredicto else ">"
+        etiqueta = "Barata" if veredicto else "Cara"
+        resultado = f"Precio actual {precio_txt} {op} Valor Justo Total {total_txt} → {etiqueta}"
+    else:
+        resultado = "no se puede calcular sin el dato faltante"
+    return (
+        f"Para saber si esta acción está barata o cara, el modelo hace 1 paso: "
+        f"compara el precio de hoy contra el Valor Justo Total que combina los 3 "
+        f"modelos (Múltiplos, Graham y DCF) — {resultado}."
+    )
 
 
 def _cuenta_vf(datos: dict) -> Optional[str]:
@@ -1230,18 +1245,80 @@ def _valor_escenario_elegido(datos: dict) -> Optional[float]:
 
 
 def _cuenta_gra(datos: dict) -> Optional[str]:
+    """Narración completa de 3 pasos con "dato faltante por paso"
+    (SDD_cuenta_narrada_universal.md, retrofit de Decisión #2/#3 Grupo C --
+    reemplaza el todo-o-nada de SDD_cuenta_narrada_graham_dcf.md). El "techo
+    del 15%" está escrito como texto fijo (no `valuation.GRAHAM_G_CAP * 100`):
+    si esa constante cambia de valor en `valuation.py`, este texto debe
+    actualizarse junto con ella."""
     eps, g, y = datos.get("eps_ttm"), datos.get("g_aplicado"), datos.get("y_value")
-    valor = _valor_escenario_elegido(datos)
-    if None in (eps, g, y, valor) or y == 0:
+    eps_ok, g_ok, y_ok = eps is not None, g is not None, (y is not None and y != 0)
+    if not any((eps_ok, g_ok, y_ok)):
         return None
-    g_pct, y_pct = g * 100, y * 100
+    valor = _valor_escenario_elegido(datos) if (eps_ok and g_ok and y_ok) else None
+    eps_txt = _money(eps) if eps_ok else "no disponible"
+    g_txt = f"{g * 100:.1f}%" if g_ok else "no disponible"
+    y_txt = f"{y * 100:.1f}%" if y_ok else "no disponible"
+    resultado = _money(valor) if valor is not None else "no se puede calcular sin el dato faltante"
     return (
-        f"{_money(eps)} × (8.5 + 2×{g_pct:.1f}) × {valuation.GRAHAM_HISTORICAL_YIELD:.1f} "
-        f"/ {y_pct:.1f} = {_money(valor)}"
+        f"Para saber cuánto vale la acción según este modelo clásico, el cálculo sigue 3 pasos: "
+        f"1) toma cuánto ganó la empresa por acción en el último año ({eps_txt} de EPS), "
+        f"2) proyecta cuánto puede crecer esa ganancia a futuro usando el crecimiento histórico "
+        f"de sus ganancias, con un techo del 15% para no ser demasiado optimista (en este caso, "
+        f"{g_txt}), y 3) multiplica todo por un factor fijo de la fórmula (8.5 + "
+        f"2×crecimiento) y lo divide entre la tasa del bono del Tesoro a 10 años ({y_txt}) "
+        f"— cuanto más alta esa tasa \"sin riesgo\", menor el valor justo, porque hay una "
+        f"alternativa más segura disponible. El resultado: {resultado} por acción."
+    )
+
+
+def _cuenta_gra_corta(datos: dict) -> Optional[str]:
+    """Versión corta con flechas, usada solo dentro de "vf" -- mismo
+    retrofit de 3 reglas que `_cuenta_gra` (Decisión #6), impacto de
+    presupuesto despreciable en "vf" (ya verificado por `architect`)."""
+    eps, g, y = datos.get("eps_ttm"), datos.get("g_aplicado"), datos.get("y_value")
+    eps_ok, g_ok, y_ok = eps is not None, g is not None, (y is not None and y != 0)
+    if not any((eps_ok, g_ok, y_ok)):
+        return None
+    valor = _valor_escenario_elegido(datos) if (eps_ok and g_ok and y_ok) else None
+    eps_txt = _money(eps) if eps_ok else "no disp."
+    g_txt = f"{g * 100:.1f}%" if g_ok else "no disp."
+    y_txt = f"{y * 100:.1f}%" if y_ok else "no disp."
+    resultado = _money(valor) if valor is not None else "no calculable"
+    return (
+        f"EPS {eps_txt} → se proyecta con {g_txt} de crecimiento (techo 15%) → se "
+        f"multiplica por 8.5+2×crecimiento y se ajusta por la tasa del bono a 10 años "
+        f"({y_txt}, a mayor tasa, menor valor) = {resultado}."
     )
 
 
 def _cuenta_mul(datos: dict) -> Optional[str]:
+    """Narración completa de 2 pasos con "dato faltante por paso"
+    (SDD_cuenta_narrada_universal.md, Decisión #3 Grupo B) -- reemplaza la
+    fórmula comprimida de 1 línea que tenía hoy. La versión comprimida se
+    conserva sin cambios en `_cuenta_mul_corta`, para el anidado en "vf"."""
+    eps, per = datos.get("eps_ttm"), datos.get("per_promedio_peers")
+    eps_ok, per_ok = eps is not None, per is not None
+    if not eps_ok and not per_ok:
+        return None
+    valor = _valor_escenario_elegido(datos)
+    p1 = _money(eps) if eps_ok else "dato de EPS no disponible"
+    p2 = _ratio2(per) if per_ok else "dato de PER promedio de comparables no disponible"
+    resultado = _money(valor) if (eps_ok and per_ok and valor is not None) else "no se puede calcular sin el dato faltante"
+    return (
+        f"Para estimar el valor por este método, el modelo hace 2 pasos: "
+        f"1) toma cuánto ganó la empresa por acción en el último año ({p1}), "
+        f"y 2) lo multiplica por el PER promedio de empresas parecidas del mismo sector "
+        f"({p2}) — así estima cuánto debería valer la acción si cotizara a un múltiplo "
+        f"similar al de sus comparables. El resultado: {resultado} por acción."
+    )
+
+
+def _cuenta_mul_corta(datos: dict) -> Optional[str]:
+    """Versión corta -- misma fórmula comprimida que `_cuenta_mul` tenía HOY,
+    conservada tal cual para el anidado en "vf" (mismo criterio que
+    `_cuenta_gra_corta`/`_cuenta_dcf_corta`: la narración completa nueva es
+    demasiado larga para el presupuesto de `_MAX_DESGLOSE_CHARS=1200`)."""
     eps, per = datos.get("eps_ttm"), datos.get("per_promedio_peers")
     valor = _valor_escenario_elegido(datos)
     if None in (eps, per, valor):
@@ -1250,45 +1327,89 @@ def _cuenta_mul(datos: dict) -> Optional[str]:
 
 
 def _cuenta_dcf(datos: dict) -> Optional[str]:
+    """Narración completa de 4 pasos con "dato faltante por paso"
+    (SDD_cuenta_narrada_universal.md, retrofit de Decisión #2/#3 Grupo D).
+    `vp_flujos`/`vt_desc`/`equity` son resultados intermedios sin "paso
+    texto" propio (ver Nota de diseño de la spec) -- solo participan de la
+    guarda del resultado final."""
     wacc = datos.get("dcf_wacc")
     g = datos.get("dcf_g_fcf")
     base = datos.get("dcf_fcf_base")
     vp_flujos = datos.get("dcf_valor_presente_flujos")
     vt_desc = datos.get("dcf_valor_terminal_descontado")
     equity = datos.get("dcf_equity_value")
-    valor_accion = _valor_escenario_elegido(datos)
-    if None in (wacc, g, base, vp_flujos, vt_desc, equity, valor_accion):
+    base_ok, g_ok, wacc_ok = base is not None, g is not None, wacc is not None
+    vp_ok, vt_ok, eq_ok = vp_flujos is not None, vt_desc is not None, equity is not None
+    if not any((base_ok, g_ok, wacc_ok, vp_ok, vt_ok, eq_ok)):
         return None
+    todos_ok = base_ok and g_ok and wacc_ok and vp_ok and vt_ok and eq_ok
+    valor_accion = _valor_escenario_elegido(datos) if todos_ok else None
     years = valuation.DCF_PROJECTION_YEARS
-    fcf_year5 = base * (1 + g) ** years
+    base_txt = _money(base) if base_ok else "no disponible"
+    g_txt = f"{g * 100:.1f}%" if g_ok else "no disponible"
+    wacc_txt = f"{wacc * 100:.1f}%" if wacc_ok else "no disponible"
+    resultado = _money(valor_accion) if valor_accion is not None else "no se puede calcular sin el dato faltante"
     return (
-        f"FCF base {_money(base)}, crece a g={g * 100:.1f}% anual (WACC={wacc * 100:.1f}%) → "
-        f"FCF proyectado año {years} ≈ {_money(fcf_year5)}. Flujos descontados a valor "
-        f"presente ≈ {_money(vp_flujos)} + valor terminal descontado ≈ {_money(vt_desc)} = "
-        f"valor de la empresa ≈ {_money(equity)} → {_money(valor_accion)} por acción."
+        f"Para saber cuánto vale la empresa hoy, el modelo hace 4 pasos: 1) toma cuánto efectivo "
+        f"libre genera HOY el negocio ({base_txt}), 2) asume que va a crecer {g_txt} "
+        f"por año durante {years} años, 3) \"trae\" cada uno de esos años futuros a su valor de "
+        f"HOY (porque un peso dentro de {years} años vale menos que uno hoy — se descuenta al "
+        f"{wacc_txt}, el costo de capital), y 4) le suma un \"valor terminal\" (lo que "
+        f"vale seguir generando plata para siempre después del año {years}). Todo eso sumado y "
+        f"dividido entre las acciones da {resultado} por acción."
+    )
+
+
+def _cuenta_dcf_corta(datos: dict) -> Optional[str]:
+    """Versión corta con flechas, usada solo dentro de "vf" -- mismo
+    retrofit de 3 reglas que `_cuenta_dcf` (Decisión #6)."""
+    wacc = datos.get("dcf_wacc")
+    g = datos.get("dcf_g_fcf")
+    base = datos.get("dcf_fcf_base")
+    vp_flujos = datos.get("dcf_valor_presente_flujos")
+    vt_desc = datos.get("dcf_valor_terminal_descontado")
+    equity = datos.get("dcf_equity_value")
+    base_ok, g_ok, wacc_ok = base is not None, g is not None, wacc is not None
+    vp_ok, vt_ok, eq_ok = vp_flujos is not None, vt_desc is not None, equity is not None
+    if not any((base_ok, g_ok, wacc_ok, vp_ok, vt_ok, eq_ok)):
+        return None
+    todos_ok = base_ok and g_ok and wacc_ok and vp_ok and vt_ok and eq_ok
+    valor_accion = _valor_escenario_elegido(datos) if todos_ok else None
+    years = valuation.DCF_PROJECTION_YEARS
+    base_txt = _money(base) if base_ok else "no disp."
+    g_txt = f"{g * 100:.1f}%" if g_ok else "no disp."
+    wacc_txt = f"{wacc * 100:.1f}%" if wacc_ok else "no disp."
+    resultado = _money(valor_accion) if valor_accion is not None else "no calculable"
+    return (
+        f"FCF hoy {base_txt} → crece {g_txt}/año durante {years} años → se descuentan "
+        f"esos flujos futuros a valor de hoy al {wacc_txt} (costo de capital) → se suma el "
+        f"valor de seguir generando caja después del año {years} = {resultado} por "
+        f"acción."
     )
 
 
 def _cuenta_rat(datos: dict) -> Optional[str]:
-    piezas = []
     ca, cl = datos.get("current_assets"), datos.get("current_liabilities")
-    if ca is not None and cl and datos.get("ratio_liquidez") is not None:
-        piezas.append(f"Liquidez = {_money(ca)} / {_money(cl)} = {_ratio2(datos['ratio_liquidez'])}")
+    liq_ok = ca is not None and cl and datos.get("ratio_liquidez") is not None
     rev, cor = datos.get("revenue"), datos.get("cost_of_revenue")
-    if rev and cor is not None and datos.get("margen_bruto") is not None:
-        piezas.append(
-            f"Margen bruto = ({_money(rev)} − {_money(cor)}) / {_money(rev)} = {_pct1(datos['margen_bruto'])}"
-        )
+    mb_ok = rev and cor is not None and datos.get("margen_bruto") is not None
     precio, eps = datos.get("precio_actual"), datos.get("eps_ttm")
-    if (
-        precio is not None and eps and datos.get("per") is not None
-        and not datos.get("per_no_aplicable")
-    ):
-        piezas.append(f"PER = {_money(precio)} / {_money(eps)} = {_ratio2(datos['per'])}")
+    per_ok = precio is not None and eps and datos.get("per") is not None and not datos.get("per_no_aplicable")
     mc = datos.get("market_cap")
-    if mc is not None and rev and datos.get("ps") is not None:
-        piezas.append(f"P/S = {_money(mc)} / {_money(rev)} = {_ratio2(datos['ps'])}")
-    return " · ".join(piezas) if piezas else None
+    ps_ok = mc is not None and rev and datos.get("ps") is not None
+    if not any((liq_ok, mb_ok, per_ok, ps_ok)):
+        return None
+    liq_txt = f"{_money(ca)} entre {_money(cl)} = {_ratio2(datos['ratio_liquidez'])}" if liq_ok else "no disponible (falta activo o pasivo corriente)"
+    mb_txt = f"({_money(rev)} − {_money(cor)}) sobre {_money(rev)} = {_pct1(datos['margen_bruto'])}" if mb_ok else "no disponible (falta ventas o costo de ventas)"
+    per_txt = f"{_money(precio)} entre {_money(eps)} = {_ratio2(datos['per'])}" if per_ok else "no disponible o no aplica (empresa con pérdidas)"
+    ps_txt = f"{_money(mc)} entre {_money(rev)} = {_ratio2(datos['ps'])}" if ps_ok else "no disponible (falta capitalización o ventas)"
+    return (
+        f"El modelo calcula hasta 4 ratios clave, cada uno con sus propios datos: "
+        f"1) Liquidez corriente (activo corriente / pasivo corriente): {liq_txt}, "
+        f"2) Margen bruto ((ventas − costo de ventas) / ventas): {mb_txt}, "
+        f"3) PER (precio / ganancia por acción): {per_txt}, "
+        f"4) P/S (capitalización / ventas): {ps_txt}."
+    )
 
 
 def _cuenta_pil(datos: dict) -> Optional[str]:
@@ -1296,45 +1417,54 @@ def _cuenta_pil(datos: dict) -> Optional[str]:
     rev_r, rev_a = datos.get("revenue_reciente"), datos.get("revenue_antiguo")
     ni_r, ni_a = datos.get("net_income_reciente"), datos.get("net_income_antiguo")
     ratio_liq = datos.get("ratio_liquidez")
-    ingresos_crecientes = pillars.get("ingresos_crecientes")
-    if None in (rev_r, rev_a, ni_r, ni_a, ratio_liq) or ingresos_crecientes is None:
+    ing_ok = rev_r is not None and rev_a is not None and pillars.get("ingresos_crecientes") is not None
+    util_ok = ni_r is not None and ni_a is not None and pillars.get("utilidades_crecientes") is not None
+    deuda_ok = ratio_liq is not None and pillars.get("deuda_controlada") is not None
+    precio_ok = pillars.get("precio_razonable") is not None
+    if not any((ing_ok, util_ok, deuda_ok, precio_ok)):
         return None
-    ing_txt = "creciente" if pillars.get("ingresos_crecientes") else "no creciente"
-    util_txt = "creciente" if pillars.get("utilidades_crecientes") else "no creciente"
-    deuda_txt = "controlada" if pillars.get("deuda_controlada") else "no controlada"
-    precio_txt = "razonable" if pillars.get("precio_razonable") else "no razonable"
+    ing_txt = f"{_money(rev_r)} vs. {_money(rev_a)} → {'creciente' if pillars['ingresos_crecientes'] else 'no creciente'}" if ing_ok else "no disponible (falta historial de ventas)"
+    util_txt = f"{_money(ni_r)} vs. {_money(ni_a)} → {'creciente' if pillars['utilidades_crecientes'] else 'no creciente'}" if util_ok else "no disponible (falta historial de utilidades)"
+    deuda_txt = f"liquidez {_ratio2(ratio_liq)} → {'controlada' if pillars['deuda_controlada'] else 'no controlada'}" if deuda_ok else "no disponible (falta liquidez)"
+    precio_txt = ("✅ razonable" if pillars["precio_razonable"] else "❌ no razonable") if precio_ok else "no disponible (falta Valor Justo Total)"
     return (
-        f"Ingresos: {_money(rev_r)} > {_money(rev_a)} → {ing_txt} · "
-        f"Utilidades: {_money(ni_r)} > 0 y > {_money(ni_a)} → {util_txt} · "
-        f"Deuda: liquidez {_ratio2(ratio_liq)} > 1 → {deuda_txt} · "
-        f"Precio: → {precio_txt}"
+        f"El modelo evalúa 4 pilares de calidad, cada uno como sí/no: "
+        f"1) ¿Ingresos crecientes? compara ventas recientes contra las más antiguas del historial: {ing_txt}. "
+        f"2) ¿Utilidades crecientes? compara utilidad reciente contra la más antigua: {util_txt}. "
+        f"3) ¿Deuda controlada? compara activo corriente contra pasivo corriente: {deuda_txt}. "
+        f"4) ¿Precio razonable? compara el precio de hoy contra el Valor Justo Total: {precio_txt}."
     )
 
 
-def _cuenta_beta_bucket(beta: Optional[float], bajo: float, alto: float, etiqueta_medio: str) -> Optional[str]:
-    if beta is None:
-        return None
+def _perfil_sugerido(beta: float, bajo: float, alto: float) -> str:
+    """Perfil de riesgo IMPLICADO por la Beta de la acción (comparado contra
+    los umbrales), no el perfil que el usuario eligió con `/start` -- mismo
+    criterio que ya usaba `_cuenta_rsk` antes de esta spec, factorizado en un
+    helper compartido con la narración nueva."""
     if beta < bajo:
-        rango = f"< {_ratio2(bajo)}"
-    elif beta > alto:
-        rango = f"> {_ratio2(alto)}"
-    else:
-        rango = f"entre {_ratio2(bajo)} y {_ratio2(alto)}"
-    return f"Beta {_ratio2(beta)} está {rango} → {etiqueta_medio}"
+        return "Muy Conservador / Conservador"
+    if beta > alto:
+        return "Agresivo"
+    return "Moderado"
 
 
 def _cuenta_rsk(datos: dict) -> Optional[str]:
     beta = datos.get("beta")
     bajo, alto = datos.get("beta_umbral_bajo"), datos.get("beta_umbral_alto")
-    if beta is None or bajo is None or alto is None:
+    if beta is None and (bajo is None or alto is None):
         return None
-    if beta < bajo:
-        implied = "Muy Conservador / Conservador"
-    elif beta > alto:
-        implied = "Agresivo"
-    else:
-        implied = "Moderado"
-    return _cuenta_beta_bucket(beta, bajo, alto, f"perfil {implied}")
+    beta_txt = (
+        f"{_ratio2(beta)}, que está {'por debajo de' if bajo is not None and beta < bajo else ('por encima de' if alto is not None and beta > alto else 'entre')} "
+        f"{_ratio2(bajo) if bajo is not None else '?'} y {_ratio2(alto) if alto is not None else '?'}"
+        if beta is not None and bajo is not None and alto is not None else "no disponible"
+    )
+    perfil = _perfil_sugerido(beta, bajo, alto) if beta is not None and bajo is not None and alto is not None else "no se puede calcular sin el dato faltante"
+    return (
+        f"Para saber si el riesgo de esta acción encaja con tu perfil, el modelo hace 2 pasos: "
+        f"1) mide qué tan volátil es la acción comparada con el mercado en general (su Beta: {beta_txt}), "
+        f"y 2) compara ese número contra los umbrales de tu perfil de riesgo elegido con /start "
+        f"→ perfil sugerido: {perfil}."
+    )
 
 
 def _cuenta_mom(datos: dict) -> Optional[str]:
@@ -1345,26 +1475,47 @@ def _cuenta_mom(datos: dict) -> Optional[str]:
         ("promedio 50d", datos.get("price_avg_50"), datos.get("pct_vs_avg_50")),
         ("promedio 200d", datos.get("price_avg_200"), datos.get("pct_vs_avg_200")),
     )
+    ok_flags = [precio is not None and ref_val is not None and pct_val is not None for _, ref_val, pct_val in refs]
+    if not any(ok_flags):
+        return None
     piezas = []
-    for label, ref_val, pct_val in refs:
-        if precio is None or ref_val is None or pct_val is None:
-            continue
-        piezas.append(
-            f"({_money(precio)} − {_money(ref_val)}) / {_money(ref_val)} × 100 = {pct_val:.1f}% vs. {label}"
-        )
-    return " · ".join(piezas) if piezas else None
+    for (label, ref_val, pct_val), ok in zip(refs, ok_flags):
+        if ok:
+            piezas.append(
+                f"({_money(precio)} − {_money(ref_val)}) / {_money(ref_val)} × 100 = {pct_val:.1f}% vs. {label}"
+            )
+        else:
+            piezas.append(f"vs. {label}: no disponible")
+    return (
+        f"El modelo compara el precio actual contra 4 referencias, cada una con sus propios datos: "
+        + " · ".join(piezas) + "."
+    )
 
 
 def _cuenta_cmp(datos: dict) -> Optional[str]:
     precio, eps = datos.get("precio_actual"), datos.get("eps_ttm")
-    per_propio = datos.get("per_propio")
-    per_prom = datos.get("per_promedio_peers")
-    if precio is None or not eps or per_propio is None:
+    per_propio, per_prom = datos.get("per_propio"), datos.get("per_promedio_peers")
+    propio_ok = precio is not None and eps and per_propio is not None
+    prom_ok = per_prom is not None
+    if not propio_ok and not prom_ok:
         return None
-    piezas = [f"PER propio = {_money(precio)} / {_money(eps)} = {_ratio2(per_propio)}"]
-    if per_prom is not None:
-        piezas.append(f"PER promedio peers = {_ratio2(per_prom)}")
-    return " — ".join(piezas)
+    propio_txt = f"{_money(precio)} entre {_money(eps)} = {_ratio2(per_propio)}" if propio_ok else "no disponible (falta precio o EPS)"
+    prom_txt = _ratio2(per_prom) if prom_ok else "no disponible (sin comparables con datos suficientes)"
+    return (
+        f"Para comparar esta acción con su sector, el modelo hace 2 pasos: "
+        f"1) calcula el PER propio de la empresa (precio / ganancia por acción): {propio_txt}, "
+        f"y 2) lo compara contra el PER promedio de empresas parecidas del mismo sector: {prom_txt}."
+    )
+
+
+# Dedicado a la versión anidada dentro de "vf" (SDD_cuenta_narrada_graham_
+# dcf.md, Decisión #4) -- reusa `_cuenta_mul` tal cual, pero usa las
+# versiones CORTAS de Graham/DCF (nunca la narración completa del botón
+# individual) para que el bloque "🔍 Desglose:" de "vf" no exceda
+# `_MAX_DESGLOSE_CHARS=1200`. `_CUENTA_TEXTO_LIBRE` (usado por el botón
+# individual vía `_build_cuenta_line`) sigue apuntando a las versiones
+# completas, sin cambios.
+_VF_SUB_MODELO_CUENTA = {"mul": _cuenta_mul_corta, "gra": _cuenta_gra_corta, "dcf": _cuenta_dcf_corta}
 
 
 _CUENTA_TEXTO_LIBRE = {
@@ -1378,13 +1529,25 @@ def _cuenta_alz(datos: dict) -> Optional[str]:
     altman = datos.get("altman") or {}
     if not altman.get("disponible"):
         return None
-    a, b, c, d, e, z = (altman.get(k) for k in ("a", "b", "c", "d", "e", "z"))
-    if None in (a, b, c, d, e, z):
+    a, b, c, d, e = (altman.get(k) for k in ("a", "b", "c", "d", "e"))
+    labels_pesos = [
+        ("Capital de Trabajo sobre Activos", a, 1.2),
+        ("Utilidades Retenidas sobre Activos", b, 1.4),
+        ("EBIT sobre Activos", c, 3.3),
+        ("Capitalización de Mercado sobre Deuda", d, 0.6),
+        ("Rotación de Activos (Ventas sobre Activos)", e, 1.0),
+    ]
+    if not any(v is not None for _, v, _ in labels_pesos):
         return None
-    t1, t2, t3, t4, t5 = 1.2 * a, 1.4 * b, 3.3 * c, 0.6 * d, 1.0 * e
+    piezas = []
+    for i, (label, val, peso) in enumerate(labels_pesos, start=1):
+        piezas.append(f"{i}) {label} = {_ratio2(val)}, ×{peso} = {_ratio2(val * peso)}" if val is not None else f"{i}) {label}: no disponible")
+    todos_ok = all(v is not None for _, v, _ in labels_pesos)
+    z = altman.get("z")
+    resultado = f"Z = {_ratio2(z)}" if todos_ok and z is not None else "Z no se puede calcular sin el dato faltante"
     return (
-        f"Z = 1.2×{_ratio2(a)} + 1.4×{_ratio2(b)} + 3.3×{_ratio2(c)} + 0.6×{_ratio2(d)} + 1.0×{_ratio2(e)} = "
-        f"{_ratio2(t1)} + {_ratio2(t2)} + {_ratio2(t3)} + {_ratio2(t4)} + {_ratio2(t5)} = {_ratio2(z)}"
+        f"El Altman Z-Score suma 5 factores financieros, cada uno multiplicado por un peso fijo "
+        f"de la fórmula: " + ", ".join(piezas) + f". Sumando los 5 términos → {resultado}."
     )
 
 
@@ -1392,22 +1555,44 @@ def _cuenta_azp(datos: dict) -> Optional[str]:
     altman_pp = datos.get("altman_pp") or {}
     if not altman_pp.get("disponible"):
         return None
-    a, b, c, d, z = (altman_pp.get(k) for k in ("a", "b", "c", "d", "z"))
-    if None in (a, b, c, d, z):
+    a, b, c, d = (altman_pp.get(k) for k in ("a", "b", "c", "d"))
+    labels_pesos = [
+        ("Capital de Trabajo sobre Activos", a, 6.56),
+        ("Utilidades Retenidas sobre Activos", b, 3.26),
+        ("EBIT sobre Activos", c, 6.72),
+        ("Capitalización de Mercado sobre Deuda", d, 1.05),
+    ]
+    if not any(v is not None for _, v, _ in labels_pesos):
         return None
-    t1, t2, t3, t4 = 6.56 * a, 3.26 * b, 6.72 * c, 1.05 * d
+    piezas = []
+    for i, (label, val, peso) in enumerate(labels_pesos, start=1):
+        piezas.append(f"{i}) {label} = {_ratio2(val)}, ×{peso} = {_ratio2(val * peso)}" if val is not None else f"{i}) {label}: no disponible")
+    todos_ok = all(v is not None for _, v, _ in labels_pesos)
+    z = altman_pp.get("z")
+    resultado = f"Z'' = {_ratio2(z)}" if todos_ok and z is not None else "Z'' no se puede calcular sin el dato faltante"
     return (
-        f"Z'' = 6.56×{_ratio2(a)} + 3.26×{_ratio2(b)} + 6.72×{_ratio2(c)} + 1.05×{_ratio2(d)} = "
-        f"{_ratio2(t1)} + {_ratio2(t2)} + {_ratio2(t3)} + {_ratio2(t4)} = {_ratio2(z)}"
+        f"El Altman Z'' (variante asset-light) suma 4 factores financieros, cada uno multiplicado por un "
+        f"peso fijo de la fórmula: " + ", ".join(piezas) + f". Sumando los 4 términos → {resultado}."
     )
 
 
 def _cuenta_pig(datos: dict) -> Optional[str]:
+    """`pig` (Grupo G) NO recibe el mecanismo de "dato faltante por paso" --
+    decisión explícita de `architect`: es un conteo de criterios ya evaluados
+    por `pir`/`pia`/`pie` (1 solo par de números que `advanced_scoring.py` ya
+    calcula completo o no calcula), no una secuencia de pasos aritméticos con
+    términos que puedan faltar por separado. Sigue con guarda todo-o-nada."""
     piotroski = datos.get("piotroski") or {}
     puntaje, evaluables = piotroski.get("puntaje"), piotroski.get("criterios_evaluables")
     if puntaje is None or not evaluables:
         return None
-    return f"{puntaje} de {evaluables} criterios evaluables cumplidos"
+    return (
+        f"El F-Score de Piotroski suma 1 punto por cada criterio de calidad contable que la "
+        f"empresa cumple, evaluados en 3 grupos (rentabilidad, apalancamiento y liquidez, "
+        f"eficiencia operativa) — de los {evaluables} criterios que se pudieron evaluar con los "
+        f"datos disponibles de este ticker, cumplió {puntaje}. Cuantos más cumple, más sólida es "
+        f"su calidad contable."
+    )
 
 
 _PIOTROSKI_CUENTA_LABEL = {
@@ -1424,15 +1609,20 @@ _PIOTROSKI_CUENTA_LABEL = {
 
 
 def _fmt_criterio_piotroski(criterio: dict) -> Optional[str]:
+    """Retrofit `SDD_cuenta_narrada_universal.md`: un criterio con
+    `cumplido is None`/`valores` vacío ya NO se descarta en silencio -- dice
+    explícitamente "dato no disponible" (aparece en la lista unida por
+    `_cuenta_piotroski_grupo`). Solo se sigue descartando (`None`) el caso de
+    `nombre` desconocido -- eso es un bug de datos, no "falta info del
+    ticker", y no tiene `label` para narrar."""
     nombre = criterio.get("nombre")
-    cumplido = criterio.get("cumplido")
-    valores = criterio.get("valores")
-    if cumplido is None or not valores:
-        return None
-    etiqueta = "cumplido" if cumplido else "no cumplido"
     label = _PIOTROSKI_CUENTA_LABEL.get(nombre)
     if label is None:
-        return None
+        return None  # nombre desconocido -- bug de datos, se sigue descartando
+    cumplido, valores = criterio.get("cumplido"), criterio.get("valores")
+    if cumplido is None or not valores:
+        return f"{label}: dato no disponible"
+    etiqueta = "cumplido" if cumplido else "no cumplido"
     if nombre == "roa_positivo":
         v = valores.get("net_income_t")
         return None if v is None else f"{label}: {_money(v)} > 0 → {etiqueta}"
@@ -1486,23 +1676,43 @@ def _cuenta_piotroski_grupo(datos: dict) -> Optional[str]:
 def _cuenta_mgr(datos: dict) -> Optional[str]:
     if not datos.get("disponible"):
         return None
-    ebit, ci, roic = datos.get("ebit"), datos.get("capital_invertido"), datos.get("roic")
-    if None in (ebit, ci, roic) or not ci:
+    ebit, ci = datos.get("ebit"), datos.get("capital_invertido")
+    ebit_ok, ci_ok = ebit is not None, ci is not None and ci != 0
+    if not ebit_ok and not ci_ok:
         return None
-    return f"ROIC = {_money(ebit)} / {_money(ci)} = {_ratio2(roic)} = {_pct1(roic)}"
+    roic = datos.get("roic")
+    ebit_txt = _money(ebit) if ebit_ok else "no disponible"
+    ci_txt = _money(ci) if ci_ok else "no disponible"
+    resultado = f"{_ratio2(roic)} = {_pct1(roic)}" if (ebit_ok and ci_ok and roic is not None) else "no se puede calcular sin el dato faltante"
+    return (
+        f"El ranking Magic Formula ordena empresas por 2 factores; el de Retorno usa el ROIC, "
+        f"en 2 pasos: 1) toma la ganancia operativa del negocio, antes de intereses e impuestos "
+        f"({ebit_txt}), y 2) la divide entre el capital invertido (activos operativos menos "
+        f"pasivos corrientes sin deuda) ({ci_txt}) → ROIC = {resultado}. Cuanto más alto, más "
+        f"eficiente es la empresa generando ganancias con el capital que usa."
+    )
 
 
 def _cuenta_mge(datos: dict) -> Optional[str]:
     if not datos.get("disponible"):
         return None
-    ebit, ev, mc, td, cash, ey = (
-        datos.get(k) for k in ("ebit", "ev", "market_cap", "total_debt", "cash", "earnings_yield")
-    )
-    if None in (ebit, ev, mc, td, cash, ey) or not ev:
+    ebit, mc, td, cash, ey = (datos.get(k) for k in ("ebit", "market_cap", "total_debt", "cash", "earnings_yield"))
+    ebit_ok, mc_ok, td_ok, cash_ok = ebit is not None, mc is not None, td is not None, cash is not None
+    if not any((ebit_ok, mc_ok, td_ok, cash_ok)):
         return None
+    todos_ok = ebit_ok and mc_ok and td_ok and cash_ok
+    ebit_txt = _money(ebit) if ebit_ok else "no disponible"
+    mc_txt = _money(mc) if mc_ok else "no disponible"
+    td_txt = _money(td) if td_ok else "no disponible"
+    cash_txt = _money(cash) if cash_ok else "no disponible"
+    ev_txt = _money(mc + td - cash) if todos_ok else "no calculable"
+    resultado = f"{_ratio2(ey)} = {_pct1(ey)}" if (todos_ok and ey is not None) else "no se puede calcular sin el dato faltante"
     return (
-        f"EY = {_money(ebit)} / ({_money(mc)} + {_money(td)} − {_money(cash)}) = "
-        f"{_money(ebit)} / {_money(ev)} = {_ratio2(ey)} = {_pct1(ey)}"
+        f"El ranking Magic Formula ordena empresas también por Earnings Yield, en 3 pasos: "
+        f"1) toma la ganancia operativa del negocio ({ebit_txt}), "
+        f"2) calcula el Valor de la Empresa (capitalización de mercado + deuda total − efectivo: "
+        f"{mc_txt} + {td_txt} − {cash_txt} = {ev_txt}), "
+        f"y 3) divide la ganancia operativa entre ese valor → Earnings Yield = {resultado}."
     )
 
 
@@ -1518,11 +1728,20 @@ def _rango_pct(valor: float, alto: float, bajo: float) -> str:
 
 def _cuenta_aqv(datos: dict) -> Optional[str]:
     ey = datos.get("earnings_yield")
-    alto, bajo, etiqueta = datos.get("umbral_alto"), datos.get("umbral_bajo"), datos.get("value")
-    if ey is None or alto is None or bajo is None:
+    alto, bajo = datos.get("umbral_alto"), datos.get("umbral_bajo")
+    ey_ok = ey is not None
+    umb_ok = alto is not None and bajo is not None
+    if not ey_ok and not umb_ok:
         return None
-    rango = _rango_pct(ey, alto, bajo)
-    return f"Earnings Yield {_pct1(ey)} está {rango} → {etiqueta}"
+    ey_txt = _pct1(ey) if ey_ok else "no disponible"
+    umb_txt = _rango_pct(ey, alto, bajo) if ey_ok and umb_ok else "no disponible"
+    etiqueta = datos.get("value") if (ey_ok and umb_ok) else "no se puede calcular sin el dato faltante"
+    return (
+        f"El factor Value (estilo AQR) hace 2 pasos: 1) calcula el Earnings Yield (mismo cálculo "
+        f"que en la Magic Formula: EBIT sobre Valor de la Empresa) ({ey_txt}), y 2) lo compara "
+        f"contra los umbrales fijos que separan valuaciones baratas/medias/caras dentro de este "
+        f"análisis ({umb_txt}) → clasificación: {etiqueta}."
+    )
 
 
 def _puntos_umbral(valor: Optional[float], alto: Optional[float], bajo: Optional[float]) -> Optional[int]:
@@ -1536,8 +1755,6 @@ def _puntos_umbral(valor: Optional[float], alto: Optional[float], bajo: Optional
 
 
 def _cuenta_aqq(datos: dict) -> Optional[str]:
-    piezas: list[str] = []
-    suma = 0
     sub_metricas = (
         ("ROE", datos.get("roe"), datos.get("roe_umbral_alto"), datos.get("roe_umbral_bajo"), _pct1),
         (
@@ -1549,45 +1766,69 @@ def _cuenta_aqq(datos: dict) -> Optional[str]:
             datos.get("piotroski_ratio_umbral_alto"), datos.get("piotroski_ratio_umbral_bajo"), _pct1,
         ),
     )
-    for nombre, valor, alto, bajo, fmt in sub_metricas:
-        p = _puntos_umbral(valor, alto, bajo)
-        if p is None:
+    ok_flags = [
+        valor is not None and alto is not None and bajo is not None
+        for _, valor, alto, bajo, _ in sub_metricas
+    ]
+    if not any(ok_flags):
+        return None
+    piezas = []
+    suma = 0
+    for (nombre, valor, alto, bajo, fmt), ok in zip(sub_metricas, ok_flags):
+        if not ok:
+            piezas.append(f"{nombre}: no disponible")
             continue
+        p = _puntos_umbral(valor, alto, bajo)
         referencia = alto if p >= 0 else bajo
         signo = ">" if p == 1 else ("<" if p == -1 else "≈")
         piezas.append(f"{nombre} {fmt(valor)} {signo} {fmt(referencia)} ({p:+d})")
         suma += p
-    if not piezas:
-        return None
-    etiqueta = datos.get("quality")
-    return " · ".join(piezas) + f" → suma {suma:+d} → {etiqueta}"
+    todos_ok = all(ok_flags)
+    etiqueta = datos.get("quality") if todos_ok else "no se puede calcular sin el dato faltante"
+    return (
+        f"El factor Quality (estilo AQR) suma puntos por 3 sub-métricas, cada una comparada contra "
+        f"umbrales fijos: " + " · ".join(piezas) + f" → suma {suma:+d} → {etiqueta}."
+    )
 
 
 def _cuenta_aqm(datos: dict) -> Optional[str]:
-    """SDD_desglose_universal.md, Grupo F, Cambio 4 -- deja de ser trivial:
-    muestra la comparación real que determina la etiqueta (precio vs.
-    promedio 50d y vs. promedio 200d), mismo criterio de "no calculable" que
-    `market_context.calculate_momentum` (etiqueta="no_disponible" si falta
-    `price_avg_50` o `price_avg_200`)."""
+    """Retrofit `SDD_cuenta_narrada_universal.md`, Decisión #3 Grupo B --
+    "dato faltante por paso" en vez del todo-o-nada que tenía desde
+    `SDD_desglose_universal.md`."""
     precio = datos.get("precio_actual")
     avg50, avg200 = datos.get("price_avg_50"), datos.get("price_avg_200")
-    etiqueta = datos.get("momentum")
-    if None in (precio, avg50, avg200):
+    p_ok, a50_ok, a200_ok = precio is not None, bool(avg50), bool(avg200)
+    if not p_ok and not a50_ok and not a200_ok:
         return None
-    cmp50 = ">" if precio > avg50 else "<"
-    cmp200 = ">" if precio > avg200 else "<"
+    avg50_txt = _money(avg50) if a50_ok else "no disponible"
+    avg200_txt = _money(avg200) if a200_ok else "no disponible"
+    precio_txt = _money(precio) if p_ok else "no disponible"
+    etiqueta = datos.get("momentum") if (p_ok and a50_ok and a200_ok) else "no se puede calcular sin el dato faltante"
     return (
-        f"Precio {_money(precio)} {cmp50} promedio 50d {_money(avg50)} y "
-        f"{cmp200} promedio 200d {_money(avg200)} → {etiqueta}"
+        f"El factor Momentum (estilo AQR) hace 2 pasos: 1) compara el precio de hoy contra el "
+        f"promedio de los últimos 50 días ({precio_txt} vs. {avg50_txt}), y 2) contra el promedio "
+        f"de los últimos 200 días ({precio_txt} vs. {avg200_txt}) — si el precio está por encima "
+        f"de ambos → impulso positivo. Clasificación: {etiqueta}."
     )
 
 
 def _cuenta_aql(datos: dict) -> Optional[str]:
     beta = datos.get("beta")
     bajo, alto, etiqueta = datos.get("beta_umbral_bajo"), datos.get("beta_umbral_alto"), datos.get("low_vol")
-    if beta is None or bajo is None or alto is None:
+    if beta is None and (bajo is None or alto is None):
         return None
-    return _cuenta_beta_bucket(beta, bajo, alto, str(etiqueta))
+    beta_txt = (
+        f"{_ratio2(beta)}, que está {'por debajo de' if bajo is not None and beta < bajo else ('por encima de' if alto is not None and beta > alto else 'entre')} "
+        f"{_ratio2(bajo) if bajo is not None else '?'} y {_ratio2(alto) if alto is not None else '?'}"
+        if beta is not None and bajo is not None and alto is not None else "no disponible"
+    )
+    clasificacion = str(etiqueta) if beta is not None and bajo is not None and alto is not None else "no se puede calcular sin el dato faltante"
+    return (
+        f"El factor Low-vol (estilo AQR) hace 2 pasos: "
+        f"1) mide qué tan volátil es la acción comparada con el mercado en general (su Beta: {beta_txt}), "
+        f"y 2) compara ese número contra los umbrales fijos que separan baja/media/alta volatilidad "
+        f"dentro de este análisis → clasificación: {clasificacion}."
+    )
 
 
 _CUENTA_AVANZADO = {

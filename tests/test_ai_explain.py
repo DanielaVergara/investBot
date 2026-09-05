@@ -2319,14 +2319,21 @@ def test_build_cuenta_line_es_funcion_pura_sin_io():
 
 
 def test_cuenta_alz_verificada_termino_a_termino_ejemplo_de_daniela():
-    """Ejemplo textual EXACTO de Daniela (Contexto, punto 1 de la spec)."""
+    """SDD_cuenta_narrada_universal.md, Decisión #3 Grupo F -- narración de
+    pasos numerados con los 5 términos + peso, en vez de la fórmula
+    comprimida de 1 línea."""
     a, b, c, d, e = 0.34, 0.12, 0.18, 1.05, 0.87
     z = 1.2 * a + 1.4 * b + 3.3 * c + 0.6 * d + 1.0 * e
     datos = {"altman": {"disponible": True, "a": a, "b": b, "c": c, "d": d, "e": e, "z": z}}
     cuenta = ai_explain._build_cuenta_line("avanzado", "alz", datos)
     assert cuenta == (
-        "Z = 1.2×0.34 + 1.4×0.12 + 3.3×0.18 + 0.6×1.05 + 1.0×0.87 = "
-        "0.41 + 0.17 + 0.59 + 0.63 + 0.87 = 2.67"
+        "El Altman Z-Score suma 5 factores financieros, cada uno multiplicado por un peso fijo "
+        "de la fórmula: 1) Capital de Trabajo sobre Activos = 0.34, ×1.2 = 0.41, "
+        "2) Utilidades Retenidas sobre Activos = 0.12, ×1.4 = 0.17, "
+        "3) EBIT sobre Activos = 0.18, ×3.3 = 0.59, "
+        "4) Capitalización de Mercado sobre Deuda = 1.05, ×0.6 = 0.63, "
+        "5) Rotación de Activos (Ventas sobre Activos) = 0.87, ×1.0 = 0.87. "
+        "Sumando los 5 términos → Z = 2.67."
     )
 
 
@@ -2336,8 +2343,12 @@ def test_cuenta_azp_verificada_termino_a_termino_ejemplo_de_daniela():
     datos = {"altman_pp": {"disponible": True, "a": a, "b": b, "c": c, "d": d, "e": None, "z": z}}
     cuenta = ai_explain._build_cuenta_line("avanzado", "azp", datos)
     assert cuenta == (
-        "Z'' = 6.56×0.34 + 3.26×0.12 + 6.72×0.18 + 1.05×1.05 = "
-        "2.23 + 0.39 + 1.21 + 1.10 = 4.93"
+        "El Altman Z'' (variante asset-light) suma 4 factores financieros, cada uno multiplicado "
+        "por un peso fijo de la fórmula: 1) Capital de Trabajo sobre Activos = 0.34, ×6.56 = 2.23, "
+        "2) Utilidades Retenidas sobre Activos = 0.12, ×3.26 = 0.39, "
+        "3) EBIT sobre Activos = 0.18, ×6.72 = 1.21, "
+        "4) Capitalización de Mercado sobre Deuda = 1.05, ×1.05 = 1.10. "
+        "Sumando los 4 términos → Z'' = 4.93."
     )
 
 
@@ -2384,7 +2395,27 @@ def test_cuenta_pig_conteo_simple():
     ctx = _avanzado_context()
     datos = ai_explain._build_explain_payload(ctx, "pig")
     cuenta = ai_explain._build_cuenta_line("avanzado", "pig", datos)
-    assert cuenta == "7 de 9 criterios evaluables cumplidos"
+    assert cuenta == (
+        "El F-Score de Piotroski suma 1 punto por cada criterio de calidad contable que la "
+        "empresa cumple, evaluados en 3 grupos (rentabilidad, apalancamiento y liquidez, "
+        "eficiencia operativa) — de los 9 criterios que se pudieron evaluar con los "
+        "datos disponibles de este ticker, cumplió 7. Cuantos más cumple, más sólida es "
+        "su calidad contable."
+    )
+
+
+def test_cuenta_pig_sin_pasos_aritmeticos_propios_decision_grupo_g():
+    """QA -- test dedicado que blinda que `pig` NO recibe el mecanismo de 3
+    reglas (sin "paso N)", sin términos independientes) porque `architect`
+    lo dejó explícitamente fuera (Grupo G: es un conteo, no una fórmula)."""
+    ctx = _avanzado_context()
+    datos = ai_explain._build_explain_payload(ctx, "pig")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "pig", datos)
+    assert "paso 1)" not in cuenta.lower() and "1) " not in cuenta
+    assert "no disponible" not in cuenta
+    # Sigue con guarda todo-o-nada (sin mecanismo de "dato faltante por paso").
+    datos_falta = {"piotroski": {"puntaje": None, "criterios_evaluables": 9}}
+    assert ai_explain._build_cuenta_line("avanzado", "pig", datos_falta) is None
 
 
 def test_cuenta_pig_evaluables_0_no_calculable():
@@ -2392,8 +2423,26 @@ def test_cuenta_pig_evaluables_0_no_calculable():
     assert ai_explain._build_cuenta_line("avanzado", "pig", datos) is None
 
 
+_PIOTROSKI_CRITERIO_NO_DISPONIBLE_ESPERADO = {
+    "pir": (
+        "Ganancia Neta: dato no disponible · CFO: dato no disponible · "
+        "ROA: dato no disponible · CFO > Utilidad: dato no disponible"
+    ),
+    "pia": (
+        "Apalancamiento: dato no disponible · Liquidez: dato no disponible · "
+        "Acciones en circulación: dato no disponible"
+    ),
+    "pie": "Margen bruto: dato no disponible · Rotación de activos: dato no disponible",
+}
+
+
 @pytest.mark.parametrize("code", ["pir", "pia", "pie"])
-def test_cuenta_piotroski_criterio_no_evaluable_se_omite_sin_none_visible(code):
+def test_cuenta_piotroski_criterio_no_evaluable_dice_dato_no_disponible_por_criterio(code):
+    """Retrofit `SDD_cuenta_narrada_universal.md` -- un criterio con
+    `cumplido is None`/`valores` vacío ya NO se descarta en silencio, dice
+    "dato no disponible" explícito y SIGUE apareciendo en la lista unida por
+    `" · "` (antes desaparecía, `_cuenta_piotroski_grupo` devolvía `None`
+    completo cuando ningún criterio del grupo era evaluable)."""
     ctx = _avanzado_context(piotroski={
         "puntaje": 0, "criterios_evaluables": 0, "criterios_totales": 9,
         "criterios": [
@@ -2404,14 +2453,48 @@ def test_cuenta_piotroski_criterio_no_evaluable_se_omite_sin_none_visible(code):
         ],
     })
     datos = ai_explain._build_explain_payload(ctx, code)
-    assert ai_explain._build_cuenta_line("avanzado", code, datos) is None
+    cuenta = ai_explain._build_cuenta_line("avanzado", code, datos)
+    assert cuenta == _PIOTROSKI_CRITERIO_NO_DISPONIBLE_ESPERADO[code]
+    assert "None" not in cuenta
+
+
+def test_fmt_criterio_piotroski_nombre_desconocido_sigue_devolviendo_none():
+    """Único caso que sigue devolviendo `None` en el retrofit: `nombre` no
+    matchea ningún label conocido -- bug de datos, no "falta info del
+    ticker" (spec, Decisión #3 Grupo G)."""
+    criterio = {"nombre": "criterio_inventado_que_no_existe", "cumplido": True, "valores": {"x": 1}}
+    assert ai_explain._fmt_criterio_piotroski(criterio) is None
+
+
+def test_fmt_criterio_piotroski_dato_faltante_por_criterio():
+    criterio = {"nombre": "roa_positivo", "cumplido": None, "valores": None}
+    assert ai_explain._fmt_criterio_piotroski(criterio) == "Ganancia Neta: dato no disponible"
 
 
 def test_cuenta_mgr_verificada_termino_a_termino():
     ctx = _avanzado_context()
     datos = ai_explain._build_explain_payload(ctx, "mgr")
     cuenta = ai_explain._build_cuenta_line("avanzado", "mgr", datos)
-    assert cuenta == "ROIC = $114,000.00 / $570,000.00 = 0.20 = 20.0%"
+    assert cuenta == (
+        "El ranking Magic Formula ordena empresas por 2 factores; el de Retorno usa el ROIC, "
+        "en 2 pasos: 1) toma la ganancia operativa del negocio, antes de intereses e impuestos "
+        "($114,000.00), y 2) la divide entre el capital invertido (activos operativos menos "
+        "pasivos corrientes sin deuda) ($570,000.00) → ROIC = 0.20 = 20.0%. Cuanto más alto, más "
+        "eficiente es la empresa generando ganancias con el capital que usa."
+    )
+
+
+def test_cuenta_mgr_1_dato_faltante_paso_dice_no_disponible():
+    ctx = _avanzado_context(magic={
+        "disponible": True, "roic": None, "campos_faltantes": ["capital_invertido"],
+        "ebit": 114_000.0, "capital_invertido": None,
+    })
+    datos = ai_explain._build_explain_payload(ctx, "mgr")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mgr", datos)
+    assert "$114,000.00" in cuenta
+    assert "capital invertido (activos operativos menos pasivos corrientes sin deuda) (no disponible)" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_mge_verificada_termino_a_termino_muestra_armado_de_ev():
@@ -2419,9 +2502,24 @@ def test_cuenta_mge_verificada_termino_a_termino_muestra_armado_de_ev():
     datos = ai_explain._build_explain_payload(ctx, "mge")
     cuenta = ai_explain._build_cuenta_line("avanzado", "mge", datos)
     assert cuenta == (
-        "EY = $114,000.00 / ($1,400,000.00 + $100,000.00 − $75,000.00) = "
-        "$114,000.00 / $1,425,000.00 = 0.08 = 8.0%"
+        "El ranking Magic Formula ordena empresas también por Earnings Yield, en 3 pasos: "
+        "1) toma la ganancia operativa del negocio ($114,000.00), "
+        "2) calcula el Valor de la Empresa (capitalización de mercado + deuda total − efectivo: "
+        "$1,400,000.00 + $100,000.00 − $75,000.00 = $1,425,000.00), "
+        "y 3) divide la ganancia operativa entre ese valor → Earnings Yield = 0.08 = 8.0%."
     )
+
+
+def test_cuenta_mge_1_dato_faltante_por_paso_ebit():
+    ctx = _avanzado_context(magic={
+        "disponible": True, "earnings_yield": None, "campos_faltantes": ["ebit"],
+        "ebit": None, "market_cap": 1_400_000.0, "total_debt": 100_000.0, "cash": 75_000.0,
+    })
+    datos = ai_explain._build_explain_payload(ctx, "mge")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "mge", datos)
+    assert "1) toma la ganancia operativa del negocio (no disponible)" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_mgr_mge_no_disponible_ausente():
@@ -2438,8 +2536,17 @@ def test_cuenta_aqv_entre_umbrales():
     ctx = _avanzado_context()
     datos = ai_explain._build_explain_payload(ctx, "aqv")
     cuenta = ai_explain._build_cuenta_line("avanzado", "aqv", datos)
-    assert "Earnings Yield 8.0%" in cuenta
-    assert "→ alto" in cuenta
+    assert "(8.0%)" in cuenta
+    assert "→ clasificación: alto." in cuenta
+
+
+def test_cuenta_aqv_1_dato_faltante_earnings_yield():
+    ctx = _avanzado_context(magic={"disponible": True, "earnings_yield": None})
+    datos = ai_explain._build_explain_payload(ctx, "aqv")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aqv", datos)
+    assert "calcula el Earnings Yield" in cuenta and "(no disponible)" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_aqq_suma_de_sub_metricas():
@@ -2472,31 +2579,56 @@ def test_cuenta_aqm_sin_precio_avg_no_calculable():
 )
 def test_cuenta_aqm_termino_a_termino_4_combinaciones(precio, avg50, avg200, cmp50, cmp200):
     """Branch coverage 100% pedido por QA -- las 4 combinaciones posibles de
-    `>`/`<` para 50d y para 200d."""
+    `>`/`<` para 50d y para 200d (narración nueva, retrofit de "dato
+    faltante por paso")."""
     ctx = _avanzado_context(precio_actual=precio, price_avg_50=avg50, price_avg_200=avg200)
     datos = ai_explain._build_explain_payload(ctx, "aqm")
     cuenta = ai_explain._build_cuenta_line("avanzado", "aqm", datos)
     assert cuenta == (
-        f"Precio {ai_explain._money(precio)} {cmp50} promedio 50d {ai_explain._money(avg50)} y "
-        f"{cmp200} promedio 200d {ai_explain._money(avg200)} → {datos['momentum']}"
+        f"El factor Momentum (estilo AQR) hace 2 pasos: 1) compara el precio de hoy contra el "
+        f"promedio de los últimos 50 días ({ai_explain._money(precio)} vs. {ai_explain._money(avg50)}), "
+        f"y 2) contra el promedio de los últimos 200 días "
+        f"({ai_explain._money(precio)} vs. {ai_explain._money(avg200)}) — si el precio está por encima "
+        f"de ambos → impulso positivo. Clasificación: {datos['momentum']}."
     )
 
 
 @pytest.mark.parametrize("campo_faltante", ["precio_actual", "price_avg_50", "price_avg_200"])
-def test_cuenta_aqm_1_campo_faltante_no_calculable(campo_faltante):
-    """QA -- los 3 casos por separado (no solo "todos ausentes")."""
+def test_cuenta_aqm_1_campo_faltante_paso_dice_no_disponible(campo_faltante):
+    """QA -- los 3 casos por separado (no solo "todos ausentes"): el paso
+    puntual dice "no disponible", el resultado dice "no se puede calcular
+    sin el dato faltante" (retrofit -- antes desaparecía el bloque
+    completo)."""
     overrides = {"precio_actual": 150.0, "price_avg_50": 140.0, "price_avg_200": 130.0}
     overrides[campo_faltante] = None
     ctx = _avanzado_context(**overrides)
     datos = ai_explain._build_explain_payload(ctx, "aqm")
-    assert ai_explain._build_cuenta_line("avanzado", "aqm", datos) is None
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aqm", datos)
+    assert "no disponible" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_aql_beta_bucket():
     ctx = _avanzado_context()
     datos = ai_explain._build_explain_payload(ctx, "aql")
     cuenta = ai_explain._build_cuenta_line("avanzado", "aql", datos)
-    assert cuenta == "Beta 1.05 está entre 0.80 y 1.20 → bajo"
+    assert cuenta == (
+        "El factor Low-vol (estilo AQR) hace 2 pasos: "
+        "1) mide qué tan volátil es la acción comparada con el mercado en general "
+        "(su Beta: 1.05, que está entre 0.80 y 1.20), "
+        "y 2) compara ese número contra los umbrales fijos que separan baja/media/alta "
+        "volatilidad dentro de este análisis → clasificación: bajo."
+    )
+
+
+def test_cuenta_aql_beta_faltante_no_calculable():
+    ctx = _avanzado_context(beta=None)
+    datos = ai_explain._build_explain_payload(ctx, "aql")
+    cuenta = ai_explain._build_cuenta_line("avanzado", "aql", datos)
+    assert "Beta: no disponible" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_ver_precio_vs_valor_justo():
@@ -2507,14 +2639,40 @@ def test_cuenta_ver_precio_vs_valor_justo():
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "ver")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "ver", datos)
-    assert cuenta == "Precio actual $550.00 < Valor Justo Total $496.00 → Barata"
+    assert cuenta == (
+        "Para saber si esta acción está barata o cara, el modelo hace 1 paso: "
+        "compara el precio de hoy contra el Valor Justo Total que combina los 3 "
+        "modelos (Múltiplos, Graham y DCF) — "
+        "Precio actual $550.00 < Valor Justo Total $496.00 → Barata."
+    )
 
 
 def test_cuenta_ver_cara_cuando_veredicto_es_false():
     ctx = _texto_libre_context(veredicto_barata=False)
     datos = ai_explain._build_explain_payload(ctx, "ver")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "ver", datos)
-    assert cuenta == "Precio actual $550.00 > Valor Justo Total $496.00 → Cara"
+    assert cuenta == (
+        "Para saber si esta acción está barata o cara, el modelo hace 1 paso: "
+        "compara el precio de hoy contra el Valor Justo Total que combina los 3 "
+        "modelos (Múltiplos, Graham y DCF) — "
+        "Precio actual $550.00 > Valor Justo Total $496.00 → Cara."
+    )
+
+
+def test_cuenta_ver_1_dato_faltante_precio_no_calculable():
+    ctx = _texto_libre_context(precio_actual=None)
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "ver", datos)
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
+
+
+def test_cuenta_ver_ningun_dato_none():
+    ctx = _texto_libre_context(precio_actual=None, scenarios={
+        "conservador": {"valor_justo_total": None},
+    })
+    datos = ai_explain._build_explain_payload(ctx, "ver")
+    assert ai_explain._build_cuenta_line("texto_libre", "ver", datos) is None
 
 
 def test_cuenta_vf_suma_de_modelos_calculables():
@@ -2525,10 +2683,21 @@ def test_cuenta_vf_suma_de_modelos_calculables():
 
 
 def test_cuenta_gra_con_numeros_reales():
+    # SDD_cuenta_narrada_graham_dcf.md -- narración completa de 3 pasos en
+    # vez de la fórmula comprimida (Daniela reportó no entenderla).
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "gra")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "gra", datos)
-    assert cuenta == "$8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00"
+    assert cuenta == (
+        "Para saber cuánto vale la acción según este modelo clásico, el cálculo sigue 3 pasos: "
+        "1) toma cuánto ganó la empresa por acción en el último año ($8.20 de EPS), "
+        "2) proyecta cuánto puede crecer esa ganancia a futuro usando el crecimiento histórico "
+        "de sus ganancias, con un techo del 15% para no ser demasiado optimista (en este caso, "
+        "9.4%), y 3) multiplica todo por un factor fijo de la fórmula (8.5 + "
+        "2×crecimiento) y lo divide entre la tasa del bono del Tesoro a 10 años (4.2%) "
+        "— cuanto más alta esa tasa \"sin riesgo\", menor el valor justo, porque hay una "
+        "alternativa más segura disponible. El resultado: $480.00 por acción."
+    )
 
 
 def test_cuenta_mul_con_numeros_reales():
@@ -2539,42 +2708,113 @@ def test_cuenta_mul_con_numeros_reales():
     })
     datos = ai_explain._build_explain_payload(ctx, "mul")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "mul", datos)
-    assert cuenta == "$8.20 × 24.00 = $500.00"
+    assert cuenta == (
+        "Para estimar el valor por este método, el modelo hace 2 pasos: "
+        "1) toma cuánto ganó la empresa por acción en el último año ($8.20), "
+        "y 2) lo multiplica por el PER promedio de empresas parecidas del mismo sector "
+        "(24.00) — así estima cuánto debería valer la acción si cotizara a un múltiplo "
+        "similar al de sus comparables. El resultado: $500.00 por acción."
+    )
+
+
+def test_cuenta_mul_1_dato_faltante_per_no_calculable():
+    ctx = _texto_libre_context(peer_comparison={"per_promedio_peers": None})
+    datos = ai_explain._build_explain_payload(ctx, "mul")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "mul", datos)
+    assert "dato de PER promedio de comparables no disponible" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
+
+
+def test_cuenta_mul_corta_identica_a_la_formula_comprimida_de_antes():
+    """`_cuenta_mul_corta` (nueva, Decisión #5) -- idéntica carácter por
+    carácter a la fórmula comprimida que `_cuenta_mul` tenía antes de esta
+    spec, usada solo dentro de "vf"."""
+    ctx = _texto_libre_context(peer_comparison={
+        "per_propio": 22.5, "per_minimo_peers": 18.0, "per_promedio_peers": 24.0,
+        "per_maximo_peers": 30.0, "peers_usados": ["MSFT", "CRM"],
+        "posicion": "en_linea", "motivo_no_comparable": None,
+    })
+    datos = ai_explain._payload_texto_libre(ctx, "mul")
+    assert ai_explain._cuenta_mul_corta(datos) == "$8.20 × 24.00 = $500.00"
+
+
+def test_cuenta_mul_corta_1_dato_faltante_no_calculable():
+    ctx = _texto_libre_context(peer_comparison={"per_promedio_peers": None})
+    datos = ai_explain._payload_texto_libre(ctx, "mul")
+    assert ai_explain._cuenta_mul_corta(datos) is None
 
 
 def test_cuenta_rat_4_sub_cuentas():
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "rat")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "rat", datos)
-    assert "Liquidez = $100.00 / $50.00 = 1.80" in cuenta
-    assert "Margen bruto = ($1,000.00 − $400.00) / $1,000.00 = 65.0%" in cuenta
-    assert "PER = $550.00 / $8.20 = 22.50" in cuenta
-    assert "P/S = $2,000,000.00 / $1,000.00 = 6.20" in cuenta
+    assert "Liquidez corriente (activo corriente / pasivo corriente): $100.00 entre $50.00 = 1.80" in cuenta
+    assert "Margen bruto ((ventas − costo de ventas) / ventas): ($1,000.00 − $400.00) sobre $1,000.00 = 65.0%" in cuenta
+    assert "PER (precio / ganancia por acción): $550.00 entre $8.20 = 22.50" in cuenta
+    assert "P/S (capitalización / ventas): $2,000,000.00 entre $1,000.00 = 6.20" in cuenta
 
 
 def test_cuenta_rat_solo_las_sub_cuentas_con_dato():
+    """Retrofit -- la pieza sin dato dice "no disponible" explícito (antes
+    desaparecía en silencio), las demás siguen con sus números reales."""
     ctx = _texto_libre_context(current_assets=None, current_liabilities=None)
     datos = ai_explain._build_explain_payload(ctx, "rat")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "rat", datos)
-    assert "Liquidez" not in cuenta
-    assert "Margen bruto" in cuenta
+    assert "Liquidez corriente (activo corriente / pasivo corriente): no disponible (falta activo o pasivo corriente)" in cuenta
+    assert "Margen bruto" in cuenta and "65.0%" in cuenta
+    assert "None" not in cuenta
+
+
+def test_cuenta_rat_per_no_aplicable_motivo_explicito():
+    ctx = _texto_libre_context(ratios={
+        "ratio_liquidez": 1.8, "margen_bruto": 0.65, "per": None,
+        "per_no_aplicable": True, "ps": 6.2,
+    })
+    datos = ai_explain._build_explain_payload(ctx, "rat")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "rat", datos)
+    assert "PER (precio / ganancia por acción): no disponible o no aplica (empresa con pérdidas)" in cuenta
 
 
 def test_cuenta_pil_4_criterios_con_numeros():
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "pil")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "pil", datos)
-    assert "Ingresos: $1,000.00 > $800.00 → creciente" in cuenta
-    assert "Utilidades: $200.00 > 0 y > $150.00 → creciente" in cuenta
-    assert "Deuda: liquidez 1.80 > 1 → controlada" in cuenta
-    assert "Precio: → no razonable" in cuenta
+    assert "¿Ingresos crecientes? compara ventas recientes contra las más antiguas del historial: $1,000.00 vs. $800.00 → creciente" in cuenta
+    assert "¿Utilidades crecientes? compara utilidad reciente contra la más antigua: $200.00 vs. $150.00 → creciente" in cuenta
+    assert "¿Deuda controlada? compara activo corriente contra pasivo corriente: liquidez 1.80 → controlada" in cuenta
+    assert "¿Precio razonable? compara el precio de hoy contra el Valor Justo Total: ❌ no razonable" in cuenta
+
+
+def test_cuenta_pil_1_dato_faltante_paso_dice_no_disponible():
+    ctx = _texto_libre_context(revenue_reciente=None, revenue_antiguo=None)
+    datos = ai_explain._build_explain_payload(ctx, "pil")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "pil", datos)
+    assert "¿Ingresos crecientes? compara ventas recientes contra las más antiguas del historial: no disponible (falta historial de ventas)" in cuenta
+    assert "¿Utilidades crecientes?" in cuenta and "creciente" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_rsk_beta_entre_umbrales():
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "rsk")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "rsk", datos)
-    assert cuenta == "Beta 1.15 está entre 0.80 y 1.20 → perfil Moderado"
+    assert cuenta == (
+        "Para saber si el riesgo de esta acción encaja con tu perfil, el modelo hace 2 pasos: "
+        "1) mide qué tan volátil es la acción comparada con el mercado en general "
+        "(su Beta: 1.15, que está entre 0.80 y 1.20), "
+        "y 2) compara ese número contra los umbrales de tu perfil de riesgo elegido con /start "
+        "→ perfil sugerido: Moderado."
+    )
+
+
+def test_cuenta_rsk_beta_faltante_no_calculable():
+    ctx = _texto_libre_context(risk_fit={"beta": None})
+    datos = ai_explain._build_explain_payload(ctx, "rsk")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "rsk", datos)
+    assert "Beta: no disponible" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
 
 
 def test_cuenta_mom_hasta_4_sub_cuentas():
@@ -2594,24 +2834,46 @@ def test_cuenta_cmp_per_propio_y_peers():
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "cmp")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "cmp", datos)
-    assert cuenta == "PER propio = $550.00 / $8.20 = 22.50 — PER promedio peers = 24.00"
+    assert cuenta == (
+        "Para comparar esta acción con su sector, el modelo hace 2 pasos: "
+        "1) calcula el PER propio de la empresa (precio / ganancia por acción): "
+        "$550.00 entre $8.20 = 22.50, "
+        "y 2) lo compara contra el PER promedio de empresas parecidas del mismo sector: 24.00."
+    )
+
+
+def test_cuenta_cmp_1_dato_faltante_per_propio_no_disponible():
+    ctx = _texto_libre_context(precio_actual=None)
+    datos = ai_explain._build_explain_payload(ctx, "cmp")
+    cuenta = ai_explain._build_cuenta_line("texto_libre", "cmp", datos)
+    assert "no disponible (falta precio o EPS)" in cuenta
+    assert "24.00" in cuenta
+    assert "None" not in cuenta
 
 
 # --- DCF -- cuenta PARCIAL (Decisión de diseño #7) -------------------------
 
 
 def test_cuenta_dcf_wacc_y_g_sustituidos_proyeccion_resumida():
+    # SDD_cuenta_narrada_graham_dcf.md -- narración completa de 4 pasos,
+    # formato ya aprobado explícitamente por Daniela, en vez de la fórmula
+    # comprimida. `fcf_year5` ya no se calcula ni se menciona.
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "dcf")
     cuenta = ai_explain._build_cuenta_line("texto_libre", "dcf", datos)
-    assert "FCF base $109.00" in cuenta
-    assert "g=8.3%" in cuenta
-    assert "WACC=9.1%" in cuenta
-    assert "FCF proyectado año 5" in cuenta
-    assert "$510.00 por acción." in cuenta
+    assert cuenta == (
+        "Para saber cuánto vale la empresa hoy, el modelo hace 4 pasos: 1) toma cuánto efectivo "
+        "libre genera HOY el negocio ($109.00), 2) asume que va a crecer 8.3% "
+        "por año durante 5 años, 3) \"trae\" cada uno de esos años futuros a su valor de "
+        "HOY (porque un peso dentro de 5 años vale menos que uno hoy — se descuenta al "
+        "9.1%, el costo de capital), y 4) le suma un \"valor terminal\" (lo que "
+        "vale seguir generando plata para siempre después del año 5). Todo eso sumado y "
+        "dividido entre las acciones da $510.00 por acción."
+    )
     # No lista los 5 años individualmente -- comportamiento esperado (D1).
     assert "año 1" not in cuenta and "año 2" not in cuenta and "año 3" not in cuenta
-    assert cuenta.count("año") == 1
+    assert "FCF proyectado año 5" not in cuenta  # `fcf_year5` retirado (Decisión #3)
+    assert cuenta.count("año") == 5  # "por año" + "5 años"×2 + "del año 5" (substring de "años")
 
 
 def test_cuenta_dcf_no_calculable_ausente():
@@ -2637,6 +2899,262 @@ def test_cuenta_dcf_usa_dcfbreakdown_no_recalcula(monkeypatch):
     datos = ai_explain._build_explain_payload(ctx, "dcf")
     ai_explain._build_cuenta_line("texto_libre", "dcf", datos)
     assert llamadas == []
+
+
+# ---------------------------------------------------------------------------
+# SDD_cuenta_narrada_graham_dcf.md -- narración paso a paso de Graham/DCF
+# ---------------------------------------------------------------------------
+
+
+def test_cuenta_gra_ningun_dato_disponible_none():
+    """Retrofit `SDD_cuenta_narrada_universal.md` -- Regla 3: solo si NINGÚN
+    dato está disponible la función sigue devolviendo `None` (antes, CUALQUIER
+    campo faltante lo devolvía)."""
+    datos = dict(eps_ttm=None, g_aplicado=None, y_value=None, escenario_elegido="conservador", conservador=None)
+    assert ai_explain._cuenta_gra(datos) is None
+    assert ai_explain._cuenta_gra_corta(datos) is None
+
+
+@pytest.mark.parametrize("campo", ["eps_ttm", "g_aplicado", "y_value"])
+def test_cuenta_gra_1_dato_faltante_paso_dice_no_disponible(campo):
+    """Retrofit -- el paso puntual dice "no disponible", el resultado dice
+    "no se puede calcular sin el dato faltante" (antes desaparecía el
+    bloque completo por 1 solo dato faltante); los demás pasos con datos
+    disponibles siguen mostrando sus números reales."""
+    base = dict(eps_ttm=16.70, g_aplicado=0.134, y_value=0.044, escenario_elegido="conservador",
+                conservador=493.44)
+    datos = dict(base)
+    datos[campo] = None
+    cuenta = ai_explain._cuenta_gra(datos)
+    assert cuenta is not None
+    assert "no disponible" in cuenta
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
+    for otro_campo, txt in (("eps_ttm", "$16.70"), ("g_aplicado", "13.4%"), ("y_value", "4.4%")):
+        if otro_campo != campo:
+            assert txt in cuenta, f"{otro_campo} debía seguir mostrando su número real"
+
+
+def test_cuenta_gra_y_value_0_se_trata_como_faltante():
+    base = dict(eps_ttm=16.70, g_aplicado=0.134, y_value=0, escenario_elegido="conservador", conservador=493.44)
+    cuenta = ai_explain._cuenta_gra(base)
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
+
+
+def test_cuenta_dcf_ningun_dato_disponible_none():
+    datos = dict(
+        dcf_wacc=None, dcf_g_fcf=None, dcf_fcf_base=None,
+        dcf_valor_presente_flujos=None, dcf_valor_terminal_descontado=None,
+        dcf_equity_value=None, escenario_elegido="conservador", conservador=None,
+    )
+    assert ai_explain._cuenta_dcf(datos) is None
+    assert ai_explain._cuenta_dcf_corta(datos) is None
+
+
+@pytest.mark.parametrize(
+    "campo",
+    ["dcf_wacc", "dcf_g_fcf", "dcf_fcf_base", "dcf_valor_presente_flujos",
+     "dcf_valor_terminal_descontado", "dcf_equity_value"],
+)
+def test_cuenta_dcf_1_dato_faltante_paso_dice_no_disponible(campo):
+    """QA -- 6 sub-casos, uno por cada campo de la guarda `todos_ok`
+    (incluye `vp_flujos`/`vt_desc`/`equity`, que no tienen "paso texto"
+    propio pero sí participan de la guarda del resultado final, ver Nota de
+    diseño del Grupo D)."""
+    base = dict(
+        dcf_wacc=0.124, dcf_g_fcf=0.093, dcf_fcf_base=9_852_000_000.00,
+        dcf_valor_presente_flujos=45_360_690_094.48, dcf_valor_terminal_descontado=88_645_529_833.61,
+        dcf_equity_value=134_006_219_928.09, escenario_elegido="conservador", conservador=313.83,
+    )
+    datos = dict(base)
+    datos[campo] = None
+    cuenta = ai_explain._cuenta_dcf(datos)
+    assert cuenta is not None
+    assert "no se puede calcular sin el dato faltante" in cuenta
+    assert "None" not in cuenta
+    if campo in ("dcf_wacc", "dcf_g_fcf", "dcf_fcf_base"):
+        assert "no disponible" in cuenta
+
+
+def test_build_cuenta_line_gra_dcf_omiten_la_linea_cuenta_en_el_mensaje_final():
+    """El botón individual no agrega la línea `🧮 Cuenta:` cuando NINGÚN dato
+    está disponible -- verificado vía `_build_leaf_message`, no solo con la
+    función aislada (pedido explícito de QA)."""
+    ctx = _texto_libre_context(
+        eps_ttm=None, y_value=None,
+        scenarios={"conservador": {"valor_justo_graham": None}},
+    )
+    datos_gra = ai_explain._build_explain_payload(ctx, "gra")
+    cuenta_gra = ai_explain._build_cuenta_line("texto_libre", "gra", datos_gra)
+    assert cuenta_gra is None
+    texto = ai_explain._build_leaf_message("Dato.", "Respuesta.", None, None, cuenta=cuenta_gra)
+    assert "🧮 Cuenta" not in texto
+
+    ctx2 = _texto_libre_context(scenarios={
+        "conservador": {
+            "valor_justo_dcf": None, "dcf_wacc": None, "dcf_g_fcf": None, "dcf_fcf_base": None,
+            "dcf_valor_presente_flujos": None, "dcf_valor_terminal_descontado": None,
+            "dcf_equity_value": None,
+        },
+    })
+    datos_dcf = ai_explain._build_explain_payload(ctx2, "dcf")
+    cuenta_dcf = ai_explain._build_cuenta_line("texto_libre", "dcf", datos_dcf)
+    assert cuenta_dcf is None
+    texto2 = ai_explain._build_leaf_message("Dato.", "Respuesta.", None, None, cuenta=cuenta_dcf)
+    assert "🧮 Cuenta" not in texto2
+
+
+def test_build_cuenta_line_gra_1_dato_faltante_sigue_mostrando_la_linea_cuenta():
+    """Retrofit -- a diferencia del caso anterior, 1 solo dato faltante YA
+    NO omite la línea `🧮 Cuenta:` completa (cambio de mecanismo central de
+    esta spec)."""
+    ctx = _texto_libre_context(eps_ttm=None)
+    datos_gra = ai_explain._build_explain_payload(ctx, "gra")
+    cuenta_gra = ai_explain._build_cuenta_line("texto_libre", "gra", datos_gra)
+    assert cuenta_gra is not None
+    texto = ai_explain._build_leaf_message("Dato.", "Respuesta.", None, None, cuenta=cuenta_gra)
+    assert "🧮 Cuenta" in texto
+    assert "no disponible" in texto
+
+
+def test_cuenta_gra_corta_con_numeros_reales_caso_daniela():
+    """Ejemplo real de Daniela (Decisión #4) -- versión corta con flechas."""
+    datos = dict(eps_ttm=16.70, g_aplicado=0.134, y_value=0.044, escenario_elegido="conservador",
+                 conservador=493.44)
+    cuenta = ai_explain._cuenta_gra_corta(datos)
+    assert cuenta == (
+        "EPS $16.70 → se proyecta con 13.4% de crecimiento (techo 15%) → se "
+        "multiplica por 8.5+2×crecimiento y se ajusta por la tasa del bono a 10 años "
+        "(4.4%, a mayor tasa, menor valor) = $493.44."
+    )
+
+
+def test_cuenta_dcf_corta_con_numeros_reales_caso_daniela():
+    datos = dict(
+        dcf_wacc=0.124, dcf_g_fcf=0.093, dcf_fcf_base=9_852_000_000.00,
+        dcf_valor_presente_flujos=45_360_690_094.48, dcf_valor_terminal_descontado=88_645_529_833.61,
+        dcf_equity_value=134_006_219_928.09, escenario_elegido="conservador", conservador=313.83,
+    )
+    cuenta = ai_explain._cuenta_dcf_corta(datos)
+    assert cuenta == (
+        "FCF hoy $9,852,000,000.00 → crece 9.3%/año durante 5 años → se descuentan "
+        "esos flujos futuros a valor de hoy al 12.4% (costo de capital) → se suma el "
+        "valor de seguir generando caja después del año 5 = $313.83 por acción."
+    )
+
+
+def test_cuenta_gra_corta_y_completa_citan_el_mismo_valor_final():
+    """Caso obligatorio de QA de mayor riesgo de negocio: el valor final
+    citado por la versión corta (usada en "Valor Justo Total") tiene que
+    ser IDÉNTICO, carácter a carácter, al de la versión completa (botón
+    individual) para el mismo `datos` -- criterio de aceptación agregado
+    por `qa`."""
+    datos = dict(eps_ttm=16.70, g_aplicado=0.134, y_value=0.044, escenario_elegido="conservador",
+                 conservador=493.44)
+    completa = ai_explain._cuenta_gra(datos)
+    corta = ai_explain._cuenta_gra_corta(datos)
+    assert f"${493.44:,.2f}" in completa
+    assert f"${493.44:,.2f}" in corta
+    assert re.findall(r"\$[\d,]+\.\d{2}", completa)[-1] == re.findall(r"\$[\d,]+\.\d{2}", corta)[-1]
+
+
+def test_cuenta_dcf_corta_y_completa_citan_el_mismo_valor_final():
+    datos = dict(
+        dcf_wacc=0.124, dcf_g_fcf=0.093, dcf_fcf_base=9_852_000_000.00,
+        dcf_valor_presente_flujos=45_360_690_094.48, dcf_valor_terminal_descontado=88_645_529_833.61,
+        dcf_equity_value=134_006_219_928.09, escenario_elegido="conservador", conservador=313.83,
+    )
+    completa = ai_explain._cuenta_dcf(datos)
+    corta = ai_explain._cuenta_dcf_corta(datos)
+    assert re.findall(r"\$[\d,]+\.\d{2}", completa)[-1] == re.findall(r"\$[\d,]+\.\d{2}", corta)[-1]
+
+
+def test_cuenta_gra_dcf_peor_caso_de_montos_bajo_el_tope_narrado(monkeypatch):
+    """Caso límite obligatorio de QA -- peor caso de montos, medido con
+    `valuation.py` real (no inventado), verificado a través del pipeline
+    completo `_build_cuenta_line` (con `_enforce_cuenta_length` aplicado),
+    no solo con `_cuenta_gra`/`_cuenta_dcf` aisladas."""
+    g_aplicado, _ = ai_explain.valuation._cap_graham_g(0.15)
+    valor_gra = ai_explain.valuation.calculate_graham_fair_value(eps_ttm=999.99, g=g_aplicado, y=0.999)
+    datos_gra = dict(eps_ttm=999.99, g_aplicado=g_aplicado, y_value=0.999,
+                      escenario_elegido="conservador", conservador=valor_gra)
+    cuenta_gra = ai_explain._build_cuenta_line("texto_libre", "gra", datos_gra)
+    assert cuenta_gra is not None
+    assert len(cuenta_gra) <= ai_explain._MAX_CUENTA_CHARS
+    assert len(cuenta_gra) == 631  # medido con Python real -- ver test para el número exacto
+
+    dcf = ai_explain.valuation.calculate_dcf_fair_value(
+        fcf_historial=[1.0, 1.0, 1.0, 1.0], wacc=0.999, shares_outstanding=1_000_000,
+        g_fcf_override=0.999, fcf_base_override=999_999_999_999.99,
+    )
+    datos_dcf = dict(
+        dcf_wacc=0.999, dcf_g_fcf=0.999, dcf_fcf_base=999_999_999_999.99,
+        dcf_valor_presente_flujos=dcf.valor_presente_flujos,
+        dcf_valor_terminal_descontado=dcf.valor_terminal_descontado,
+        dcf_equity_value=dcf.equity_value,
+        escenario_elegido="conservador", conservador=dcf.valor_por_accion,
+    )
+    cuenta_dcf = ai_explain._build_cuenta_line("texto_libre", "dcf", datos_dcf)
+    assert cuenta_dcf is not None
+    assert len(cuenta_dcf) <= ai_explain._MAX_CUENTA_CHARS
+    assert len(cuenta_dcf) == 530  # medido con Python real
+
+
+@pytest.mark.parametrize("code", ["mul", "rat"])
+def test_build_cuenta_line_regresion_tope_unico_800_para_todas_las_preguntas(code, monkeypatch):
+    """Regresión -- `_MAX_CUENTA_NARRADA_CHARS` se retiró (Decisión #4):
+    `_MAX_CUENTA_CHARS=800` es AHORA el único tope, para las 22 preguntas
+    `dato_y_paso_a_paso` por igual, sin rama condicional de `gra`/`dcf`. Un
+    texto de 500 caracteres (que antes excedía el viejo tope de 400 de
+    estas preguntas) ya NO se omite."""
+    tabla = ai_explain._CUENTA_TEXTO_LIBRE
+    monkeypatch.setitem(tabla, code, lambda datos: "Z" * 500)
+    assert ai_explain._build_cuenta_line("texto_libre", code, {}) == "Z" * 500
+
+    monkeypatch.setitem(tabla, code, lambda datos: "Z" * 801)
+    assert ai_explain._build_cuenta_line("texto_libre", code, {}) is None
+
+
+def test_vf_sub_modelo_cuenta_gra_dcf_completas_exceden_el_tope_de_desglose(monkeypatch):
+    """Test de regresión que documenta *por qué* existe la versión corta
+    (caso obligatorio de QA) -- si en el futuro alguien revierte
+    `_VF_SUB_MODELO_CUENTA` a usar las narraciones completas, el bloque
+    "🔍 Desglose:" de "vf" excede `_MAX_DESGLOSE_CHARS=1200` en el peor caso
+    de montos, y este test debe fallar."""
+    g_aplicado, _ = ai_explain.valuation._cap_graham_g(0.15)
+    valor_gra = ai_explain.valuation.calculate_graham_fair_value(eps_ttm=999.99, g=g_aplicado, y=0.999)
+    dcf = ai_explain.valuation.calculate_dcf_fair_value(
+        fcf_historial=[1.0, 1.0, 1.0, 1.0], wacc=0.999, shares_outstanding=1_000_000,
+        g_fcf_override=0.999, fcf_base_override=999_999_999_999.99,
+    )
+    scenarios_extremos = {
+        "conservador": {
+            "valor_justo_multiplos": 144.40, "valor_justo_graham": valor_gra,
+            "valor_justo_dcf": dcf.valor_por_accion,
+            "valor_justo_total": (144.40 + valor_gra + dcf.valor_por_accion) / 3,
+            "graham_g_aplicado": g_aplicado,
+            "dcf_wacc": 0.999, "dcf_g_fcf": 0.999, "dcf_fcf_base": 999_999_999_999.99,
+            "dcf_valor_presente_flujos": dcf.valor_presente_flujos,
+            "dcf_valor_terminal_descontado": dcf.valor_terminal_descontado,
+            "dcf_equity_value": dcf.equity_value,
+        },
+    }
+    ctx = _texto_libre_context(
+        scenarios=scenarios_extremos, escenario_elegido="conservador",
+        eps_ttm=999.99, y_value=0.999,
+        peer_comparison={"per_promedio_peers": 999.99},
+    )
+    # Fuerza la versión anidada a usar las narraciones COMPLETAS en vez de
+    # las cortas -- simula un revert accidental de `_VF_SUB_MODELO_CUENTA`.
+    monkeypatch.setitem(ai_explain._VF_SUB_MODELO_CUENTA, "gra", ai_explain._cuenta_gra)
+    monkeypatch.setitem(ai_explain._VF_SUB_MODELO_CUENTA, "dcf", ai_explain._cuenta_dcf)
+    datos_vf = ai_explain._payload_texto_libre(ctx, "vf")
+    bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
+    # Al forzar las versiones completas, el bloque debe superar el tope y
+    # `_enforce_desglose_length` lo omite completo -- confirma el hallazgo
+    # bloqueante de la Decisión #4 del `architect`.
+    assert bloque is None
 
 
 # --- Cuenta entra al payload ANTES del guard (Decisión de diseño #4) ------
@@ -2683,6 +3201,13 @@ async def test_guard_extendido_sigue_rechazando_alucinacion_con_cuenta_presente(
 # (mejora recomendada (c) de `security`) -----------------------------------
 
 
+def test_max_cuenta_chars_es_800_y_max_cuenta_narrada_chars_se_retiro():
+    """Decisión #4 -- 1 sola constante para las 22 preguntas
+    `dato_y_paso_a_paso`, reemplaza el par 400/800 que convivía antes."""
+    assert ai_explain._MAX_CUENTA_CHARS == 800
+    assert not hasattr(ai_explain, "_MAX_CUENTA_NARRADA_CHARS")
+
+
 def test_max_cuenta_chars_cuenta_corta_no_se_toca():
     corta = "Z = 1.2×0.34 = 0.41"
     assert ai_explain._enforce_cuenta_length(corta) == corta
@@ -2697,7 +3222,7 @@ def test_max_cuenta_chars_cuenta_larga_se_omite_no_trunca(caplog):
 
 
 def test_build_cuenta_line_omite_si_la_cuenta_construida_excede_el_limite(monkeypatch):
-    monkeypatch.setitem(ai_explain._CUENTA_TEXTO_LIBRE, "ver", lambda datos: "Y" * 500)
+    monkeypatch.setitem(ai_explain._CUENTA_TEXTO_LIBRE, "ver", lambda datos: "Y" * 801)
     ctx = _texto_libre_context()
     datos = ai_explain._build_explain_payload(ctx, "ver")
     assert ai_explain._build_cuenta_line("texto_libre", "ver", datos) is None
@@ -3410,7 +3935,7 @@ def test_consistencia_cuenta_y_desglose_alz_mismo_valor_termino_a_termino():
     datos = ai_explain._build_explain_payload(ctx, "alz")
     cuenta = ai_explain._build_cuenta_line("avanzado", "alz", datos)
     desglose = ai_explain._build_desglose_block("avanzado", "alz", datos)
-    assert "1.2×0.34" in cuenta  # término A de la Cuenta
+    assert "Capital de Trabajo sobre Activos = 0.34, ×1.2 = 0.41" in cuenta  # término A de la Cuenta
     assert "• A (Capital de Trabajo) = 0.34 —" in desglose  # mismo A en el Desglose
 
 
@@ -3419,7 +3944,7 @@ def test_consistencia_cuenta_y_desglose_azp_mismo_valor_termino_a_termino():
     datos = ai_explain._build_explain_payload(ctx, "azp")
     cuenta = ai_explain._build_cuenta_line("avanzado", "azp", datos)
     desglose = ai_explain._build_desglose_block("avanzado", "azp", datos)
-    assert "6.56×0.34" in cuenta
+    assert "Capital de Trabajo sobre Activos = 0.34, ×6.56 = 2.23" in cuenta
     assert "• A (Capital de Trabajo) = 0.34 —" in desglose
 
 
@@ -3517,6 +4042,28 @@ def _desglose_vf(ctx: ai_explain.ExplanationContext) -> str:
 # --- Fixtures mínimos que pide QA (Ticker A-E + escenario variable) --------
 
 
+def test_build_desglose_vf_mul_usa_version_corta_sin_cambio_de_presupuesto():
+    """Decisión #5 -- `_VF_SUB_MODELO_CUENTA["mul"]` apunta a
+    `_cuenta_mul_corta` (no a la narración completa nueva del botón
+    individual), y el bloque "🔍 Desglose:" de "vf" mide lo mismo que medía
+    antes de esta spec (cero impacto de presupuesto, `_cuenta_mul_corta` es
+    carácter por carácter la fórmula comprimida que `_cuenta_mul` tenía
+    antes)."""
+    assert ai_explain._VF_SUB_MODELO_CUENTA["mul"] is ai_explain._cuenta_mul_corta
+    ctx = _texto_libre_context()
+    bloque = _desglose_vf(ctx)
+    assert len(bloque) == 910  # medido con Python real, sin cambios respecto a antes de esta spec
+    assert len(bloque) <= ai_explain._MAX_DESGLOSE_CHARS
+
+
+def test_cuenta_texto_libre_mul_sigue_apuntando_a_la_narracion_completa():
+    """`_CUENTA_TEXTO_LIBRE["mul"]` (botón individual) sigue apuntando a
+    `_cuenta_mul` (la narración completa), sin cambios de dispatch salvo lo
+    descrito para "vf" (Decisión #5)."""
+    assert ai_explain._CUENTA_TEXTO_LIBRE["mul"] is ai_explain._cuenta_mul
+    assert ai_explain._CUENTA_TEXTO_LIBRE["mul"] is not ai_explain._cuenta_mul_corta
+
+
 def test_build_desglose_vf_ticker_a_3_modelos_calculables_3_subsecciones_en_orden():
     """Ticker A -- happy path, las 3 sub-secciones en orden Múltiplos ->
     Graham -> DCF, cada una con valor entre paréntesis, 1 línea de "qué
@@ -3528,12 +4075,24 @@ def test_build_desglose_vf_ticker_a_3_modelos_calculables_3_subsecciones_en_orde
     idx_gra = bloque.index("• Graham (EPS)")
     idx_dcf = bloque.index("• DCF (Flujo de Caja Descontado)")
     assert idx_mul < idx_gra < idx_dcf
+    # SDD_cuenta_narrada_graham_dcf.md -- las sub-cuentas de Graham/DCF usan
+    # la versión CORTA con flechas (`_cuenta_gra_corta`/`_cuenta_dcf_corta`),
+    # nunca la fórmula comprimida de antes ni la narración completa del
+    # botón individual.
     assert "• Múltiplos ($500.00) — cuánto debería valer la acción si cotizara" in bloque
     assert "Cuenta: $8.20 × 24.00 = $500.00" in bloque
     assert "• Graham (EPS) ($480.00) — cuánto debería valer la acción según" in bloque
-    assert "Cuenta: $8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00" in bloque
+    assert (
+        "Cuenta: EPS $8.20 → se proyecta con 9.4% de crecimiento (techo 15%) → se "
+        "multiplica por 8.5+2×crecimiento y se ajusta por la tasa del bono a 10 años "
+        "(4.2%, a mayor tasa, menor valor) = $480.00."
+    ) in bloque
     assert "• DCF (Flujo de Caja Descontado) ($510.00) — cuánto vale la empresa hoy" in bloque
-    assert "Cuenta: FCF base $109.00" in bloque
+    assert (
+        "Cuenta: FCF hoy $109.00 → crece 8.3%/año durante 5 años → se descuentan esos "
+        "flujos futuros a valor de hoy al 9.1% (costo de capital) → se suma el valor de "
+        "seguir generando caja después del año 5 = $510.00 por acción."
+    ) in bloque
     assert "no calculable" not in bloque
     assert "None" not in bloque
 
@@ -3542,17 +4101,32 @@ def test_build_desglose_vf_ticker_a_3_modelos_calculables_3_subsecciones_en_orde
     "code,nombre",
     [("mul", "Múltiplos"), ("gra", "Graham (EPS)"), ("dcf", "DCF (Flujo de Caja Descontado)")],
 )
-def test_build_desglose_vf_cuenta_identica_byte_a_byte_al_boton_individual(code, nombre):
-    """Caso obligatorio de QA -- la sub-cuenta de cada modelo dentro del
-    Desglose de "vf" tiene que ser EXACTAMENTE la misma cuenta (comparación
-    de string completa) que arma hoy el botón individual («Múltiplos»/
-    «Graham»/«DCF») con el mismo `_payload_texto_libre`/`_cuenta_*`."""
+def test_build_desglose_vf_cuenta_usa_vf_sub_modelo_cuenta(code, nombre):
+    """SDD_cuenta_narrada_graham_dcf.md -- la sub-cuenta de cada modelo
+    dentro del Desglose de "vf" es exactamente la que arma
+    `_VF_SUB_MODELO_CUENTA[code]` (Múltiplos sin cambios, Graham/DCF en su
+    versión CORTA) -- ya NO es la misma cuenta que hoy arma el botón
+    individual para Graham/DCF (que usa `_CUENTA_TEXTO_LIBRE`, la versión
+    narrada completa); solo Múltiplos sigue siendo idéntico entre ambos."""
     ctx = _texto_libre_context()
     bloque = _desglose_vf(ctx)
-    esperado = ai_explain._CUENTA_TEXTO_LIBRE[code](ai_explain._payload_texto_libre(ctx, code))
+    esperado = ai_explain._VF_SUB_MODELO_CUENTA[code](ai_explain._payload_texto_libre(ctx, code))
     assert esperado is not None
     assert f"• {nombre}" in bloque
     assert f"Cuenta: {esperado}" in bloque
+
+
+@pytest.mark.parametrize("code", ["gra", "dcf"])
+def test_build_desglose_vf_narracion_completa_no_aparece_en_el_bloque(code):
+    """SDD_cuenta_narrada_graham_dcf.md, criterio de aceptación -- las
+    sub-secciones Graham/DCF de "vf" nunca muestran la narración completa
+    del botón individual (serían demasiado largas para el tope de 1200)."""
+    ctx = _texto_libre_context()
+    bloque = _desglose_vf(ctx)
+    narracion_completa = ai_explain._CUENTA_TEXTO_LIBRE[code](ai_explain._payload_texto_libre(ctx, code))
+    assert narracion_completa is not None
+    assert narracion_completa not in bloque
+    assert "→" in bloque  # marca distintiva de la versión corta
 
 
 def test_build_desglose_vf_valor_entre_parentesis_igual_a_valor_de_cuenta_vf():
@@ -3582,7 +4156,11 @@ def test_build_desglose_vf_ticker_b_multiplos_no_calculable():
     assert bloque is not None
     assert "• Múltiplos — no calculable con los datos disponibles." in bloque
     assert "• Graham (EPS) ($480.00) —" in bloque
-    assert "Cuenta: $8.20 × (8.5 + 2×9.4) × 4.4 / 4.2 = $480.00" in bloque
+    assert (
+        "Cuenta: EPS $8.20 → se proyecta con 9.4% de crecimiento (techo 15%) → se "
+        "multiplica por 8.5+2×crecimiento y se ajusta por la tasa del bono a 10 años "
+        "(4.2%, a mayor tasa, menor valor) = $480.00."
+    ) in bloque
     assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in bloque
     assert "None" not in bloque
     cuenta_vf = ai_explain._cuenta_vf(datos_vf)
@@ -3591,7 +4169,12 @@ def test_build_desglose_vf_ticker_b_multiplos_no_calculable():
 
 def test_build_desglose_vf_ticker_c_2_modelos_no_calculables():
     """Ticker C -- 2 modelos no calculables (Múltiplos y Graham), DCF
-    calculable -- evita el sesgo de solo probar "1 de 3 falla"."""
+    calculable -- evita el sesgo de solo probar "1 de 3 falla". Retrofit:
+    Graham ya NO cae al fallback genérico "no calculable con los datos
+    disponibles" (`_cuenta_gra_corta` sigue narrando con `eps`/`g`/`y`
+    disponibles, solo el resultado final dice "no calculable") -- Múltiplos
+    SÍ sigue con el fallback genérico porque `_cuenta_mul_corta` no fue
+    retrofiteada (Decisión #5: idéntica a la fórmula comprimida de antes)."""
     ctx = _vf_context({
         "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_total": 510.00,
     })
@@ -3599,9 +4182,15 @@ def test_build_desglose_vf_ticker_c_2_modelos_no_calculables():
     bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
     assert bloque is not None
     assert "• Múltiplos — no calculable con los datos disponibles." in bloque
-    assert "• Graham (EPS) — no calculable con los datos disponibles." in bloque
+    assert "• Graham (EPS) — cuánto debería valer la acción según" in bloque
+    assert "Cuenta: EPS $8.20 → se proyecta con 9.4% de crecimiento" in bloque
+    assert "= no calculable." in bloque  # resultado de Graham marcado no calculable
     assert "• DCF (Flujo de Caja Descontado) ($510.00) —" in bloque
-    assert "Cuenta: FCF base $109.00" in bloque
+    assert (
+        "Cuenta: FCF hoy $109.00 → crece 8.3%/año durante 5 años → se descuentan esos "
+        "flujos futuros a valor de hoy al 9.1% (costo de capital) → se suma el valor de "
+        "seguir generando caja después del año 5 = $510.00 por acción."
+    ) in bloque
     assert "None" not in bloque
     cuenta_vf = ai_explain._cuenta_vf(datos_vf)
     assert cuenta_vf == "($510.00) / 1 = $510.00"
@@ -3609,10 +4198,12 @@ def test_build_desglose_vf_ticker_c_2_modelos_no_calculables():
 
 def test_build_desglose_vf_ticker_d_3_modelos_no_calculables_sigue_mostrando_el_bloque():
     """Ticker D (caso extremo agregado por `qa`, resuelto por `architect`,
-    Decisión de diseño #5) -- el Desglose se sigue mostrando completo (3
-    líneas "no calculable"), aunque la Cuenta de "vf" sea `None`. Confirma
-    que `_build_desglose_vf` no depende de `_cuenta_vf` para decidir si
-    renderizarse."""
+    Decisión de diseño #5) -- el Desglose se sigue mostrando completo,
+    aunque la Cuenta de "vf" sea `None`. Confirma que `_build_desglose_vf`
+    no depende de `_cuenta_vf` para decidir si renderizarse. Retrofit:
+    Graham/DCF (con `eps`/`g`/`y`/`wacc`/`base` disponibles) narran su
+    "no calculable" dentro de la propia Cuenta -- solo Múltiplos (sin
+    retrofit) usa el fallback genérico de `_build_desglose_vf`."""
     ctx = _vf_context({
         "valor_justo_multiplos": None, "valor_justo_graham": None, "valor_justo_dcf": None,
         "valor_justo_total": None,
@@ -3621,7 +4212,8 @@ def test_build_desglose_vf_ticker_d_3_modelos_no_calculables_sigue_mostrando_el_
     assert ai_explain._cuenta_vf(datos_vf) is None
     bloque = ai_explain._build_desglose_vf(ctx, datos_vf)
     assert bloque is not None
-    assert bloque.count("no calculable con los datos disponibles") == 3
+    assert bloque.count("no calculable con los datos disponibles") == 1  # solo Múltiplos
+    assert bloque.count("= no calculable") == 2  # Graham (resultado) + DCF (resultado)
     assert "None" not in bloque
 
 
@@ -3918,7 +4510,10 @@ async def test_mensaje_paso_a_paso_vf_3_no_calculables_omite_cuenta_pero_muestra
     texto = kwargs["text"]
     assert "🧮 Cuenta" not in texto
     assert "🔍 Desglose" in texto
-    assert texto.count("no calculable con los datos disponibles") == 3
+    # Retrofit -- Múltiplos (sin retrofit) sigue con el fallback genérico;
+    # Graham/DCF narran su "no calculable" dentro de la propia Cuenta.
+    assert texto.count("no calculable con los datos disponibles") == 1
+    assert texto.count("= no calculable") == 2
     assert "None" not in texto
 
 
@@ -3938,7 +4533,8 @@ def test_build_cuenta_line_vf_none_y_leaf_message_omite_cuenta_pero_incluye_desg
 
     desglose = ai_explain._build_desglose_vf(ctx, datos_vf)
     assert desglose is not None
-    assert desglose.count("no calculable con los datos disponibles") == 3
+    assert desglose.count("no calculable con los datos disponibles") == 1
+    assert desglose.count("= no calculable") == 2
 
     texto = ai_explain._build_leaf_message(
         "Dato de prueba", "Respuesta.", None, None, cuenta=cuenta, desglose=desglose,
@@ -4130,6 +4726,17 @@ def test_consistencia_cuenta_y_desglose_texto_libre_mismo_valor_termino_a_termin
             # Piotroski, Grupo B de la spec) -- vocabulario distinto a
             # propósito, no una inconsistencia de valor.
             continue
+        if code == "dcf" and t.letra in (
+            "Valor presente de los flujos", "Valor terminal descontado", "Valor de la empresa",
+        ):
+            # SDD_cuenta_narrada_graham_dcf.md, Decisión #3 -- la narración
+            # nueva de `_cuenta_dcf` cuenta los 4 PASOS del cálculo (FCF
+            # base, crecimiento, descuento, valor terminal) pero ya no cita
+            # el monto intermedio de cada uno (VP de los flujos, VT
+            # descontado, equity value) -- esos 3 números solo viven en el
+            # Desglose término a término, no en la Cuenta narrada. Cambio
+            # deliberado, no una inconsistencia real.
+            continue
         valor = extractor(t.letra, datos)
         if valor is None:
             continue
@@ -4311,11 +4918,244 @@ def test_cuenta_y_desglose_mom_sin_cambios_por_el_cambio_de_aqm():
     cuenta = ai_explain._build_cuenta_line("texto_libre", "mom", datos)
     bloque = ai_explain._build_desglose_block("texto_libre", "mom", datos)
     assert cuenta == (
+        "El modelo compara el precio actual contra 4 referencias, cada una con sus propios datos: "
         "($550.00 − $600.00) / $600.00 × 100 = -8.2% vs. máx. 52 sem. · "
         "($550.00 − $400.00) / $400.00 × 100 = 25.0% vs. mín. 52 sem. · "
         "($550.00 − $540.00) / $540.00 × 100 = 3.1% vs. promedio 50d · "
-        "($550.00 − $520.00) / $520.00 × 100 = 9.4% vs. promedio 200d"
+        "($550.00 − $520.00) / $520.00 × 100 = 9.4% vs. promedio 200d."
     )
     assert bloque is not None
     assert "-8.2%" in bloque
     assert "25.0%" in bloque
+
+
+# ---------------------------------------------------------------------------
+# Test genérico anti-"None"/"nan" -- pedido explícito de `security`
+# (Revisión de seguridad, §2) hecho operativo por `qa` (Criterios de QA, §1)
+# de SDD_cuenta_narrada_universal.md. Corre sobre las 21 funciones bajo el
+# mecanismo de 3 reglas (16 preguntas nuevas + `_cuenta_gra`/`_cuenta_dcf` +
+# `_cuenta_gra_corta`/`_cuenta_dcf_corta`/`_cuenta_mul_corta`), para cada
+# combinación de "1 dato faltante a la vez", más "todos disponibles" y
+# "ninguno disponible" -- confirma que la palabra "None"/"nan" nunca aparece
+# en el texto final devuelto.
+# ---------------------------------------------------------------------------
+
+
+_NAN_TOKEN_RE = re.compile(r"\bnan\b", re.IGNORECASE)
+
+
+def _sin_none_ni_nan(texto: str) -> bool:
+    # "nan" como palabra SUELTA (ej. `str(float("nan"))`) -- no una substring
+    # dentro de palabras españolas legítimas como "Ganancia"/"financiero".
+    return "None" not in texto and not _NAN_TOKEN_RE.search(texto)
+
+
+def _null_top(datos: dict, campo: str) -> dict:
+    d = dict(datos)
+    d[campo] = None
+    return d
+
+
+def _null_nested(clave_externa: str):
+    def _setter(datos: dict, campo: str) -> dict:
+        d = dict(datos)
+        d[clave_externa] = dict(d[clave_externa])
+        d[clave_externa][campo] = None
+        return d
+    return _setter
+
+
+# Cada entrada: (nombre, fn, datos_base_todo_disponible, [campos a anular 1 a
+# la vez], setter(datos, campo) -> datos_modificado).
+_GENERICO_ANTI_NONE_CASOS = [
+    (
+        "ver", ai_explain._cuenta_ver,
+        {"precio_actual": 550.0, "valor_justo_total": 496.0, "veredicto_barata": True},
+        ["precio_actual", "valor_justo_total"], _null_top,
+    ),
+    (
+        "mul", ai_explain._cuenta_mul,
+        {"eps_ttm": 8.2, "per_promedio_peers": 24.0, "escenario_elegido": "conservador", "conservador": 500.0},
+        ["eps_ttm", "per_promedio_peers", "conservador"], _null_top,
+    ),
+    (
+        "mul_corta", ai_explain._cuenta_mul_corta,
+        {"eps_ttm": 8.2, "per_promedio_peers": 24.0, "escenario_elegido": "conservador", "conservador": 500.0},
+        ["eps_ttm", "per_promedio_peers", "conservador"], _null_top,
+    ),
+    (
+        "rat", ai_explain._cuenta_rat,
+        {
+            "current_assets": 100.0, "current_liabilities": 50.0, "ratio_liquidez": 1.8,
+            "revenue": 1000.0, "cost_of_revenue": 400.0, "margen_bruto": 0.65,
+            "precio_actual": 550.0, "eps_ttm": 8.2, "per": 22.5, "per_no_aplicable": False,
+            "market_cap": 2_000_000.0, "ps": 6.2,
+        },
+        ["current_assets", "current_liabilities", "revenue", "cost_of_revenue",
+         "precio_actual", "eps_ttm", "per", "market_cap", "ps"], _null_top,
+    ),
+    (
+        "pil", ai_explain._cuenta_pil,
+        {
+            "pillars": {
+                "ingresos_crecientes": True, "utilidades_crecientes": True,
+                "deuda_controlada": True, "precio_razonable": False,
+            },
+            "revenue_reciente": 1000.0, "revenue_antiguo": 800.0,
+            "net_income_reciente": 200.0, "net_income_antiguo": 150.0,
+            "ratio_liquidez": 1.8,
+        },
+        ["revenue_reciente", "revenue_antiguo", "net_income_reciente",
+         "net_income_antiguo", "ratio_liquidez"], _null_top,
+    ),
+    (
+        "rsk", ai_explain._cuenta_rsk,
+        {"beta": 1.15, "beta_umbral_bajo": 0.8, "beta_umbral_alto": 1.2},
+        ["beta", "beta_umbral_bajo", "beta_umbral_alto"], _null_top,
+    ),
+    (
+        "mom", ai_explain._cuenta_mom,
+        {
+            "precio_actual": 550.0, "year_high": 600.0, "year_low": 400.0,
+            "price_avg_50": 540.0, "price_avg_200": 520.0,
+            "pct_vs_year_high": -8.2, "pct_vs_year_low": 25.0,
+            "pct_vs_avg_50": 3.1, "pct_vs_avg_200": 9.4,
+        },
+        ["precio_actual", "year_high", "year_low", "price_avg_50", "price_avg_200"], _null_top,
+    ),
+    (
+        "cmp", ai_explain._cuenta_cmp,
+        {"precio_actual": 550.0, "eps_ttm": 8.2, "per_propio": 22.5, "per_promedio_peers": 24.0},
+        ["precio_actual", "eps_ttm", "per_propio", "per_promedio_peers"], _null_top,
+    ),
+    (
+        "gra", ai_explain._cuenta_gra,
+        {"eps_ttm": 16.70, "g_aplicado": 0.134, "y_value": 0.044, "escenario_elegido": "conservador", "conservador": 493.44},
+        ["eps_ttm", "g_aplicado", "y_value", "conservador"], _null_top,
+    ),
+    (
+        "gra_corta", ai_explain._cuenta_gra_corta,
+        {"eps_ttm": 16.70, "g_aplicado": 0.134, "y_value": 0.044, "escenario_elegido": "conservador", "conservador": 493.44},
+        ["eps_ttm", "g_aplicado", "y_value", "conservador"], _null_top,
+    ),
+    (
+        "dcf", ai_explain._cuenta_dcf,
+        {
+            "dcf_wacc": 0.124, "dcf_g_fcf": 0.093, "dcf_fcf_base": 9_852_000_000.00,
+            "dcf_valor_presente_flujos": 45_360_690_094.48, "dcf_valor_terminal_descontado": 88_645_529_833.61,
+            "dcf_equity_value": 134_006_219_928.09, "escenario_elegido": "conservador", "conservador": 313.83,
+        },
+        ["dcf_wacc", "dcf_g_fcf", "dcf_fcf_base", "dcf_valor_presente_flujos",
+         "dcf_valor_terminal_descontado", "dcf_equity_value", "conservador"], _null_top,
+    ),
+    (
+        "dcf_corta", ai_explain._cuenta_dcf_corta,
+        {
+            "dcf_wacc": 0.124, "dcf_g_fcf": 0.093, "dcf_fcf_base": 9_852_000_000.00,
+            "dcf_valor_presente_flujos": 45_360_690_094.48, "dcf_valor_terminal_descontado": 88_645_529_833.61,
+            "dcf_equity_value": 134_006_219_928.09, "escenario_elegido": "conservador", "conservador": 313.83,
+        },
+        ["dcf_wacc", "dcf_g_fcf", "dcf_fcf_base", "dcf_valor_presente_flujos",
+         "dcf_valor_terminal_descontado", "dcf_equity_value", "conservador"], _null_top,
+    ),
+    (
+        "alz", ai_explain._cuenta_alz,
+        {"altman": {"disponible": True, "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "e": 0.87, "z": 2.67}},
+        ["a", "b", "c", "d", "e"], _null_nested("altman"),
+    ),
+    (
+        "azp", ai_explain._cuenta_azp,
+        {"altman_pp": {"disponible": True, "a": 0.34, "b": 0.12, "c": 0.18, "d": 1.05, "z": 4.93}},
+        ["a", "b", "c", "d"], _null_nested("altman_pp"),
+    ),
+    (
+        "mgr", ai_explain._cuenta_mgr,
+        {"disponible": True, "ebit": 114_000.0, "capital_invertido": 570_000.0, "roic": 0.2},
+        ["ebit", "capital_invertido"], _null_top,
+    ),
+    (
+        "mge", ai_explain._cuenta_mge,
+        {
+            "disponible": True, "ebit": 114_000.0, "market_cap": 1_400_000.0,
+            "total_debt": 100_000.0, "cash": 75_000.0, "earnings_yield": 0.08,
+        },
+        ["ebit", "market_cap", "total_debt", "cash"], _null_top,
+    ),
+    (
+        "aqv", ai_explain._cuenta_aqv,
+        {"earnings_yield": 0.08, "umbral_alto": 0.08, "umbral_bajo": 0.04, "value": "alto"},
+        ["earnings_yield", "umbral_alto", "umbral_bajo"], _null_top,
+    ),
+    (
+        "aqq", ai_explain._cuenta_aqq,
+        {
+            "roe": 0.22, "roe_umbral_alto": 0.15, "roe_umbral_bajo": 0.05,
+            "gross_margin": 0.55, "gross_margin_umbral_alto": 0.40, "gross_margin_umbral_bajo": 0.20,
+            "piotroski_ratio": 0.778, "piotroski_ratio_umbral_alto": 0.75, "piotroski_ratio_umbral_bajo": 0.4,
+            "quality": "alto",
+        },
+        ["roe", "gross_margin", "piotroski_ratio"], _null_top,
+    ),
+    (
+        "aqm", ai_explain._cuenta_aqm,
+        {"precio_actual": 150.0, "price_avg_50": 140.0, "price_avg_200": 130.0, "momentum": "medio"},
+        ["precio_actual", "price_avg_50", "price_avg_200"], _null_top,
+    ),
+    (
+        "aql", ai_explain._cuenta_aql,
+        {"beta": 1.05, "beta_umbral_bajo": 0.8, "beta_umbral_alto": 1.2, "low_vol": "bajo"},
+        ["beta", "beta_umbral_bajo", "beta_umbral_alto"], _null_top,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "nombre, fn, datos_base, campos, setter", _GENERICO_ANTI_NONE_CASOS, ids=[c[0] for c in _GENERICO_ANTI_NONE_CASOS],
+)
+def test_ninguna_cuenta_narrada_expone_none_o_nan(nombre, fn, datos_base, campos, setter):
+    """Hace operativa la recomendación de `security` (Revisión de seguridad,
+    §2 de SDD_cuenta_narrada_universal.md): para las 21 funciones bajo el
+    mecanismo de 3 reglas, ninguna combinación de 1 dato faltante a la vez
+    (ni "todos disponibles" ni "ninguno disponible") produce el string
+    literal "None"/"nan" en el texto devuelto."""
+    # Todos disponibles.
+    resultado = fn(dict(datos_base))
+    if resultado is not None:
+        assert _sin_none_ni_nan(resultado), f"{nombre}: 'None'/'nan' con todos los datos disponibles"
+
+    # 1 dato faltante a la vez.
+    for campo in campos:
+        datos = setter(datos_base, campo)
+        resultado = fn(datos)
+        if resultado is not None:
+            assert _sin_none_ni_nan(resultado), f"{nombre}: 'None'/'nan' faltando solo {campo!r}"
+
+    # Ninguno disponible -- se anulan todos los campos de datos del barrido
+    # (los campos de control/etiqueta, ej. "escenario_elegido"/"disponible",
+    # no forman parte de `campos` a propósito: no son "datos que pueden
+    # faltar", son metadata que decide qué camino tomar).
+    datos_vacios = dict(datos_base)
+    for campo in campos:
+        datos_vacios = setter(datos_vacios, campo)
+    resultado = fn(datos_vacios)
+    if resultado is not None:
+        assert _sin_none_ni_nan(resultado), f"{nombre}: 'None'/'nan' con ningún dato disponible"
+
+
+def test_ninguna_cuenta_narrada_piotroski_expone_none_o_nan():
+    """Mismo test genérico, aplicado a `pig` (todo-o-nada, sin mecanismo de
+    3 reglas) y `_fmt_criterio_piotroski` (mecanismo por-criterio) -- QA,
+    §1, segundo ítem."""
+    assert ai_explain._cuenta_pig({"piotroski": {"puntaje": 7, "criterios_evaluables": 9}}) is not None
+    r = ai_explain._cuenta_pig({"piotroski": {"puntaje": 7, "criterios_evaluables": 9}})
+    assert _sin_none_ni_nan(r)
+    assert ai_explain._cuenta_pig({"piotroski": {"puntaje": None, "criterios_evaluables": None}}) is None
+
+    criterio_ok = {"nombre": "roa_positivo", "cumplido": True, "valores": {"net_income_t": 118.0}}
+    criterio_sin_datos = {"nombre": "roa_positivo", "cumplido": None, "valores": None}
+    criterio_desconocido = {"nombre": "no_existe", "cumplido": True, "valores": {"x": 1}}
+    for c in (criterio_ok, criterio_sin_datos):
+        r = ai_explain._fmt_criterio_piotroski(c)
+        if r is not None:
+            assert _sin_none_ni_nan(r)
+    assert ai_explain._fmt_criterio_piotroski(criterio_desconocido) is None
