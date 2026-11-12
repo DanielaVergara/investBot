@@ -21,7 +21,7 @@ _PERFILES_CONSERVADORES = {"muy_conservador", "conservador"}
 # SDD_explicacion_paso_a_paso.md, Decisión de diseño #5 -- mismo patrón que
 # `advanced_scoring.LOW_VOL_BETA_UMBRAL_BAJO`/`_ALTO`: nombra los literales
 # 0.8/1.2 ya existentes, sin cambio de comportamiento. Necesario para que el
-# botón "paso a paso" de `rsk` pueda mandar estos 2 números a Ollama como
+# botón "paso a paso" de `rsk` pueda mandar estos 2 números a Gemini como
 # dato garantizado (Bug 2 -- un número del marco conceptual del bot tiene
 # que viajar nombrado o el guard lo rechaza).
 BETA_UMBRAL_BAJO = 0.8

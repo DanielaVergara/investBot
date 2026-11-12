@@ -1,4 +1,4 @@
-"""Explicaciones interactivas con Ollama, menú por capas —
+"""Explicaciones interactivas con Gemini, menú por capas —
 `SDD_menu_por_capas_explicaciones.md` (rediseño de
 `SDD_explicaciones_interactivas_ollama.md`, cerrada, + 2 fixes de
 producción del 2026-09-02 ya incorporados).
@@ -14,23 +14,23 @@ explicaciones.md`, extendida por `SDD_explicacion_paso_a_paso.md`):
 - `xp:{id}:c:{cat}`  -> botones de Nivel 2 de una categoría + "🔙 Menú"
 - `xp:{id}:{code}`   -> "Ver dato" -- pregunta puntual (leaf), según
   `QuestionSpec.variant` (`ai_explain_content.py`): determinístico sin
-  Ollama para `dato_y_paso_a_paso`/`deterministico`, o llama a Ollama con
+  Gemini para `dato_y_paso_a_paso`/`deterministico`, o llama a Gemini con
   `SYSTEM_PROMPT_EXPLAIN` para `narrativa`.
 - `xp:{id}:p:{code}` -> "Explicame paso a paso" -- solo preguntas
-  `variant="dato_y_paso_a_paso"`; llama a Ollama con la cuenta ya resuelta
+  `variant="dato_y_paso_a_paso"`; llama a Gemini con la cuenta ya resuelta
   (100% Python) inyectada al payload y `SYSTEM_PROMPT_PASO_A_PASO`.
 
-Guard de integridad (heredado sin aflojar): la respuesta de Ollama puede
+Guard de integridad (heredado sin aflojar): la respuesta de Gemini puede
 usar cualquier SUBCONJUNTO de los tokens protegidos que le pasamos, pero
 ningún token protegido en la respuesta puede estar ausente de los datos
 originales (bloquea alucinación de números/tickers nuevos). La fórmula y la
 fuente del dato (Decisión de diseño #5) son SIEMPRE texto fijo agregado
-DESPUÉS de la respuesta de Ollama — nunca pasan por este guard porque nunca
-pasan por Ollama.
+DESPUÉS de la respuesta de Gemini — nunca pasan por este guard porque nunca
+pasan por Gemini.
 
 Hallazgo 1 BLOQUEANTE de `security` (spec anterior, sigue vigente):
 `sector`/`industry` (texto libre de FMP) nunca viajan crudos al prompt de
-Ollama. `sector` se valida contra una allow-list GICS cerrada
+Gemini. `sector` se valida contra una allow-list GICS cerrada
 (`_SECTOR_ALLOWLIST`); `industry` se excluye directamente del payload en
 todos los casos.
 
@@ -52,12 +52,21 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
-from investbot import advanced_scoring, ai_explain_content, ai_rewrite, risk_fit, summary, valuation
+from investbot import (
+    advanced_scoring,
+    ai_explain_content,
+    ai_rewrite,
+    db,
+    gemini_client,
+    risk_fit,
+    summary,
+    valuation,
+)
+from investbot.gemini_client import GeminiConfig, GeminiError, violates_output_filter
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +83,9 @@ RATE_LIMITED_MSG = "Estás consultando muy rápido — esperá un minuto antes d
 
 # --- Mensajes de fallback ----------------------------------------------
 
-EXPLAIN_UNAVAILABLE_MSG = "📋 Ollama no está disponible en este momento — probá de nuevo en un rato."
+EXPLAIN_UNAVAILABLE_MSG = (
+    "📋 La explicación con IA no está disponible en este momento — probá de nuevo en un rato."
+)
 EXPLAIN_EXPIRED_MSG = "Este botón ya venció — pedí el análisis de nuevo para ver explicaciones."
 EXPLAIN_PENDING_MSG = "🤔 Pensando la explicación…"
 EXPLAIN_INVALID_MSG = "Ese botón no es válido — pedí el análisis de nuevo si querés una explicación."
@@ -86,7 +97,7 @@ EXPLAIN_INVALID_MSG = "Ese botón no es válido — pedí el análisis de nuevo 
 EXPLAIN_DELIVERY_FAILED_MSG = "⚠️ Algo salió mal generando la explicación. Probá de nuevo en un rato."
 
 # Prefijo de contenido 100% determinístico (Decisión de diseño #4 — `evt`/
-# `inf`, nunca pasan por Ollama). Mismo espíritu que
+# `inf`, nunca pasan por Gemini). Mismo espíritu que
 # `advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS`.
 DETERMINISTIC_PREFIX = "📋 Contenido fijo (sin IA)."
 
@@ -260,16 +271,11 @@ _ALL_QUESTIONS_COMBINED: dict[str, ai_explain_content.QuestionSpec] = {
 # --- Sanitización de sector/industry (hallazgo 1 BLOQUEANTE de `security`,
 # spec anterior — sin cambios) -----------------------------------------
 #
-# Punto 2 de la revisión de `security` en `SDD_ollama_texto_plano.md`: hoy
-# `datos_del_contexto` no tiene NINGÚN campo de texto libre no sanitizado
-# (todo lo demás son enums cerrados o numéricos) -- por eso la secuencia
-# literal del marcador de extracción (`_MARCADOR_RESPUESTA`,
-# "###RESPUESTA###") no puede colarse hoy vía `sector` ni ningún otro campo.
-# Si en el futuro se agrega un campo de texto libre nuevo (ej. una
-# descripción de FMP sin allowlist) a `datos_del_contexto`, este mismo
-# análisis debe repetirse ANTES de sumarlo al payload: un atacante que
-# controlara ese texto podría anteponer su propio `_MARCADOR_RESPUESTA` para
-# hacer que `_extraer_respuesta_plana` corte donde el atacante eligiera.
+# Hoy `datos_del_contexto` no tiene NINGÚN campo de texto libre no
+# sanitizado (todo lo demás son enums cerrados, numéricos o filtrados por
+# `_validated_*`). Si en el futuro se agrega un campo de texto libre nuevo
+# (ej. una descripción de FMP sin allowlist) a `datos_del_contexto`, hay que
+# validarlo ANTES de sumarlo al payload: viaja a Google (CS-4).
 
 _SECTOR_ALLOWLIST = frozenset(
     {
@@ -292,6 +298,37 @@ _SECTOR_NO_DISPONIBLE = "no disponible"
 def _validated_sector(sector: Optional[str]) -> str:
     if sector in _SECTOR_ALLOWLIST:
         return sector
+    return _SECTOR_NO_DISPONIBLE
+
+
+# CS-4 (SDD_migracion_gemini.md, 13.2 E-6/E-8): `peers_usados` viene de
+# Finnhub sin validar y `perfil` de la base; ambos viajan a Google en el
+# payload, así que se filtran igual que `sector`. `re.fullmatch`, nunca `$`.
+_PEER_TICKER_RE = re.compile(r"[A-Z0-9]{1,6}(?:[.\-][A-Z0-9]{1,2})?")
+_MAX_PEERS_PAYLOAD = 10
+
+
+def _validated_peers(peers) -> list[str]:
+    """Conserva en orden los `str` que cumplen `_PEER_TICKER_RE`, sin
+    duplicados, máximo 10; lo que no cumple se descarta."""
+    if not isinstance(peers, (list, tuple)):
+        return []
+    validos: list[str] = []
+    for peer in peers:
+        if (
+            isinstance(peer, str)
+            and _PEER_TICKER_RE.fullmatch(peer)
+            and peer not in validos
+        ):
+            validos.append(peer)
+            if len(validos) == _MAX_PEERS_PAYLOAD:
+                break
+    return validos
+
+
+def _validated_perfil(perfil) -> str:
+    if isinstance(perfil, str) and perfil in db.PERFILES_VALIDOS:
+        return perfil
     return _SECTOR_NO_DISPONIBLE
 
 
@@ -434,7 +471,7 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
         return {
             "modelo": "Encaje con tu perfil de riesgo",
             "encaja": risk_fit_d.get("encaja"),
-            "perfil": risk_fit_d.get("perfil"),
+            "perfil": _validated_perfil(risk_fit_d.get("perfil")),
             "beta": risk_fit_d.get("beta"),
             "etiqueta_activo": risk_fit_d.get("etiqueta_activo"),
             "beta_umbral_bajo": risk_fit.BETA_UMBRAL_BAJO,
@@ -466,7 +503,7 @@ def _payload_texto_libre(context: ExplanationContext, question_code: str) -> dic
             "per_minimo_peers": pc.get("per_minimo_peers"),
             "per_promedio_peers": pc.get("per_promedio_peers"),
             "per_maximo_peers": pc.get("per_maximo_peers"),
-            "peers_usados": pc.get("peers_usados"),
+            "peers_usados": _validated_peers(pc.get("peers_usados")),
             "posicion": pc.get("posicion"),
             "motivo_no_comparable": pc.get("motivo_no_comparable"),
             "eps_ttm": context.eps_ttm,
@@ -614,7 +651,7 @@ def _build_explain_payload(context: ExplanationContext, question_code: str) -> d
 
 
 # --- Bloque "📌 Dato" (Decisión de diseño #5 — determinístico, sacado del
-# mismo payload ya armado para Ollama, nunca recalculado) -------------------
+# mismo payload ya armado para Gemini, nunca recalculado) -------------------
 
 
 def _fmt_money_or_nd(value: object) -> str:
@@ -740,12 +777,12 @@ def _build_leaf_message(
     paso_a_paso.md y por SDD_desglose_terminos_formula.md): header -> Dato ->
     Cuenta (si está presente) -> Desglose (si está presente, Decisión de
     diseño #2 de esa spec: sección nueva, no reemplaza Cuenta) -> respuesta
-    de Ollama -> Fórmula/Fuente (si existen) -> disclaimer. Fórmula/Fuente/
+    de Gemini -> Fórmula/Fuente (si existen) -> disclaimer. Fórmula/Fuente/
     Cuenta/Desglose NUNCA pasan por el guard de integridad tal cual (Cuenta
     SÍ entra a `datos_del_contexto` -- y por lo tanto a `datos_tokens` --
-    ANTES de llamar a Ollama, Decisión de diseño #4 de la spec anterior;
+    ANTES de llamar a Gemini, Decisión de diseño #4 de la spec anterior;
     Desglose, igual que Fórmula/Fuente, se arma y se inserta en el texto
-    final DESPUÉS de la respuesta de Ollama, nunca antes ni mezclado con el
+    final DESPUÉS de la respuesta de Gemini, nunca antes ni mezclado con el
     prompt -- Decisión de diseño #4/Revisión de seguridad de
     SDD_desglose_terminos_formula.md)."""
     partes = [ai_rewrite.TRANSPARENCY_USED, f"📌 Dato: {dato_line}"]
@@ -768,7 +805,7 @@ def _build_leaf_message(
 def _build_ver_dato_content(context: ExplanationContext, question_code: str) -> str:
     """"Ver dato" (Decisión de diseño #9) — generalización de
     `DETERMINISTIC_PREFIX` + 📌 Dato + 📐 Fórmula/📊 Fuente (si existen) a las
-    22 preguntas `dato_y_paso_a_paso`: nunca llama a Ollama, sin cuenta
+    22 preguntas `dato_y_paso_a_paso`: nunca llama a Gemini, sin cuenta
     (exclusiva de "paso a paso"), sin disclaimer (no es contenido generado
     por IA)."""
     datos = _build_explain_payload(context, question_code)
@@ -787,7 +824,7 @@ def _build_ver_dato_content(context: ExplanationContext, question_code: str) -> 
 
 
 # --- Bloque "🧮 Cuenta" (paso a paso) — Decisión de diseño #3/#4 -----------
-# 100% Python, nunca por Ollama. Lee ÚNICAMENTE del `datos` ya armado por
+# 100% Python, nunca por Gemini. Lee ÚNICAMENTE del `datos` ya armado por
 # `_build_explain_payload` -- nunca recalcula nada, nunca vuelve a llamar a
 # `advanced_scoring.py`/`valuation.py`. Si un campo necesario falta (modelo
 # no calculable para ese ticker), devuelve `None` -- nunca arma un string
@@ -814,7 +851,7 @@ def _pct1(x: float) -> str:
 def _enforce_cuenta_length(cuenta: str, max_chars: int = _MAX_CUENTA_CHARS) -> Optional[str]:
     """`_MAX_CUENTA_CHARS=800` (Decisión de diseño #8, retomada como tope
     único por SDD_cuenta_narrada_universal.md Decisión #4). Mejora
-    recomendada (c) de `security`: a diferencia de la prosa de Ollama, la
+    recomendada (c) de `security`: a diferencia de la prosa de Gemini, la
     "cuenta" es aritmética -- cortarla a mitad de un número mostraría un
     resultado incompleto y potencialmente engañoso. Si el límite se excede
     (no debería pasar con tickers reales, peor caso medido 671, margen
@@ -833,7 +870,7 @@ def _enforce_cuenta_length(cuenta: str, max_chars: int = _MAX_CUENTA_CHARS) -> O
 # formula.md + SDD_desglose_con_valores_reales.md, Decisión de diseño
 # #3/#4/#5. Texto fijo (nombre/origen/qué mide) + valor real puntual del
 # ticker por línea, agregado en la spec de valores reales. Nunca por
-# Ollama -- se arma DESPUÉS de `_fetch_explanation`, nunca es input suyo.
+# Gemini -- se arma DESPUÉS de `_fetch_explanation`, nunca es input suyo.
 
 _MAX_DESGLOSE_CHARS = 1200
 
@@ -1186,9 +1223,9 @@ def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optiona
     propio se arma con la MISMA `_payload_texto_libre(context, code)` que ya
     usa `_build_explain_payload` cuando el usuario toca el botón individual
     -- no se inventa ninguna fuente de dato nueva, y ese `datos` intermedio
-    NUNCA se mezcla con `datos_del_contexto` (el que ve Ollama para "vf") --
+    NUNCA se mezcla con `datos_del_contexto` (el que ve Gemini para "vf") --
     se descarta apenas se usa para armar el texto del Desglose, que se
-    inserta DESPUÉS de la respuesta de Ollama, igual que el resto del
+    inserta DESPUÉS de la respuesta de Gemini, igual que el resto del
     mecanismo."""
     terminos = ai_explain_content.desglose("texto_libre", "vf")
     if not terminos:
@@ -1871,7 +1908,7 @@ def _build_cuenta_line(kind: str, question_code: str, datos: dict) -> Optional[s
 
 
 def _build_deterministic_content(context: ExplanationContext, question_code: str) -> str:
-    """`evt`/`inf` — Decisión de diseño #4: nunca llaman a Ollama, contenido
+    """`evt`/`inf` — Decisión de diseño #4: nunca llaman a Gemini, contenido
     ya construido por `summary.py`, prefijado con `DETERMINISTIC_PREFIX`."""
     if question_code == "evt":
         block = summary.build_corporate_events_section(context.corporate_events) or (
@@ -1907,27 +1944,19 @@ SYSTEM_PROMPT_EXPLAIN = (
     "   inventes, estimes ni completes un dato que no esté ahí.\n"
     "3. Nunca dés una recomendación de compra/venta ni asesoramiento\n"
     "   financiero personalizado — solo explicá qué significa el dato.\n"
-    "4. Empezá tu respuesta completa, sin nada antes, con el texto exacto\n"
-    "   ###RESPUESTA### seguido de un salto de línea, y a continuación tu\n"
-    "   explicación en prosa. No agregues saludos, aclaraciones, ni texto de\n"
-    "   ningún tipo antes de ###RESPUESTA### ni después de terminar tu\n"
-    "   explicación.\n"
+    "4. Copiá los números exactamente como aparecen en el JSON: mismo\n"
+    "   formato, punto decimal, sin separador de miles.\n"
     "5. Con tono de análisis de inversionista: si el JSON trae la clave\n"
     "   \"modelo\" o \"modelos\", nombrá ese/esos modelo(s) financiero(s) al\n"
     "   principio de tu respuesta y decí en general qué mide -- sin salirte\n"
     "   de las 2 a 4 oraciones de la regla 1.\n"
-    "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
-    "   respuesta — tu respuesta, después de ###RESPUESTA###, es SOLO la\n"
-    "   explicación en prosa, nunca el JSON de entrada ni fragmentos de él.\n"
-    "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
-    "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
+    "6. Respondé en español rioplatense.\n"
 )
 
 # Decisión de diseño #4 de SDD_explicacion_paso_a_paso.md -- NO reemplaza
 # `SYSTEM_PROMPT_EXPLAIN` (ese sigue usándose sin cambios para `mod`/`ben`/
 # `ren`, variant="narrativa"): exclusivo del camino "paso a paso" de las 22
-# preguntas `dato_y_paso_a_paso`. Mismo `format: "json"`, mismo
-# `num_predict=220`, mismo timeout -- sin cambios de infraestructura de red.
+# preguntas `dato_y_paso_a_paso`. Mismo tope de tokens y mismo timeout.
 SYSTEM_PROMPT_PASO_A_PASO = (
     "Sos un profesor de finanzas que explica en español rioplatense, en un\n"
     "mensaje de chat. Vas a recibir un JSON con una pregunta puntual, los\n"
@@ -1948,22 +1977,15 @@ SYSTEM_PROMPT_PASO_A_PASO = (
     "   estimes ni completes un dato que no esté ahí.\n"
     "3. Nunca dés una recomendación de compra/venta ni asesoramiento financiero\n"
     "   personalizado — solo explicá qué significa el resultado.\n"
-    "4. Empezá tu respuesta completa, sin nada antes, con el texto exacto\n"
-    "   ###RESPUESTA### seguido de un salto de línea, y a continuación tu\n"
-    "   explicación en prosa. No agregues saludos, aclaraciones, ni texto de\n"
-    "   ningún tipo antes de ###RESPUESTA### ni después de terminar tu\n"
-    "   explicación.\n"
+    "4. Copiá los números exactamente como aparecen en el JSON: mismo\n"
+    "   formato, punto decimal, sin separador de miles.\n"
     "5. Con tono de análisis de inversionista: nombrá el modelo financiero\n"
     "   (\"modelo\"/\"modelos\" en el JSON) al principio de tu respuesta y decí en\n"
     "   general qué mide -- sin salirte de las 2 a 4 oraciones de la regla 1.\n"
-    "6. NUNCA repitas ni copies el JSON de datos que recibiste en tu\n"
-    "   respuesta — tu respuesta, después de ###RESPUESTA###, es SOLO la\n"
-    "   explicación en prosa, nunca el JSON de entrada ni fragmentos de él.\n"
-    "7. Respondé SIEMPRE en español (de Argentina/Río de la Plata) — NUNCA\n"
-    "   en portugués, inglés, ni mezclando idiomas, ni una sola palabra.\n"
+    "6. Respondé en español rioplatense.\n"
 )
 
-MAX_EXPLANATION_OUTPUT_TOKENS = 220
+MAX_EXPLANATION_OUTPUT_TOKENS = 1024
 _MAX_EXPLANATION_CHARS = 480
 
 
@@ -1981,7 +2003,7 @@ def _normalize_numeric_token(token: str) -> str:
     """Normaliza formato (no valor) para comparar contra los tokens
     protegidos del payload real. Además del `$`/signo/separador de miles ya
     cubiertos, distingue coma DECIMAL de coma de MILES (incidente de
-    producción 2026-09-04: Ollama a veces escribe montos con coma decimal,
+    producción 2026-09-04: el modelo a veces escribe montos con coma decimal,
     ej. "$285,75" en vez de "285.75" -- mezcla de convenio numérico de otro
     idioma/locale -- que antes se normalizaba mal a "28575", un valor
     distinto, y disparaba un rechazo del guard sobre un número que en
@@ -2011,12 +2033,12 @@ def _percent_token_a_decimal(token: str) -> Optional[str]:
     """Si `token` (ya normalizado por `_normalize_numeric_token`) es un
     porcentaje, devuelve el string que tendría el mismo valor expresado
     como proporción decimal cruda (ej. "12%" -> "0.12"), matcheando cómo
-    `json.dumps` serializa el float crudo del payload que Ollama recibió
+    `json.dumps` serializa el float crudo del payload que el modelo recibió
     (ej. `net_debt_to_ebitda: 0.12`, un múltiplo -- no un porcentaje -- que
     varios campos vecinos del mismo payload SÍ son, roe/dividend_yield/
     payout_ratio). Extiende la normalización de formato ya existente
     ($/separador de miles) al mismo tipo de falso positivo: incidente real
-    de producción 2026-09-03 donde Ollama redactó 0.12 como "12%" para
+    de producción 2026-09-03 donde el modelo redactó 0.12 como "12%" para
     `net_debt_to_ebitda` -- mismo valor, otra representación, no una
     alucinación. `None` si `token` no es un porcentaje o no es convertible."""
     if not token.endswith("%"):
@@ -2042,187 +2064,7 @@ def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
     return True
 
 
-# --- Detección de eco del JSON de entrada (incidente de producción
-# 2026-09-03, captura de Daniela, con el contrato JSON de salida vigente en
-# ese momento): `qwen2.5:3b-instruct` a veces devolvía
-# `{"respuesta": "<datos_del_contexto repetido> -- <explicación real>"}` --
-# el parseo del contrato de esa época era válido, pero el CONTENIDO de
-# `respuesta` era el eco del payload que le mandamos, no una explicación.
-# `SDD_ollama_texto_plano.md` -- esta detección opera igual sobre el texto ya
-# extraído por `_extraer_respuesta_plana`, ahora sin envoltura JSON de salida
-# que nombrar. Tratado igual que respuesta vacía tras extracción: reintento
-# único, y si el reintento también da el mismo patrón, `_ExplainUnavailable`.
-# ---------------------------------------------------------------------------
-
-_ECO_PREFIX_CHARS = 50
-# Ampliada (Decisión #4 de `SDD_ollama_texto_plano.md`): sin envoltura JSON de
-# salida, un eco del `prompt` de entrada sigue terminando en "}" (el prompt es
-# JSON y siempre cierra así) pero ya no hay motivo para que el modelo agregue
-# el separador literal "--" -- ese separador era un artefacto de cómo fusionaba
-# el eco con su propia respuesta DENTRO de la sintaxis JSON que antes se le
-# exigía. Se acepta también salto(s) de línea como separador válido (ajuste
-# preventivo, sin evidencia empírica todavía en texto plano -- revisar con
-# logs reales tras el primer despliegue).
-_ECO_SEPARADOR_RE = re.compile(r"\}\s*(--\s*|\n+)")
-
-
-def _normalizar_para_comparar_eco(texto: str) -> str:
-    return re.sub(r"\s+", "", texto)
-
-
-def _respuesta_es_eco_del_payload(respuesta: str, datos_del_contexto: dict) -> bool:
-    """Dos señales independientes, cualquiera dispara -- ninguna depende de
-    que Ollama serialice el JSON EXACTAMENTE igual a `json.dumps`, ya que
-    puede reformatear espacios al repetirlo:
-    1. Los primeros `_ECO_PREFIX_CHARS` de `respuesta` (sin espacios)
-       coinciden con los primeros `_ECO_PREFIX_CHARS` del `datos_del_
-       contexto` serializado (sin espacios) -- comparación real contra lo
-       que se envió, no solo "empieza con {" (evita falsos positivos si
-       alguna vez una respuesta legítima arrancara con una llave).
-    2. Aparece el separador visto en la evidencia real ("} -- "/"}-- ") O
-       un salto de línea tras el "}" de cierre del eco (`_ECO_SEPARADOR_RE`,
-       ampliada por `SDD_ollama_texto_plano.md`) cerca del principio de
-       `respuesta`, con contenido real después -- señal tolerante para el
-       caso en que el eco no sea 100% textual.
-    """
-    texto = respuesta.strip()
-    if not texto:
-        return False
-
-    payload_json = json.dumps(datos_del_contexto, ensure_ascii=False)
-    texto_norm = _normalizar_para_comparar_eco(texto)[:_ECO_PREFIX_CHARS]
-    payload_norm = _normalizar_para_comparar_eco(payload_json)[:_ECO_PREFIX_CHARS]
-    if texto_norm and payload_norm and texto_norm == payload_norm:
-        return True
-
-    match = _ECO_SEPARADOR_RE.search(texto[:200])
-    if match is not None and texto[: match.start() + 1].lstrip().startswith("{"):
-        resto = texto[match.end():].strip()
-        if resto:
-            return True
-
-    return False
-
-
-# --- Detección de mezcla de portugués (incidente de producción
-# 2026-09-04, captura de Daniela): `qwen2.5:3b-instruct` a veces "cambia de
-# idioma" a mitad de una respuesta y redacta parte o toda la explicación en
-# portugués aunque el prompt pida español -- problema conocido de modelos
-# chicos con contextos de entrenamiento multilingües. Tratado igual que el
-# eco del payload: reintento único, y si el reintento también da el mismo
-# patrón, `_ExplainUnavailable`.
-#
-# Esto es una HEURÍSTICA simple, no un detector de idioma completo ni
-# exhaustivo -- el objetivo es atrapar los casos obvios (como el de la
-# evidencia real de abajo), no garantizar 100% de precisión. Se apoya en
-# dos señales que NUNCA aparecen en español estándar:
-# 1. Caracteres exclusivos del portugués (ã/õ/ç) -- el español no los usa.
-# 2. Palabras/patrones característicos del portugués sin equivalente
-#    ortográfico en español (não, você, cê, também, muito, quanto, coisas,
-#    sabiam, áqui, "é" como verbo "ser" aislado -- distinto del "es"
-#    español). Se evitan a propósito palabras que EXISTEN en ambos idiomas
-#    (ej. "también"/"também" difieren en la vocal final -- solo se matchea
-#    la forma portuguesa) para no generar falsos positivos. -----------------
-
-_CARACTERES_EXCLUSIVOS_PORTUGUES = ("ã", "õ", "ç", "Ã", "Õ", "Ç")
-
-_PATRONES_PORTUGUES = [
-    re.compile(patron)
-    for patron in (
-        r"\bnão\b",
-        r"\bvocê\b",
-        r"\bcê\b",
-        r"\btambém\b",
-        r"\bmuito\b",
-        r"\bquanto\b",
-        r"\bcoisas\b",
-        r"\bsabiam\b",
-        r"\báqui\b",
-        r"\bé\b",
-    )
-]
-
-
-def _respuesta_tiene_portugues(respuesta: str) -> bool:
-    """`True` si `respuesta` contiene alguna señal característica de
-    portugués (ver comentario arriba). Heurística por lista de patrones,
-    no exhaustiva -- pensada para atrapar casos obvios de mezcla de
-    idioma, no para cubrir todo el espacio posible."""
-    if any(ch in respuesta for ch in _CARACTERES_EXCLUSIVOS_PORTUGUES):
-        return True
-    texto = respuesta.lower()
-    return any(patron.search(texto) for patron in _PATRONES_PORTUGUES)
-
-
-# --- Extracción de texto plano (Decisión #2/#3 de `SDD_ollama_texto_plano.md`
-# -- reemplaza el `json.loads` + acceso a la clave "respuesta" del contrato
-# JSON anterior): sin `format: "json"` forzando el primer carácter, Ollama
-# puede anteponer preámbulos -- se reproduce el mismo efecto de ancla con un
-# marcador literal fijo, mucho más simple de reproducir para un modelo 3B que
-# sintaxis JSON válida completa. -------------------------------------------
-
-_MARCADOR_RESPUESTA = "###RESPUESTA###"
-
-# Mejora no bloqueante de `security` (Punto 4), vuelta OBLIGATORIA por `qa`
-# (Caso 5): si `num_predict`/un stop-token corta la generación a mitad del
-# marcador (ej. el modelo emite "###RESP" y se corta ahí sin completar
-# "###RESPUESTA###"), NO se debe dejar que ese fragmento parcial del marcador
-# quede al principio del texto entregado al usuario. Esta regex detecta un
-# prefijo de "#" + letras (con o sin "#" de cierre parcial) al inicio del
-# texto -- solo puede matchear cuando el texto empieza con "#", así que nunca
-# se aplica sobre una respuesta legítima que no intentó reproducir el
-# marcador.
-_MARCADOR_PARCIAL_RE = re.compile(r"^#{1,}[A-ZÁÉÍÓÚÑa-záéíóúñ]*#{0,}\s*")
-
-
-def _extraer_respuesta_plana(raw_text: str) -> str:
-    """Función pura (`str -> str`, sin I/O ni estado): extrae el texto útil
-    de la respuesta cruda de Ollama, tolerante a que el modelo no reproduzca
-    el marcador `_MARCADOR_RESPUESTA` exactamente (mismo principio de
-    degradación con gracia que `_respuesta_es_eco_del_payload`/
-    `_respuesta_tiene_portugues` -- nunca se rechaza la respuesta solo por
-    faltar el marcador).
-
-    3 ramas:
-    1. Marcador completo presente en cualquier posición -> todo lo que sigue
-       a la ÚLTIMA ocurrencia (no la primera). El marcador aparece
-       textualmente dentro de las instrucciones del system prompt
-       (`SYSTEM_PROMPT_EXPLAIN`/`SYSTEM_PROMPT_PASO_A_PASO`, como ejemplo de
-       formato); si el modelo ecoa parte de esas instrucciones antes de
-       responder de verdad (mismo patrón de eco ya documentado para
-       `qwen2.5:3b-instruct`), el texto crudo puede contener el marcador dos
-       veces. Tomar la primera ocurrencia filtraría hacia el usuario el
-       resto de las instrucciones ecoadas + el marcador real mezclados con
-       la respuesta. La última ocurrencia es siempre la que precede a la
-       respuesta real; en el caso normal de una sola ocurrencia, coincide
-       con la primera y no cambia nada.
-    2. Marcador ausente pero el texto empieza con un prefijo parcial de "#"
-       (corte a mitad del marcador, ej. num_predict cortando la generación)
-       -> se descarta ese fragmento parcial antes de devolver el resto,
-       para que nunca se cuele hacia el usuario (Caso 5 obligatorio de `qa`).
-    3. Marcador ausente por completo, sin prefijo de "#" -> se devuelve
-       `raw_text.strip()` completo (degradación con gracia).
-    """
-    if _MARCADOR_RESPUESTA in raw_text:
-        idx = raw_text.rfind(_MARCADOR_RESPUESTA)
-        return raw_text[idx + len(_MARCADOR_RESPUESTA):].strip()
-
-    texto = raw_text.strip()
-    match = _MARCADOR_PARCIAL_RE.match(texto)
-    if match is not None:
-        logger.info(
-            "Respuesta de Ollama con el marcador %s truncado a la mitad -- "
-            "descartando el fragmento parcial",
-            _MARCADOR_RESPUESTA,
-        )
-        return texto[match.end():].strip()
-
-    logger.info(
-        "Respuesta de Ollama sin el marcador %s -- usando el texto completo "
-        "como respuesta (degradación con gracia)",
-        _MARCADOR_RESPUESTA,
-    )
-    return texto
+_GUARD_LOG_MAX_CHARS = 500
 
 
 class _ExplainUnavailable(Exception):
@@ -2233,112 +2075,54 @@ class _ExplainUnavailable(Exception):
 async def _fetch_explanation(
     *,
     clients,
-    config: ai_rewrite.OllamaConfig,
+    config: GeminiConfig,
     question_code: str,
     pregunta_fija: str,
     datos_del_contexto: dict,
     datos_tokens: set[str],
     system_prompt: str = SYSTEM_PROMPT_EXPLAIN,
 ) -> str:
-    prompt = json.dumps(
+    """Una llamada a Gemini vía `gemini_client.generate_text` (1 reintento
+    solo ante 500/503, hecho por el cliente). Todo fallo converge en
+    `_ExplainUnavailable`. El cliente ya dejó su propio registro con token
+    `GEMINI_*`: acá no se duplica. Nunca se crea un cliente HTTP propio."""
+    http_client = clients.gemini_http
+    if http_client is None or not config.enabled:
+        gemini_client.log_no_client("explain")
+        raise _ExplainUnavailable()
+
+    user_text = json.dumps(
         {"pregunta": pregunta_fija, "datos": datos_del_contexto}, ensure_ascii=False
     )
+    try:
+        result = await gemini_client.generate_text(
+            http_client,
+            config,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            max_output_tokens=MAX_EXPLANATION_OUTPUT_TOKENS,
+            timeout_seconds=config.timeout_seconds,
+            max_retries=1,
+            feature="explain",
+        )
+    except GeminiError:
+        raise _ExplainUnavailable() from None
 
-    http_client = clients.ollama_http if clients.ollama_http is not None else httpx.AsyncClient()
-    timeout = httpx.Timeout(
-        connect=ai_rewrite.CONNECT_TIMEOUT_SECONDS,
-        read=config.timeout_seconds,
-        write=config.timeout_seconds,
-        pool=config.timeout_seconds,
-    )
-
-    # Reintento único ante respuesta vacía tras extracción, eco del payload de
-    # entrada, mezcla de portugués, O invención de números/tickers no
-    # presentes en los datos reales (evidencia de producción 2026-09-03:
-    # `qwen2.5:3b-instruct` a veces no respeta el contrato de formato en el
-    # primer intento -- los otros 3 chequeos comparten el mismo patrón de
-    # reintento). El guard final de integridad (`_no_new_protected_tokens`)
-    # vivía FUERA de este loop y se rendía sin reintentar ante el primer
-    # fallo, inconsistente con los otros 3 -- fix 2026-09-04: mismo criterio
-    # para los 4 chequeos. Se repite la llamada COMPLETA a Ollama (mismo
-    # `config.timeout_seconds` sin recortar, no toca el rate limiter) hasta
-    # 2 intentos en total -- si el segundo también falla (por cualquiera de
-    # los 4 motivos, o timeout/conexión), se aplica el comportamiento de
-    # siempre (`_ExplainUnavailable`).
-    #
-    # `SDD_ollama_texto_plano.md` -- ya no se exige `"format": "json"`: sin la
-    # grammar constraint, Ollama genera texto libre en prosa (más confiable
-    # para un modelo 3B que JSON estricto), anclado por el marcador
-    # `_MARCADOR_RESPUESTA` que `_extraer_respuesta_plana` reconoce.
-    respuesta: Optional[str] = None
-    for attempt in range(2):
-        try:
-            response = await http_client.post(
-                f"{config.base_url}/api/generate",
-                json={
-                    "model": config.model,
-                    "system": system_prompt,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"num_predict": MAX_EXPLANATION_OUTPUT_TOKENS},
-                },
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            raw_text = data["response"]
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            logger.info(
-                "Ollama no disponible o timeout generando explicación (%s)", type(exc).__name__
-            )
-            raise _ExplainUnavailable() from exc
-
-        try:
-            respuesta_candidata = _extraer_respuesta_plana(raw_text)
-            if not respuesta_candidata:
-                raise ValueError("respuesta vacía tras extracción")
-            if _respuesta_es_eco_del_payload(respuesta_candidata, datos_del_contexto):
-                raise ValueError("respuesta contiene el eco del JSON de entrada")
-            if _respuesta_tiene_portugues(respuesta_candidata):
-                raise ValueError("respuesta mezcla portugués en vez de español")
-        except ValueError as exc:
-            if attempt == 0:
-                logger.info(
-                    "Respuesta de Ollama vacía tras extracción, con eco del JSON de "
-                    "entrada, o mezclando portugués generando explicación (%s) "
-                    "— reintentando una vez",
-                    type(exc).__name__,
-                )
-                continue
-            logger.info(
-                "Respuesta de Ollama vacía tras extracción, con eco del JSON de "
-                "entrada, o mezclando portugués generando explicación tras "
-                "reintentar (%s)", type(exc).__name__,
-            )
-            raise _ExplainUnavailable() from exc
-
-        # Guard final de integridad -- movido DENTRO del loop de reintento
-        # (fix 2026-09-04): antes vivía fuera y se rendía sin reintentar en
-        # el primer fallo, inconsistente con los 3 chequeos de arriba.
-        if not _no_new_protected_tokens(datos_tokens, respuesta_candidata):
-            if attempt == 0:
-                logger.warning(
-                    "Explicación generada no pasó el guard de integridad -- "
-                    "descartada, reintentando una vez. Respuesta cruda: %s",
-                    _sanitize_for_log(respuesta_candidata),
-                )
-                continue
-            logger.warning(
-                "Explicación generada no pasó el guard de integridad -- "
-                "descartada tras reintentar. Respuesta cruda: %s",
-                _sanitize_for_log(respuesta_candidata),
-            )
-            raise _ExplainUnavailable()
-
-        respuesta = respuesta_candidata
-        break
-
-    assert respuesta is not None  # el loop siempre termina en `break` o `raise`
+    respuesta = result.text
+    # Guard de números + filtro de salida, ANTES de `_enforce_brevity` (una
+    # URL pasada la posición 480 también se rechaza).
+    guard = None
+    if not _no_new_protected_tokens(datos_tokens, respuesta):
+        guard = "numeros"
+    elif violates_output_filter(respuesta):
+        guard = "salida"
+    if guard is not None:
+        logger.warning(
+            "GEMINI_GUARD_REJECT feature=explain guard=%s respuesta=%s",
+            guard,
+            _sanitize_for_log(respuesta)[:_GUARD_LOG_MAX_CHARS],
+        )
+        raise _ExplainUnavailable()
     return _enforce_brevity(respuesta)
 
 
@@ -2549,7 +2333,7 @@ async def _dispatch_leaf(
 
     # A partir de acá: `narrativa` (mod/ben/ren, sin cambios), o
     # `dato_y_paso_a_paso` con `paso_a_paso=True` ("Explicame paso a paso")
-    # -- ambas llaman a Ollama y consumen el balde (Decisión de diseño #10).
+    # -- ambas llaman a Gemini y consumen el balde (Decisión de diseño #10).
     if not rate_limiter.allow(str(chat_id)):
         await bot.send_message(chat_id=chat_id, text=RATE_LIMITED_MSG)
         return
@@ -2564,7 +2348,7 @@ async def _dispatch_leaf(
             # Mejora recomendada (b) de `security` -- un bug de programación
             # en el dispatch de `_build_cuenta_line` (~22 casos) nunca debe
             # dejar al usuario sin respuesta: cae al mismo mensaje que un
-            # fallo de Ollama, nunca sube sin capturar hasta el handler
+            # fallo de Gemini, nunca sube sin capturar hasta el handler
             # global de errores.
             logger.exception(
                 "Fallo inesperado construyendo la cuenta de %s", _sanitize_for_log(question_code)
@@ -2573,7 +2357,7 @@ async def _dispatch_leaf(
             return
         if cuenta is not None:
             # Decisión de diseño #4 -- la cuenta entra al payload ANTES del
-            # cálculo de `datos_tokens` del guard: Ollama la recibe como
+            # cálculo de `datos_tokens` del guard: Gemini la recibe como
             # dato garantizado, nunca la genera.
             datos_del_contexto["cuenta"] = cuenta
 
@@ -2583,9 +2367,7 @@ async def _dispatch_leaf(
             json.dumps(datos_del_contexto, ensure_ascii=False, default=str)
         )
     }
-    config = clients.ollama_config or ai_rewrite.OllamaConfig(
-        enabled=False, base_url="", model="", timeout_seconds=0.0
-    )
+    config = clients.gemini_config or GeminiConfig()
 
     pensando = await bot.send_message(chat_id=chat_id, text=EXPLAIN_PENDING_MSG)
 

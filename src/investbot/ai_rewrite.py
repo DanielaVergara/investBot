@@ -1,154 +1,85 @@
-"""Capa de post-procesamiento de redacción con LLM local (Ollama).
+"""Reescritura de tono con Gemini (`SDD_migracion_gemini.md`).
 
 Reescribe el TONO de las secciones que `summary.py` ya terminó de armar —
 nunca participa de ningún cálculo, nunca ve datos crudos de FMP, nunca
 decide nada financiero. Opt-in, apagado por defecto
-(`OLLAMA_REWRITE_ENABLED`): sin la variable seteada, `rewrite_parts` es un
-no-op inmediato, cero latencia agregada, cero llamadas HTTP.
+(`GEMINI_REWRITE_ENABLED`, que además exige una `GEMINI_API_KEY` válida): con
+`config.rewrite_enabled=False`, `rewrite_parts` es un no-op inmediato, cero
+latencia agregada, cero llamadas HTTP. El transporte (request, errores,
+parseo del sobre) vive en `gemini_client.generate_text`; este módulo no crea
+clientes HTTP.
 
 Garantía de integridad — placeholder-y-restitución (Spec Patch [Iter-2] de
-`SDD_redaccion_ia_ollama.md`, reemplaza la Decisión de diseño #3(c)
-original de comparar multiset por sección, que `security` demostró que no
-detecta un intercambio de tokens protegidos entre 2 líneas de la misma
-sección): antes de enviar cada sección a Ollama, toda línea con al menos un
-"protected token" (número, %, ticker, ✅/❌, SÍ/NO) se reemplaza por un
-placeholder opaco (`⟦PHn⟧`); el LLM nunca ve ni puede alterar el contenido
-real de esas líneas. Tras la respuesta, se restituye cada placeholder por
-su línea original verbatim — no hay "swap" posible porque no hay nada que
-el modelo pueda mover. `_is_safe_rewrite`/`_protected_tokens` no
-desaparecen: cambian de rol, de "comparación primaria" a "criterio de
-clasificación" + "red de seguridad final" post-restitución.
+`SDD_redaccion_ia_ollama.md`, sigue vigente): antes de enviar cada sección al
+modelo, toda línea con al menos un "protected token" (número, %, ticker,
+✅/❌, SÍ/NO) o que sea un disclaimer protegido se reemplaza por un
+placeholder opaco (`⟦PHn⟧`); el modelo nunca ve ni puede alterar el contenido
+real de esas líneas. Tras la respuesta, se restituye cada placeholder por su
+línea original verbatim — no hay "swap" posible porque no hay nada que el
+modelo pueda mover. `_is_safe_rewrite`/`_protected_tokens` son la "red de
+seguridad final" post-restitución.
 
-Cuando Ollama no responde a tiempo (PC apagada, tailnet caída, timeout,
-lo que sea) el fallback es silencioso: se devuelve el texto original de
-`summary.py` sin cambios, sin excepción, logueado a INFO — es un estado
-esperado del sistema, no una anomalía (Decisión de diseño #2).
+Orden por sección (3.14 de la spec): parseo del JSON -> filtro de salida
+(URLs/menciones/invisibles) sobre el texto del modelo, ANTES de restituir ->
+restitución con `_reconstruct_section` (placeholders, `_is_safe_rewrite`,
+balance de Markdown) -> tope de longitud sobre la sección ya reconstruida.
+Cualquier falla vuelve a esa sección a su texto original.
+
+Ante cualquier falla de Gemini (error HTTP, timeout, bloqueo, estructura
+inesperada) el fallback es el texto original de `summary.py` sin cambios, sin
+excepción: el rewrite no reintenta (es cosmético y bloquea el primer mensaje).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Optional
 
 import httpx
 
+from investbot import gemini_client
+from investbot.gemini_client import GeminiConfig, GeminiError, violates_output_filter
 from investbot.summary import DISCLAIMER_NO_ASESORAMIENTO, DISCLAIMER_WACC_DCF
 
 logger = logging.getLogger(__name__)
 
-# --- Configuración (Decisión de diseño #4) ---------------------------------
+# Tope de tokens de salida del rewrite (3.2 de la spec): los tokens de
+# pensamiento cuentan contra este tope, así que es un techo de seguridad
+# contra una generación fuera de control, no un objetivo. `MAX_TOKENS` es
+# falla con fallback al texto original.
+REWRITE_MAX_OUTPUT_TOKENS = 2048
+_REWRITE_MIME_TYPE = "application/json"
 
-ENV_ENABLED = "OLLAMA_REWRITE_ENABLED"
-ENV_BASE_URL = "OLLAMA_BASE_URL"
-ENV_MODEL = "OLLAMA_MODEL"
-ENV_TIMEOUT = "OLLAMA_TIMEOUT_SECONDS"
+# Tope de longitud por sección ya reconstruida (3.14/P-7):
+# `max(int(1.5 * len(original)), 200)`. El prompt pide condensar, así que una
+# salida más larga indica desvío.
+_LENGTH_FACTOR = 1.5
+_LENGTH_FLOOR = 200
 
-DEFAULT_MODEL = "qwen2.5:7b-instruct"
-DEFAULT_TIMEOUT_SECONDS = 8.0
-# Timeout de conexión fijo (Decisión de diseño #2) — no configurable por env,
-# a propósito: el caso más común (PC apagada) debe fallar rápido siempre,
-# independientemente de qué tan generoso sea OLLAMA_TIMEOUT_SECONDS (que
-# solo controla el read timeout, el caso "PC prendida pero generando lento").
-CONNECT_TIMEOUT_SECONDS = 3.0
-
-# Tope duro de tokens de salida (`num_predict` de Ollama) — no configurable
-# por env, a propósito: es una red de seguridad de tiempo, no una perilla de
-# tuning de usuario. Sin esto, un modelo puede generar indefinidamente sin
-# converger a un stop token (observado en producción: >1100 tokens en una
-# sola reescritura), haciendo que CUALQUIER timeout, por generoso que sea,
-# eventualmente se agote sin producir ninguna respuesta utilizable. Si la
-# reescritura se corta a mitad de camino por este tope, el objeto JSON de
-# salida queda truncado/inválido y el guard de parseo cae a fallback igual
-# que cualquier otra respuesta malformada — nunca llega un mensaje cortado
-# al usuario final.
-#
-# Subido de 600 a 2000 (2026-08-13) tras confirmar aceleración por GPU en
-# instalación nativa (~33 tok/s medido en producción, vs ~1.5-2 tok/s por
-# CPU en Docker Desktop): con 600 tokens, una reescritura JSON de 10
-# secciones se cortaba sistemáticamente antes de completar el objeto
-# (observado: siempre llegaba exactamente a 600 sin cerrar el JSON). A 33
-# tok/s, 2000 tokens cuestan ~60s de generación — presupuesto razonable
-# dado el timeout ya configurado (ver OLLAMA_TIMEOUT_SECONDS del .env).
-MAX_OUTPUT_TOKENS = 2000
-
-_TRUTHY_VALUES = {"true", "1", "yes"}
-
-# Indicador visible en el mensaje final — RETIRADO (SDD_explicaciones_
-# interactivas_ollama.md, Decisión de diseño #5/D2): ya no se agrega a
-# ningún mensaje bajo ningún escenario, reemplazado por la línea de
-# transparencia nueva (`transparency_line`, siempre primera línea del
-# mensaje). Se mantiene la constante (sin uso en la lógica) únicamente para
-# que el test de regresión pueda seguir confirmando su ausencia por nombre
-# — no para volver a agregarla en ningún call-site.
-AI_REWRITE_INDICATOR = "_(redacción asistida por IA local)_"
-
-# Línea de transparencia nueva (SDD_explicaciones_interactivas_ollama.md,
-# Decisión de diseño #5, D1 resuelta por Daniela 2026-09-01: sí mencionar
-# "Ollama" por nombre — revierte parcialmente el criterio de `security` de
-# `AI_REWRITE_INDICATOR` de arriba, ya evaluado y aceptado por `security` en
-# esta nueva spec, sección 7). Siempre la primera línea de todo mensaje de
-# análisis exitoso (ambos flujos), nunca en mensajes de error/uso/intermedios.
-TRANSPARENCY_USED = "🤖 Con ayuda de Ollama"
-TRANSPARENCY_NOT_USED = "📋 Ollama no disponible esta vez"
+# --- Transparencia (3.7 de la spec): primera línea de todo análisis exitoso.
+# Ninguna constante contiene `*`, `_`, `` ` `` ni `[`: se anteponen a un
+# mensaje que se envía con `parse_mode="Markdown"`.
+TRANSPARENCY_USED = "🤖 Con ayuda de Gemini"
+TRANSPARENCY_NOT_USED = "📋 Gemini no disponible esta vez"
+TRANSPARENCY_FIXED_NO_BUTTONS = "📋 Análisis con formato fijo (sin IA)."
+TRANSPARENCY_FIXED_WITH_BUTTONS = (
+    "📋 Análisis con formato fijo — pedí una explicación con los botones de abajo."
+)
 
 
-def transparency_line(used_ollama: bool) -> str:
-    """Texto exacto de la primera línea del mensaje de análisis — nunca
-    revela detalles de infraestructura más allá del nombre "Ollama" (mismo
-    estándar ya exigido por `security` para `AI_REWRITE_INDICATOR`)."""
-    return TRANSPARENCY_USED if used_ollama else TRANSPARENCY_NOT_USED
-
-
-@dataclass(frozen=True)
-class OllamaConfig:
-    """Configuración resuelta de la feature. `enabled=False` es el estado
-    seguro por defecto — `rewrite_parts` lo trata como no-op inmediato."""
-
-    enabled: bool
-    base_url: str
-    model: str
-    timeout_seconds: float
-
-
-def load_config(env: Optional[Mapping[str, str]] = None) -> OllamaConfig:
-    """Lee las 4 variables de entorno de Ollama. Nunca lanza — a diferencia
-    de `security.get_allowed_chat_id` (fail-closed), esta feature es
-    opcional/best-effort (Decisión de diseño #5): cualquier configuración
-    ausente o incompleta resuelve a `enabled=False`, nunca aborta el
-    arranque del bot.
-
-    `OLLAMA_REWRITE_ENABLED` sin setear (o cualquier valor que no sea
-    "true"/"1"/"yes" case-insensitive) -> deshabilitado, sin siquiera mirar
-    `OLLAMA_BASE_URL`. Con el flag en `true` pero `OLLAMA_BASE_URL` vacía o
-    ausente -> también deshabilitado (defensivo, evita un `ConnectError`
-    inmediato contra una URL vacía en cada consulta).
-    """
-    source = env if env is not None else os.environ
-
-    raw_enabled = (source.get(ENV_ENABLED) or "").strip().lower()
-    flag_on = raw_enabled in _TRUTHY_VALUES
-
-    # El feature flag es la puerta de entrada explícita (Decisión de diseño
-    # #4): con el flag apagado, `OLLAMA_BASE_URL` ni siquiera se lee — no
-    # solo "se ignora su valor".
-    base_url = (source.get(ENV_BASE_URL) or "").strip() if flag_on else ""
-    enabled = flag_on and bool(base_url)
-
-    model = source.get(ENV_MODEL) or DEFAULT_MODEL
-
-    raw_timeout = source.get(ENV_TIMEOUT)
-    try:
-        timeout_seconds = float(raw_timeout) if raw_timeout else DEFAULT_TIMEOUT_SECONDS
-    except (TypeError, ValueError):
-        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
-
-    return OllamaConfig(
-        enabled=enabled, base_url=base_url, model=model, timeout_seconds=timeout_seconds
-    )
+def transparency_line(config: Optional[GeminiConfig], used: bool) -> str:
+    """Primera línea del mensaje de análisis, 4 estados (3.6/3.7): sin
+    Gemini habilitado -> formato fijo sin botones; habilitado y sin rewrite
+    -> formato fijo con botones; rewrite habilitado -> `USED` si al menos una
+    sección cambió, `NOT_USED` si no (falla o sin cambios)."""
+    if config is None or not config.enabled:
+        return TRANSPARENCY_FIXED_NO_BUTTONS
+    if not config.rewrite_enabled:
+        return TRANSPARENCY_FIXED_WITH_BUTTONS
+    return TRANSPARENCY_USED if used else TRANSPARENCY_NOT_USED
 
 
 # --- Guard de integridad numérica (Decisión de diseño #3(c) original —
@@ -183,7 +114,7 @@ def _is_safe_rewrite(original: str, rewritten: str) -> bool:
 # Telegram interpreta como delimitadores de entidad Markdown (`*`, `_`,
 # `` ` ``, `[`). Una línea de prosa 100% libre (sin ningún protected token,
 # ej. "*Veredicto:*" de `summary.build_veredicto_section`) puede llegar
-# intacta a Ollama para reescritura -- si el modelo parafrasea y dropea o
+# intacta al modelo para reescritura -- si el modelo parafrasea y dropea o
 # duplica UNO de esos caracteres (ej. "*Veredicto:*" -> "*Veredicto:"), el
 # guard de arriba no lo detecta porque ningún protected token cambió, pero
 # el mensaje final queda con un delimitador de negrita/itálica desparejado
@@ -208,7 +139,7 @@ def _markdown_balance_preserved(original: str, rewritten: str) -> bool:
     """`original` no se usa en la comparación (se mantiene en la firma por
     simetría con `_is_safe_rewrite` y porque documenta la intención: el
     invariante que debe seguir cumpliendo `rewritten` es el mismo que ya
-    cumplía `original` antes de pasar por Ollama). Devuelve `False` si
+    cumplía `original` antes de pasar por el modelo). Devuelve `False` si
     algún delimitador de Markdown queda con conteo impar en `rewritten`."""
     return all(rewritten.count(ch) % 2 == 0 for ch in _MARKDOWN_DELIMITER_CHARS)
 
@@ -221,7 +152,7 @@ _PLACEHOLDER_RE = re.compile(r"⟦PH\d+⟧")
 # importan como el MISMO objeto que usa `summary.py` para armar el mensaje
 # real (Opción C del patch) — no una copia hardcodeada que pueda driftear. Se
 # comparan por igualdad exacta de línea completa en `_classify_lines`, así
-# que nunca llegan a Ollama como texto libre editable — no hay nada que
+# que nunca llegan al modelo como texto libre editable — no hay nada que
 # "condensar" porque no hay nada que el modelo pueda leer.
 _PROTECTED_DISCLAIMERS = frozenset({DISCLAIMER_WACC_DCF, DISCLAIMER_NO_ASESORAMIENTO})
 
@@ -291,14 +222,13 @@ def _reconstruct_section(
     return reconstructed
 
 
-# --- Prompt (Decisión de diseño #3(a)/(b), regla 6 agregada por el patch;
-# contrato de transporte JSON estructurado agregado en iteración posterior
-# — reemplaza los marcadores de texto libre <<<SECTION_N>>> porque modelos
-# chicos (qwen2.5:3b-instruct, phi3.5) no reproducen ese patrón de forma
-# confiable, mientras que `"format": "json"` de Ollama restringe la
-# generación a nivel de grammar/sampling, mucho más robusto. El guard de
-# integridad real (`_is_safe_rewrite`/placeholders) no cambia en absoluto —
-# esto es solo el "contenedor" de transporte.) --------------------------------
+# --- Prompt (Decisión de diseño #3(a)/(b), regla 6 agregada por el patch) ----
+# Contrato de transporte: objeto JSON con claves de índice numérico en texto.
+# El servidor garantiza JSON sintácticamente válido (`responseMimeType:
+# "application/json"`, sin schema); las claves exactas y los tipos de los
+# valores los valida `_parse_json_sections`. El guard de integridad real
+# (`_is_safe_rewrite`/placeholders) es independiente del modelo y no depende
+# de este contenedor. Contenido del prompt constante, sin interpolación.
 
 SYSTEM_PROMPT = (
     "Sos un editor de redacción financiera en español rioplatense. Tu única tarea\n"
@@ -336,10 +266,10 @@ SYSTEM_PROMPT = (
 
 
 def _parse_json_sections(raw_text: str, expected_count: int) -> Optional[list[str]]:
-    """Parsea la respuesta cruda de Ollama como un objeto JSON con claves de
-    índice string (`"0"`..`"{expected_count-1}"`). `None` (mismo contrato
-    que la función que reemplaza) si:
-    - `raw_text` no es JSON válido (`json.JSONDecodeError`), o
+    """Parsea el texto del modelo como un objeto JSON con claves de índice
+    string (`"0"`..`"{expected_count-1}"`). `None` si:
+    - `raw_text` no es JSON válido (`json.JSONDecodeError`) o está anidado
+      tan hondo que lanza `RecursionError` (CS-19), o
     - el resultado no es un `dict`, o
     - el conjunto de claves no es exactamente `{"0", ..., str(expected_count-1)}`
       (ni de más ni de menos), o
@@ -349,7 +279,7 @@ def _parse_json_sections(raw_text: str, expected_count: int) -> Optional[list[st
     las secciones vuelven al original)."""
     try:
         data = json.loads(raw_text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -361,48 +291,59 @@ def _parse_json_sections(raw_text: str, expected_count: int) -> Optional[list[st
     return [data[str(i)] for i in range(expected_count)]
 
 
-# --- Llamada de red + orquestación ------------------------------------------
+def _length_limit(original: str) -> int:
+    return max(int(_LENGTH_FACTOR * len(original)), _LENGTH_FLOOR)
+
+
+# --- Orquestación -----------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class RewriteOutcome:
-    """Resultado de `rewrite_parts` (SDD_explicaciones_interactivas_ollama.md,
-    Decisión de diseño #5) — reemplaza el `list[str]` que devolvía antes.
-    `used_ollama` es el booleano que `_run_analysis` necesita para construir
-    la línea de transparencia; antes se calculaba adentro de la función y se
-    descartaba apenas se decidía si agregar `AI_REWRITE_INDICATOR`."""
+    """Resultado de `rewrite_parts`. `used_gemini` es `True` solo si al menos
+    una sección resultó efectivamente distinta del original tras los guards;
+    `_run_analysis` lo usa para elegir la línea de transparencia."""
 
     parts: list[str]
-    used_ollama: bool
+    used_gemini: bool
+
+
+def _fallback(parts: list[str]) -> RewriteOutcome:
+    return RewriteOutcome(parts=parts, used_gemini=False)
 
 
 async def rewrite_parts(
     parts: list[str],
-    config: OllamaConfig,
+    config: Optional[GeminiConfig],
     *,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> RewriteOutcome:
     """Recibe la misma forma de datos que fluye entre
     `fetch_and_analyze_parts` y `chunk_for_telegram` (`list[str]`, índice 0
-    = título) y devuelve un `RewriteOutcome` cuyo `.parts` es una lista de
-    la misma longitud: cada sección es o bien la reescritura de Ollama (si
-    pasó el guard de 2 capas) o el texto original sin cambios.
-    `.used_ollama` es `True` solo si `config.enabled` y al menos una sección
-    resultó efectivamente distinta del original tras el guard — `False` en
-    cualquier otro caso (deshabilitado, timeout, guard falló en todas las
-    secciones, etc.).
+    = título) y devuelve un `RewriteOutcome` cuyo `.parts` es una lista de la
+    misma longitud: cada sección es o bien la reescritura de Gemini (si pasó
+    todos los guards) o el texto original sin cambios.
 
-    El título (`parts[0]`) nunca se envía a Ollama ni se reescribe, bajo
-    ningún escenario (Restricción de `architect`). Con la feature
-    deshabilitada, o con `parts` de longitud <=1 (solo título), es un no-op
-    inmediato — ni siquiera se resuelve `config.base_url` en una conexión.
-    """
-    if not config.enabled:
-        return RewriteOutcome(parts=parts, used_ollama=False)
+    No-op inmediato (0 llamadas HTTP, `used_gemini=False`) si la config es
+    `None`, si `config.rewrite_enabled` es falso, o si `parts` solo trae el
+    título. Con `rewrite_enabled=True` y `http_client=None` también es no-op
+    (sin crear ningún cliente) y deja un WARNING `GEMINI_NO_CLIENT`: en
+    producción `main()` crea el cliente siempre que Gemini esté habilitado,
+    así que ese estado es un error de cableado y debe ser visible.
+
+    El título (`parts[0]`) nunca se envía al modelo ni se reescribe. Sin
+    reintentos: la primera falla de Gemini es definitiva y se devuelve el
+    texto original (el cliente ya dejó su propio registro con token)."""
+    if config is None or not (config.enabled and config.rewrite_enabled):
+        return _fallback(parts)
 
     body_parts = parts[1:]
     if not body_parts:
-        return RewriteOutcome(parts=parts, used_ollama=False)
+        return _fallback(parts)
+
+    if http_client is None:
+        gemini_client.log_no_client("rewrite")
+        return _fallback(parts)
 
     placeholder_sections: list[str] = []
     line_maps: list[dict[str, str]] = []
@@ -411,108 +352,83 @@ async def rewrite_parts(
         placeholder_sections.append(placeholder_text)
         line_maps.append(line_map)
 
-    prompt = json.dumps(
+    user_text = json.dumps(
         {str(i): text for i, text in enumerate(placeholder_sections)}, ensure_ascii=False
     )
 
-    client = http_client if http_client is not None else httpx.AsyncClient()
-    timeout = httpx.Timeout(
-        connect=CONNECT_TIMEOUT_SECONDS,
-        read=config.timeout_seconds,
-        write=config.timeout_seconds,
-        pool=config.timeout_seconds,
-    )
-
-    # Reintento único ante estructura JSON inesperada (evidencia de
-    # producción 2026-09-03: `qwen2.5:3b-instruct` a veces no respeta el
-    # contrato de formato en el primer intento). Se repite la llamada
-    # COMPLETA a Ollama (mismo `timeout_seconds` sin recortar, no toca el
-    # rate limiter) hasta 2 intentos en total — la segunda falla, por el
-    # motivo que sea, cae al fallback de siempre.
-    sections: Optional[list[str]] = None
-    for attempt in range(2):
-        try:
-            response = await client.post(
-                f"{config.base_url}/api/generate",
-                json={
-                    "model": config.model,
-                    "system": SYSTEM_PROMPT,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json",
-                    "options": {"num_predict": MAX_OUTPUT_TOKENS},
-                },
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            # `response.json()` lanza `json.JSONDecodeError` sobre cuerpo
-            # no-JSON — es subclase de `ValueError` en la librería estándar de
-            # Python, por eso queda cubierta acá aunque no se nombre explícita
-            # (criterio de `security`, sección 4 — documentado para que un
-            # refactor futuro no la excluya pensando que `ValueError` sobra).
-            raw_text = data["response"]
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            # `asyncio.CancelledError` (y cualquier otro `BaseException`) NO
-            # queda atrapado acá — hereda de `BaseException`, no de
-            # `Exception`, así que se propaga normalmente (criterio de
-            # `security`, sección 4).
-            logger.info(
-                "Ollama no disponible o timeout — fallback a redacción original (%s)",
-                type(exc).__name__,
-            )
-            return RewriteOutcome(parts=parts, used_ollama=False)
-
-        sections = _parse_json_sections(raw_text, len(body_parts))
-        if sections is not None:
-            break
-        if attempt == 0:
-            logger.info(
-                "Respuesta de Ollama con estructura JSON inesperada "
-                "(%d secciones esperadas) — reintentando una vez",
-                len(body_parts),
-            )
-            continue
-        logger.warning(
-            "Respuesta de Ollama con estructura JSON inesperada "
-            "(%d secciones esperadas) tras reintentar — fallback completo a "
-            "redacción original",
-            len(body_parts),
+    try:
+        result = await gemini_client.generate_text(
+            http_client,
+            config,
+            system_prompt=SYSTEM_PROMPT,
+            user_text=user_text,
+            max_output_tokens=REWRITE_MAX_OUTPUT_TOKENS,
+            timeout_seconds=config.rewrite_timeout_seconds,
+            max_retries=0,
+            feature="rewrite",
+            response_mime_type=_REWRITE_MIME_TYPE,
         )
-        return RewriteOutcome(parts=parts, used_ollama=False)
+    except GeminiError:
+        # `asyncio.CancelledError` (BaseException) no queda atrapado y se
+        # propaga. El cliente ya registró la falla con su token: no se duplica.
+        return _fallback(parts)
 
     try:
+        sections = _parse_json_sections(result.text, len(body_parts))
+        if sections is None:
+            logger.warning(
+                "GEMINI_MALFORMED feature=rewrite estructura JSON inesperada "
+                "(%d secciones esperadas) — fallback completo a redacción original",
+                len(body_parts),
+            )
+            return _fallback(parts)
+
         result_body: list[str] = []
         any_rewritten = False
         for original_section, rewritten_section, line_map in zip(
             body_parts, sections, line_maps
         ):
+            # 1) filtro de salida sobre el texto del modelo, ANTES de restituir
+            # (las líneas restituidas nunca son salida del modelo).
+            if violates_output_filter(rewritten_section):
+                logger.warning(
+                    "GEMINI_GUARD_REJECT feature=rewrite guard=salida — esa sección "
+                    "vuelve a su redacción original, el resto del mensaje sigue su "
+                    "curso normal"
+                )
+                result_body.append(original_section)
+                continue
+            # 2) restitución + `_is_safe_rewrite` + balance de Markdown
             reconstructed = _reconstruct_section(rewritten_section, line_map, original_section)
             if reconstructed is None:
                 logger.warning(
-                    "Una sección no pasó el guard de integridad — esa sección "
-                    "vuelve a su redacción original, el resto del mensaje sigue "
-                    "su curso normal"
+                    "GEMINI_GUARD_REJECT feature=rewrite guard=integridad — una sección "
+                    "no pasó el guard de integridad — esa sección vuelve a su "
+                    "redacción original, el resto del mensaje sigue su curso normal"
                 )
                 result_body.append(original_section)
-            else:
-                result_body.append(reconstructed)
-                if reconstructed != original_section:
-                    any_rewritten = True
+                continue
+            # 3) tope de longitud sobre la sección YA reconstruida
+            if len(reconstructed) > _length_limit(original_section):
+                logger.warning(
+                    "GEMINI_GUARD_REJECT feature=rewrite guard=longitud — esa sección "
+                    "vuelve a su redacción original, el resto del mensaje sigue su "
+                    "curso normal"
+                )
+                result_body.append(original_section)
+                continue
+            result_body.append(reconstructed)
+            if reconstructed != original_section:
+                any_rewritten = True
     except Exception:
-        # Guard/parseo del JSON de secciones lanzando una excepción propia
-        # (bug de programación, no un fallo de red) — mismo fallback que un
-        # fallo de red, nunca propaga hacia `_run_analysis` (criterio de
-        # `security`, sección 4, última fila).
+        # Parseo/guards lanzando una excepción propia (bug de programación, no
+        # un fallo de red): mismo fallback, nunca propaga hacia `_run_analysis`.
+        # El traceback es la única pista de un bug; la excepción original de
+        # httpx nunca llega acá (`GeminiError` se lanza `from None`).
         logger.warning(
-            "Fallo inesperado reconstruyendo la respuesta de Ollama — "
+            "Fallo inesperado reconstruyendo la respuesta de Gemini — "
             "fallback completo a redacción original", exc_info=True,
         )
-        return RewriteOutcome(parts=parts, used_ollama=False)
+        return _fallback(parts)
 
-    result = [parts[0], *result_body]
-    # AI_REWRITE_INDICATOR RETIRADO (Decisión de diseño #5/D2) — ya no se
-    # agrega ningún sufijo acá. `any_rewritten` sigue calculándose para
-    # informar `used_ollama`, que ahora es responsabilidad del llamador
-    # (`_run_analysis`) usar para construir la línea de transparencia.
-    return RewriteOutcome(parts=result, used_ollama=any_rewritten)
+    return RewriteOutcome(parts=[parts[0], *result_body], used_gemini=any_rewritten)

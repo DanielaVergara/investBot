@@ -19,6 +19,7 @@ from telegram.error import TelegramError
 
 from investbot import ai_explain, ai_rewrite, db, query_handler, rules, sec_edgar_client
 from investbot.fmp_client import FMPError
+from investbot.gemini_client import GeminiConfig
 
 ALLOWED_CHAT_ID = 555
 
@@ -986,9 +987,9 @@ async def test_run_analysis_multichunk_feliz_edit_y_send_message_en_orden(conn_f
     edit_args, edit_kwargs = loading_msg.edit_text.call_args
     # SDD_explicaciones_interactivas_ollama.md, Decisión #5: línea de
     # transparencia siempre primera línea del camino exitoso -- acá
-    # `_empty_clients()` no habilita Ollama, así que es la variante
+    # `_empty_clients()` no habilita Gemini, así que es la variante
     # "no disponible".
-    assert edit_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert edit_args[0].startswith(ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS)
     assert "Parte1" in edit_args[0]
     assert edit_kwargs.get("parse_mode") == "Markdown"
 
@@ -1024,7 +1025,7 @@ async def test_run_analysis_loading_msg_none_multichunk_reply_fn_y_send_message(
 
     assert query_vent.edit_message_text.await_count == 2
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
-    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS)
     assert "Parte1" in final_args[0]
     assert final_kwargs.get("parse_mode") == "Markdown"
 
@@ -1060,7 +1061,7 @@ async def test_run_analysis_falla_edit_text_multichunk_fallback_a_reply_fn(
     assert query_vent.edit_message_text.await_count == 2
     loading_msg.edit_text.assert_awaited_once()
     final_args, final_kwargs = query_vent.edit_message_text.call_args_list[1]
-    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_NOT_USED)
+    assert final_args[0].startswith(ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS)
     assert "Parte1" in final_args[0]
     assert final_kwargs.get("parse_mode") == "Markdown"
 
@@ -2529,11 +2530,13 @@ async def test_run_analysis_llama_ai_rewrite_exactamente_una_vez_camino_exitoso(
 
     async def fake_rewrite(parts, config, *, http_client=None):
         calls.append(parts)
-        return ai_rewrite.RewriteOutcome(parts=rewritten_parts, used_ollama=True)
+        return ai_rewrite.RewriteOutcome(parts=rewritten_parts, used_gemini=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
-    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    handlers = query_handler.build_query_handlers(
+        conn_factory, _clients_with_gemini(rewrite_enabled=True), FakeRateLimiter()
+    )
     _, query_vent = await _drive_esc_vent(handlers, "ADBE")
 
     assert calls == [original_parts]
@@ -2605,9 +2608,9 @@ async def test_run_analysis_feature_deshabilitada_comportamiento_identico_a_pre_
     (config real de `ai_rewrite`, `rewrite_parts` SIN mockear -- se ejecuta
     el no-op real), el comportamiento observable de `_run_analysis` (texto
     final entregado, `parse_mode`) es idéntico al comportamiento pre-spec.
-    `_empty_clients()` no setea `ollama_config`, así que
-    `clients.ollama_config` es `None` -> `_run_analysis` arma un
-    `OllamaConfig(enabled=False, ...)` local y `ai_rewrite.rewrite_parts`
+    `_empty_clients()` no setea `gemini_config`, así que
+    `clients.gemini_config` es `None` -> `_run_analysis` arma un
+    `GeminiConfig()` deshabilitado local y `ai_rewrite.rewrite_parts`
     devuelve `parts` sin cambios ni llamadas HTTP."""
     _complete_onboarding(conn_factory)
     parts = ["*Adobe (ADBE)*", "Cuerpo sin cambios 15.0%"]
@@ -2622,7 +2625,7 @@ async def test_run_analysis_feature_deshabilitada_comportamiento_identico_a_pre_
     # Único cambio observable respecto al comportamiento pre-spec: la nueva
     # primera línea de transparencia (Decisión #5) -- el resto es idéntico.
     expected_parts = list(parts)
-    expected_parts[0] = f"{ai_rewrite.TRANSPARENCY_NOT_USED}\n\n{expected_parts[0]}"
+    expected_parts[0] = f"{ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS}\n\n{expected_parts[0]}"
     assert args[0] == "\n\n".join(expected_parts)
     assert kwargs.get("parse_mode") == "Markdown"
 
@@ -2633,7 +2636,7 @@ async def test_run_analysis_feature_deshabilitada_comportamiento_identico_a_pre_
 # ---------------------------------------------------------------------------
 
 
-def _clients_with_ollama(enabled=True) -> query_handler.Clients:
+def _clients_with_gemini(enabled=True, rewrite_enabled=False) -> query_handler.Clients:
     empty_transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
     return query_handler.Clients(
         fmp_http=httpx.AsyncClient(transport=empty_transport),
@@ -2641,9 +2644,10 @@ def _clients_with_ollama(enabled=True) -> query_handler.Clients:
         treasury_gov_http=httpx.AsyncClient(transport=empty_transport),
         fmp_api_key="test-key",
         fred_api_key="test-key",
-        ollama_config=ai_rewrite.OllamaConfig(
-            enabled=enabled, base_url="http://100.101.102.103:11434",
-            model="qwen2.5:7b-instruct", timeout_seconds=8.0,
+        gemini_http=httpx.AsyncClient(transport=empty_transport),
+        gemini_config=GeminiConfig(
+            enabled=enabled, api_key="TEST-DUMMY-KEY-0123456789ABCDEF",
+            rewrite_enabled=enabled and rewrite_enabled,
         ),
     )
 
@@ -2718,18 +2722,18 @@ def _sink_values_texto_libre(**overrides) -> dict:
 
 
 async def test_reply_markup_solo_en_ultimo_chunk_texto_libre_con_botones(conn_factory, monkeypatch):
-    """Caso 38: con `clients.ollama_config.enabled=True`, el `reply_markup`
+    """Caso 38: con `clients.gemini_config.enabled=True`, el `reply_markup`
     aparece SOLO en el último chunk enviado -- 0 en los intermedios."""
     _complete_onboarding(conn_factory)
     parts = _multichunk_parts()
     _patch_parts_search_and_sink(monkeypatch, parts, _sink_values_texto_libre())
 
     async def fake_rewrite(p, config, *, http_client=None):
-        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
-    clients = _clients_with_ollama(enabled=True)
+    clients = _clients_with_gemini(enabled=True)
     handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
     _, query_vent = await _drive_esc_vent(handlers, "ADBE")
 
@@ -2755,11 +2759,11 @@ async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_f
     _patch_parts_search_and_sink(monkeypatch, parts, _sink_values_texto_libre())
 
     async def fake_rewrite(p, config, *, http_client=None):
-        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
-    clients = _clients_with_ollama(enabled=True)
+    clients = _clients_with_gemini(enabled=True)
     handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
 
     update_esc, _ = _fake_callback_update("esc:ADBE:conservador")
@@ -2779,22 +2783,19 @@ async def test_reply_markup_single_chunk_loading_msg_none_via_deliver_all(conn_f
     assert sum(len(fila) for fila in keyboard.inline_keyboard) == 6  # Nivel 1: ver(2 botones)/val/cal/rie/inf
 
 
-async def test_run_analysis_ollama_habilitado_mensaje_corto_end_to_end(adobe_fixtures, conn_factory, monkeypatch):
-    """Integración real (sin mockear el sink) — con Ollama habilitado, el
+async def test_run_analysis_gemini_habilitado_mensaje_corto_end_to_end(adobe_fixtures, conn_factory, monkeypatch):
+    """Integración real (sin mockear el sink) — con Gemini habilitado, el
     primer chunk entregado por `_run_analysis` es la versión corta (Decisión
     de diseño #9), lleva teclado de Nivel 1, y el `ExplanationContext`
     guardado lleva el `chat_id` real (Hallazgo 9 de `security`)."""
     _complete_onboarding(conn_factory)
     clients = dataclasses.replace(
         _make_clients(adobe_fixtures),
-        ollama_config=ai_rewrite.OllamaConfig(
-            enabled=True, base_url="http://100.101.102.103:11434",
-            model="qwen2.5:7b-instruct", timeout_seconds=8.0,
-        ),
+        gemini_config=GeminiConfig(enabled=True, api_key="TEST-DUMMY-KEY-0123456789ABCDEF"),
     )
 
     async def fake_rewrite(p, config, *, http_client=None):
-        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
@@ -2826,12 +2827,12 @@ async def test_explanation_context_texto_libre_mismos_objetos_no_recalculados(co
     _patch_parts_search_and_sink(monkeypatch, parts, sink_values)
 
     async def fake_rewrite(p, config, *, http_client=None):
-        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=True)
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=True)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
     store = ai_explain.ExplanationContextStore()
-    clients = _clients_with_ollama(enabled=True)
+    clients = _clients_with_gemini(enabled=True)
     handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter(), store)
     await _drive_esc_vent(handlers, "ADBE")
 
@@ -2847,12 +2848,12 @@ async def test_explanation_context_texto_libre_mismos_objetos_no_recalculados(co
     assert ctx.veredicto_barata == sink_values["veredicto_barata"]
 
 
-@pytest.mark.parametrize("used_ollama", [True, False])
+@pytest.mark.parametrize("used_gemini", [True, False])
 async def test_final_parts_0_transparency_line_correcta_y_titulo_intacto(
-    conn_factory, monkeypatch, used_ollama
+    conn_factory, monkeypatch, used_gemini
 ):
     """Caso 40: `final_parts[0]` empieza con `TRANSPARENCY_USED`/
-    `TRANSPARENCY_NOT_USED` según `outcome.used_ollama`, seguido de "\\n\\n"
+    `TRANSPARENCY_NOT_USED` según `outcome.used_gemini`, seguido de "\\n\\n"
     y el título original sin alterar."""
     _complete_onboarding(conn_factory)
     titulo = "*Adobe (ADBE)*"
@@ -2860,23 +2861,25 @@ async def test_final_parts_0_transparency_line_correcta_y_titulo_intacto(
     _patch_parts_and_search(monkeypatch, parts)
 
     async def fake_rewrite(p, config, *, http_client=None):
-        return ai_rewrite.RewriteOutcome(parts=p, used_ollama=used_ollama)
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=used_gemini)
 
     monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
 
-    handlers = query_handler.build_query_handlers(conn_factory, _empty_clients(), FakeRateLimiter())
+    handlers = query_handler.build_query_handlers(
+        conn_factory, _clients_with_gemini(rewrite_enabled=True), FakeRateLimiter()
+    )
     _, query_vent = await _drive_esc_vent(handlers, "ADBE")
 
     loading_msg = query_vent.edit_message_text.return_value
     args, kwargs = loading_msg.edit_text.call_args
-    esperado = ai_rewrite.TRANSPARENCY_USED if used_ollama else ai_rewrite.TRANSPARENCY_NOT_USED
+    esperado = ai_rewrite.TRANSPARENCY_USED if used_gemini else ai_rewrite.TRANSPARENCY_NOT_USED
     assert args[0].startswith(f"{esperado}\n\n{titulo}")
 
 
 async def test_feature_deshabilitada_nunca_hay_keyboard_aunque_sink_este_poblado(
     conn_factory, monkeypatch
 ):
-    """Caso 41: con `clients.ollama_config` ausente/`enabled=False`, nunca
+    """Caso 41: con `clients.gemini_config` ausente/`enabled=False`, nunca
     hay `InlineKeyboardMarkup` -- ni siquiera si `explain_context_sink`
     quedó poblado (defensivo: la condición del botón exige ambas cosas)."""
     _complete_onboarding(conn_factory)
@@ -2891,34 +2894,249 @@ async def test_feature_deshabilitada_nunca_hay_keyboard_aunque_sink_este_poblado
     assert "reply_markup" not in kwargs
 
 
-def test_clients_acepta_ollama_http_y_ollama_config_sin_romper_call_sites_existentes(
+def test_clients_acepta_gemini_http_y_gemini_config_sin_romper_call_sites_existentes(
     adobe_fixtures,
 ):
-    """Caso 55: `Clients` gana `ollama_http`/`ollama_config` opcionales con
+    """Caso 55: `Clients` tiene `gemini_http`/`gemini_config` opcionales con
     default `None` -- los call-sites existentes de `Clients(...)` (ej.
     `_make_clients`, usado ~15 veces en este archivo) siguen construyendo
-    sin `TypeError`, sin necesidad de tocarlos (ya lo confirma el resto de
-    la suite, que no fue modificada). Este test ejercita además el camino
-    explícito con los 2 kwargs nuevos poblados."""
-    clients_sin_ollama = _make_clients(adobe_fixtures)
-    assert clients_sin_ollama.ollama_http is None
-    assert clients_sin_ollama.ollama_config is None
+    sin `TypeError`. Este test ejercita además el camino explícito con los 2
+    kwargs poblados y confirma que ya no existen los campos legados."""
+    clients_sin_gemini = _make_clients(adobe_fixtures)
+    assert clients_sin_gemini.gemini_http is None
+    assert clients_sin_gemini.gemini_config is None
+    for legado in ("olla" + "ma_http", "olla" + "ma_config"):
+        assert not hasattr(clients_sin_gemini, legado)
 
-    from investbot import ai_rewrite
-
-    ollama_http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
-    ollama_config = ai_rewrite.OllamaConfig(
-        enabled=True, base_url="http://100.101.102.103:11434",
-        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
-    )
-    clients_con_ollama = query_handler.Clients(
-        fmp_http=clients_sin_ollama.fmp_http,
-        fred_http=clients_sin_ollama.fred_http,
-        treasury_gov_http=clients_sin_ollama.treasury_gov_http,
+    gemini_http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    gemini_config = GeminiConfig(enabled=True, api_key="TEST-DUMMY-KEY-0123456789ABCDEF")
+    clients_con_gemini = query_handler.Clients(
+        fmp_http=clients_sin_gemini.fmp_http,
+        fred_http=clients_sin_gemini.fred_http,
+        treasury_gov_http=clients_sin_gemini.treasury_gov_http,
         fmp_api_key="test-key",
         fred_api_key="test-fred-key",
-        ollama_http=ollama_http,
-        ollama_config=ollama_config,
+        gemini_http=gemini_http,
+        gemini_config=gemini_config,
     )
-    assert clients_con_ollama.ollama_http is ollama_http
-    assert clients_con_ollama.ollama_config is ollama_config
+    assert clients_con_gemini.gemini_http is gemini_http
+    assert clients_con_gemini.gemini_config is gemini_config
+
+
+# ---------------------------------------------------------------------------
+# SDD_migracion_gemini.md (F2) — CA-48: `Clients` gana `gemini_http`/
+# `gemini_config` opcionales (default `None`); el gating del mensaje corto y
+# de los botones depende de `gemini_config.enabled`, no del flag legado.
+# ---------------------------------------------------------------------------
+
+
+def test_ca48_clients_acepta_gemini_http_y_gemini_config_con_default_none(adobe_fixtures):
+    sin_gemini = _make_clients(adobe_fixtures)
+    assert sin_gemini.gemini_http is None
+    assert sin_gemini.gemini_config is None
+
+    gemini_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    config = GeminiConfig(enabled=True, api_key="TEST-DUMMY-KEY-0123456789ABCDEF")
+    con_gemini = dataclasses.replace(sin_gemini, gemini_http=gemini_http, gemini_config=config)
+    assert con_gemini.gemini_http is gemini_http
+    assert con_gemini.gemini_config is config
+
+
+@pytest.mark.parametrize(
+    "gemini_enabled,rewrite_enabled",
+    [(True, False), (True, True), (False, False)],
+)
+async def test_ca48_gating_de_mensaje_corto_y_botones_depende_solo_de_gemini(
+    conn_factory, monkeypatch, gemini_enabled, rewrite_enabled
+):
+    _complete_onboarding(conn_factory)
+    seen_kwargs = {}
+
+    async def fake_fetch(ticker, clients_arg, perfil, **kwargs):
+        seen_kwargs.update(kwargs)
+        return ["*Adobe (ADBE)*", "Cuerpo 15.0%"]
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", fake_fetch)
+
+    async def fake_search(client, key, q):
+        return [{"symbol": "ADBE", "name": "Adobe Inc."}]
+
+    monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
+
+    async def fake_rewrite(p, config, *, http_client=None):
+        return ai_rewrite.RewriteOutcome(parts=p, used_gemini=False)
+
+    monkeypatch.setattr(query_handler.ai_rewrite, "rewrite_parts", fake_rewrite)
+    clients = dataclasses.replace(
+        _empty_clients(),
+        gemini_config=GeminiConfig(
+            enabled=gemini_enabled, api_key="TEST-DUMMY-KEY-0123456789ABCDEF",
+            rewrite_enabled=gemini_enabled and rewrite_enabled,
+        ),
+    )
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    await _drive_esc_vent(handlers, "ADBE")
+    assert seen_kwargs["use_short_summary"] is gemini_enabled
+
+
+# ---------------------------------------------------------------------------
+# SDD_migracion_gemini.md (F3) -- desacople de flags y transparencia de 4
+# estados probados sobre `_run_analysis` real (CA-31 con `_run_analysis`,
+# CA-37, CA-38), con el cliente real de `rewrite_parts` sobre MockTransport.
+# ---------------------------------------------------------------------------
+
+import re as _re_f3
+
+from .gemini_helpers import (
+    CANARY_BODY,
+    CANARY_KEY,
+    DUMMY_KEY,
+    FAILURE_TABLE,
+    gemini_response,
+    sequence_handler,
+)
+
+_BODY_PROSA = "Una frase de prosa libre larga para reescribir con claridad."
+_PARTS_RW = ["*Adobe (ADBE)*", _BODY_PROSA]
+_TOKEN_RE_F3 = _re_f3.compile(r"GEMINI_[A-Z0-9_]+")
+
+
+@pytest.fixture(autouse=True)
+def _logging_explicito_gemini(caplog):
+    for name in ("investbot", "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=name)
+
+
+def _gemini_clients(config, handler=None):
+    """`Clients` con un `gemini_http` sobre MockTransport; devuelve también la
+    lista de requests recibidas por Gemini (spy de llamadas HTTP)."""
+    seen: list = []
+
+    def spy(request):
+        seen.append(request)
+        return handler(request) if handler else httpx.Response(500)
+
+    base = _empty_clients()
+    clients = dataclasses.replace(
+        base,
+        gemini_http=httpx.AsyncClient(transport=httpx.MockTransport(spy)) if config else None,
+        gemini_config=config,
+    )
+    return clients, seen
+
+
+def _patch_parts_kwargs(monkeypatch, parts, kwargs_seen: dict):
+    async def fake_parts(ticker, clients_arg, perfil, **kwargs):
+        kwargs_seen.update(kwargs)
+        sink = kwargs.get("explain_context_sink")
+        if sink is not None and kwargs.get("use_short_summary"):
+            sink.update(_sink_values_texto_libre())
+        return parts
+
+    async def fake_search(client, key, q):
+        return [{"symbol": "ADBE", "name": "Adobe Inc."}]
+
+    monkeypatch.setattr(query_handler, "fetch_and_analyze_parts", fake_parts)
+    monkeypatch.setattr(query_handler.fmp_client, "search_company", fake_search)
+
+
+def _rewrite_ok(request):
+    return httpx.Response(
+        200, json=gemini_response(json.dumps({"0": "Frase de prosa libre reescrita."}))
+    )
+
+
+@pytest.mark.parametrize(
+    "caso,env,handler,llamadas,corto,teclado,primer_renglon",
+    [
+        ("a_sin_key_sin_flag", {}, None, 0, False, False, "TRANSPARENCY_FIXED_NO_BUTTONS"),
+        ("b_sin_key_con_flag", {"GEMINI_REWRITE_ENABLED": "true"}, None, 0, False, False,
+         "TRANSPARENCY_FIXED_NO_BUTTONS"),
+        ("c_key_flag_false", {"GEMINI_API_KEY": DUMMY_KEY}, _rewrite_ok, 0, True, True,
+         "TRANSPARENCY_FIXED_WITH_BUTTONS"),
+        ("d_key_flag_true_cambia", {"GEMINI_API_KEY": DUMMY_KEY, "GEMINI_REWRITE_ENABLED": "true"},
+         _rewrite_ok, 1, True, True, "TRANSPARENCY_USED"),
+        ("e_key_flag_true_falla", {"GEMINI_API_KEY": DUMMY_KEY, "GEMINI_REWRITE_ENABLED": "true"},
+         lambda r: httpx.Response(500), 1, True, True, "TRANSPARENCY_NOT_USED"),
+    ],
+)
+async def test_ca38_matriz_de_paridad_y_desacople_sobre_run_analysis(
+    conn_factory, monkeypatch, caso, env, handler, llamadas, corto, teclado, primer_renglon
+):
+    from investbot import gemini_client
+
+    _complete_onboarding(conn_factory)
+    config = gemini_client.load_config(env)
+    kwargs_seen: dict = {}
+    _patch_parts_kwargs(monkeypatch, list(_PARTS_RW), kwargs_seen)
+    clients, seen = _gemini_clients(config if config.enabled else None, handler)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    args, kwargs = loading_msg.edit_text.call_args
+    assert len(seen) == llamadas
+    assert kwargs_seen["use_short_summary"] is corto  # mensaje corto vs completo
+    assert ("reply_markup" in kwargs) is teclado
+    assert args[0].startswith(getattr(ai_rewrite, primer_renglon))
+    assert kwargs.get("parse_mode") == "Markdown"  # CA-37
+    if primer_renglon == "TRANSPARENCY_FIXED_NO_BUTTONS":
+        assert ai_rewrite.TRANSPARENCY_NOT_USED not in args[0]  # corrige el defecto 1.4
+    if primer_renglon == "TRANSPARENCY_USED":
+        assert "Frase de prosa libre reescrita." in args[0]
+    if primer_renglon == "TRANSPARENCY_NOT_USED":
+        assert _BODY_PROSA in args[0]  # texto original intacto
+
+
+@pytest.mark.parametrize("case", FAILURE_TABLE, ids=lambda c: c.id)
+async def test_ca31_run_analysis_entrega_el_mensaje_original_ante_cada_falla(
+    case, conn_factory, monkeypatch, caplog
+):
+    from investbot import gemini_client
+
+    _complete_onboarding(conn_factory)
+    config = gemini_client.load_config(
+        {"GEMINI_API_KEY": CANARY_KEY, "GEMINI_REWRITE_ENABLED": "true"}
+    )
+    handler, _ = sequence_handler(case.steps)
+    kwargs_seen: dict = {}
+    _patch_parts_kwargs(monkeypatch, list(_PARTS_RW), kwargs_seen)
+    clients, seen = _gemini_clients(config, handler)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+
+    loading_msg = query_vent.edit_message_text.return_value
+    loading_msg.edit_text.assert_awaited_once()
+    args, kwargs = loading_msg.edit_text.call_args
+    assert args[0] == f"{ai_rewrite.TRANSPARENCY_NOT_USED}\n\n*Adobe (ADBE)*\n\n{_BODY_PROSA}"
+    assert kwargs.get("parse_mode") == "Markdown"
+    # los Gemini del spy: el handler envuelve al cliente, pero cada intento cuenta
+    tokens = [r for r in caplog.records if _TOKEN_RE_F3.search(r.getMessage())]
+    assert len(tokens) == 1
+    exc_texts = "".join(str(r.exc_text) for r in caplog.records)
+    for blob in (caplog.text, exc_texts):
+        assert CANARY_KEY not in blob and CANARY_BODY not in blob
+        assert "Illegal header value" not in blob
+
+
+async def test_ca37_primer_renglon_sin_caracteres_markdown_y_envio_con_parse_mode_markdown(
+    conn_factory, monkeypatch
+):
+    from investbot import gemini_client
+
+    _complete_onboarding(conn_factory)
+    config = gemini_client.load_config(
+        {"GEMINI_API_KEY": DUMMY_KEY, "GEMINI_REWRITE_ENABLED": "true"}
+    )
+    _patch_parts_kwargs(monkeypatch, list(_PARTS_RW), {})
+    clients, _ = _gemini_clients(config, _rewrite_ok)
+    handlers = query_handler.build_query_handlers(conn_factory, clients, FakeRateLimiter())
+    _, query_vent = await _drive_esc_vent(handlers, "ADBE")
+    args, kwargs = query_vent.edit_message_text.return_value.edit_text.call_args
+    primer_renglon = args[0].split("\n\n")[0]
+    assert primer_renglon == ai_rewrite.TRANSPARENCY_USED
+    assert kwargs["parse_mode"] == "Markdown"
+    for ch in ("*", "_", "`", "["):
+        assert ch not in primer_renglon

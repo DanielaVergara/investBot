@@ -1,3 +1,5 @@
+SUPERSEDIDA PARCIALMENTE por SDD_migracion_gemini.md (transporte y configuración; el mecanismo de integridad sigue vigente)
+
 # Spec: Capa de post-procesamiento de redacción con LLM local (Ollama) [Iter-1]
 
 **Rol:** `architect` (spec base).

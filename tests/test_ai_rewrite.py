@@ -1,5 +1,5 @@
 """Tests de `ai_rewrite.py` — capa de post-procesamiento de redacción con
-Ollama (`SDD_redaccion_ia_ollama.md`, con Spec Patch [Iter-2] ya aplicado).
+Gemini (`SDD_redaccion_ia_ollama.md`, con Spec Patch [Iter-2] ya aplicado).
 
 Mapeo test→criterio: los números entre paréntesis en cada docstring/comentario
 (ej. "Caso 9") corresponden a la numeración 1-63 de la sección "Casos
@@ -25,40 +25,49 @@ import httpx
 import pytest
 
 from investbot import ai_rewrite, summary
+from investbot.gemini_client import GeminiConfig
 
-CANARY_SECRET = "OLLAMA-SHARED-SECRET-CANARY"
+from .gemini_helpers import (
+    CANARY_BODY,
+    CANARY_KEY,
+    DUMMY_KEY,
+    FAILURE_TABLE,
+    gemini_response,
+    request_body,
+    sequence_handler,
+    system_text,
+    user_text,
+)
 
 
 def _client_with_handler(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _enabled_config(**overrides) -> ai_rewrite.OllamaConfig:
+def _enabled_config(**overrides) -> GeminiConfig:
     defaults = dict(
         enabled=True,
-        base_url="http://100.101.102.103:11434",
-        model="qwen2.5:7b-instruct",
-        timeout_seconds=8.0,
+        api_key=DUMMY_KEY,
+        rewrite_enabled=True,
+        rewrite_timeout_seconds=8.0,
     )
     defaults.update(overrides)
-    return ai_rewrite.OllamaConfig(**defaults)
+    return GeminiConfig(**defaults)
 
 
-def _disabled_config() -> ai_rewrite.OllamaConfig:
-    return ai_rewrite.OllamaConfig(
-        enabled=False, base_url="", model="qwen2.5:7b-instruct", timeout_seconds=8.0
-    )
+def _disabled_config() -> GeminiConfig:
+    return GeminiConfig(enabled=False)
 
 
 def _ok_handler(response_text: str):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": response_text})
+        return httpx.Response(200, json=gemini_response(response_text))
 
     return handler
 
 
 def _section_response(sections: list[str]) -> str:
-    """Arma el string de respuesta simulada de Ollama como un objeto JSON
+    """Arma el string de respuesta simulada de Gemini como un objeto JSON
     con claves de índice string ("0".."N-1"), mismo contrato que espera
     `ai_rewrite._parse_json_sections`."""
     return json.dumps({str(i): text for i, text in enumerate(sections)}, ensure_ascii=False)
@@ -73,84 +82,6 @@ class _CountingClient:
     async def post(self, *args, **kwargs):  # pragma: no cover - nunca debería invocarse
         self.call_count += 1
         raise AssertionError("no debería haber ninguna llamada HTTP en este camino")
-
-
-class _EnvNoBaseUrl(dict):
-    """Env que explota si se lee OLLAMA_BASE_URL — usado para probar que
-    `load_config` no la lee cuando el feature flag está apagado (caso 1)."""
-
-    def get(self, key, default=None):
-        if key == ai_rewrite.ENV_BASE_URL:
-            raise AssertionError("load_config no debería leer OLLAMA_BASE_URL acá")
-        return dict.get(self, key, default)
-
-
-# ---------------------------------------------------------------------------
-# A. load_config — feature flag y configuración (casos 1-6)
-# ---------------------------------------------------------------------------
-
-
-def test_load_config_enabled_ausente_no_lee_base_url():
-    """Caso 1: sin OLLAMA_REWRITE_ENABLED, `enabled is False` y
-    `OLLAMA_BASE_URL` ni siquiera se lee."""
-    env = _EnvNoBaseUrl({})
-    config = ai_rewrite.load_config(env)
-    assert config.enabled is False
-
-
-@pytest.mark.parametrize(
-    "raw_value",
-    ["", "false", "0", "no", "cualquier-otra-cosa"],
-    ids=["vacio", "false", "cero", "no", "otro"],
-)
-def test_load_config_enabled_valores_falsy(raw_value):
-    """Caso 2: valores que no matchean "true"/"1"/"yes" -> `enabled is False`."""
-    env = {ai_rewrite.ENV_ENABLED: raw_value, ai_rewrite.ENV_BASE_URL: "http://x:11434"}
-    assert ai_rewrite.load_config(env).enabled is False
-
-
-@pytest.mark.parametrize(
-    "raw_value", ["true", "TRUE", "True", "1", "yes", "YES"],
-)
-def test_load_config_enabled_valores_truthy_case_insensitive(raw_value):
-    """Caso 3: valores truthy (case-insensitive) + OLLAMA_BASE_URL seteada
-    -> `enabled is True`."""
-    env = {ai_rewrite.ENV_ENABLED: raw_value, ai_rewrite.ENV_BASE_URL: "http://100.1.2.3:11434"}
-    assert ai_rewrite.load_config(env).enabled is True
-
-
-def test_load_config_enabled_true_sin_base_url_es_deshabilitado():
-    """Caso 4: ENABLED=true pero BASE_URL ausente/vacía -> tratado como
-    deshabilitado (defensivo)."""
-    env = {ai_rewrite.ENV_ENABLED: "true"}
-    assert ai_rewrite.load_config(env).enabled is False
-
-    env2 = {ai_rewrite.ENV_ENABLED: "true", ai_rewrite.ENV_BASE_URL: "   "}
-    assert ai_rewrite.load_config(env2).enabled is False
-
-
-def test_load_config_model_y_timeout_defaults():
-    """Caso 5: sin OLLAMA_MODEL/OLLAMA_TIMEOUT_SECONDS -> defaults documentados."""
-    config = ai_rewrite.load_config({})
-    assert config.model == "qwen2.5:7b-instruct"
-    assert config.timeout_seconds == 8.0
-
-
-def test_load_config_timeout_custom_como_float():
-    """Caso 6: OLLAMA_TIMEOUT_SECONDS custom se refleja como `float`, no string."""
-    config = ai_rewrite.load_config({ai_rewrite.ENV_TIMEOUT: "15.0"})
-    assert config.timeout_seconds == 15.0
-    assert isinstance(config.timeout_seconds, float)
-
-
-def test_load_config_timeout_no_numerico_cae_a_default():
-    """Robustez adicional (branch coverage de `load_config`, exigido por
-    QA -- "branch coverage 100% en... combinaciones del feature flag"): un
-    valor no numérico en OLLAMA_TIMEOUT_SECONDS no debe romper el arranque
-    del bot -- mismo espíritu best-effort de toda la feature -- cae al
-    default documentado en vez de propagar `ValueError`."""
-    config = ai_rewrite.load_config({ai_rewrite.ENV_TIMEOUT: "no-es-un-numero"})
-    assert config.timeout_seconds == ai_rewrite.DEFAULT_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +119,8 @@ def _one_section_parts() -> list[str]:
 
 
 async def test_rewrite_parts_connect_error_fallback_silencioso_info(caplog):
-    """Caso 9: ConnectError (PC apagada) -> fallback silencioso, INFO, sin
-    propagar excepción."""
+    """Caso 9: ConnectError -> fallback silencioso, log con token
+    `GEMINI_NETWORK`, sin propagar excepción."""
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("failed", request=request)
 
@@ -198,11 +129,11 @@ async def test_rewrite_parts_connect_error_fallback_silencioso_info(caplog):
     with caplog.at_level(logging.INFO):
         result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
-    assert any(r.levelno == logging.INFO for r in caplog.records)
+    assert any(r.levelno >= logging.INFO and "GEMINI_NETWORK" in r.getMessage() for r in caplog.records)
 
 
 async def test_rewrite_parts_timeout_exception_fallback_silencioso_info(caplog):
-    """Caso 10: TimeoutException -> mismo resultado, INFO."""
+    """Caso 10: TimeoutException -> mismo resultado, token `GEMINI_TIMEOUT`."""
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timed out", request=request)
 
@@ -211,7 +142,7 @@ async def test_rewrite_parts_timeout_exception_fallback_silencioso_info(caplog):
     with caplog.at_level(logging.INFO):
         result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
-    assert any(r.levelno == logging.INFO for r in caplog.records)
+    assert any(r.levelno >= logging.INFO and "GEMINI_TIMEOUT" in r.getMessage() for r in caplog.records)
 
 
 async def test_rewrite_parts_http_500_fallback_silencioso(caplog):
@@ -242,8 +173,8 @@ async def test_rewrite_parts_cuerpo_no_json_fallback_silencioso():
 
 async def test_rewrite_parts_json_sin_clave_response_fallback_silencioso():
     """Caso 13 (criterio de `security` sección 4, no estaba en base de
-    `architect`): JSON 200 válido pero sin la clave "response" esperada ->
-    fallback silencioso, sin `KeyError` no capturado."""
+    `architect`): JSON 200 válido pero sin `candidates` (forma inesperada del
+    sobre de Gemini) -> fallback silencioso, sin `KeyError` no capturado."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"unexpected_shape": True})
 
@@ -251,26 +182,6 @@ async def test_rewrite_parts_json_sin_clave_response_fallback_silencioso():
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
-
-
-async def test_rewrite_parts_payload_incluye_stream_false_y_format_json():
-    """Caso 14: el payload a /api/generate incluye "stream": false y
-    "format": "json" explícitos -- el formato estructurado es lo que le
-    permite a Ollama restringir la generación a JSON válido a nivel de
-    grammar/sampling, en vez de depender de que el modelo reproduzca un
-    patrón de texto libre."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        import json as _json
-        captured["body"] = _json.loads(request.content)
-        return httpx.Response(200, json={"response": _section_response(["Precio razonable con PER de 15.0%"])})
-
-    parts = _one_section_parts()
-    client = _client_with_handler(handler)
-    await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert captured["body"]["stream"] is False
-    assert captured["body"]["format"] == "json"
 
 
 async def test_rewrite_parts_cancelled_error_se_propaga():
@@ -283,26 +194,6 @@ async def test_rewrite_parts_cancelled_error_se_propaga():
     client = _client_with_handler(handler)
     with pytest.raises(asyncio.CancelledError):
         await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-
-
-async def test_rewrite_parts_usa_timeout_connect_3_y_read_configurado():
-    """Caso 16: el cliente HTTP se invoca con
-    `timeout=httpx.Timeout(connect=3.0, read=config.timeout_seconds)` (o
-    equivalente) -- se inspecciona `request.extensions["timeout"]`, no solo
-    que "no tarda más de X"."""
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["timeout"] = request.extensions.get("timeout")
-        return httpx.Response(200, json={"response": _section_response(["Precio razonable con PER de 15.0%"])})
-
-    parts = _one_section_parts()
-    client = _client_with_handler(handler)
-    config = _enabled_config(timeout_seconds=12.5)
-    await ai_rewrite.rewrite_parts(parts, config, http_client=client)
-    assert captured["timeout"]["connect"] == ai_rewrite.CONNECT_TIMEOUT_SECONDS
-    assert captured["timeout"]["connect"] == 3.0
-    assert captured["timeout"]["read"] == 12.5
 
 
 async def test_rewrite_parts_fallo_en_reconstruccion_cae_a_fallback_completo(monkeypatch, caplog):
@@ -318,7 +209,7 @@ async def test_rewrite_parts_fallo_en_reconstruccion_cae_a_fallback_completo(mon
     parts = _one_section_parts()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response(["Precio razonable con PER de 15.0%"])})
+        return httpx.Response(200, json=gemini_response(_section_response(["Precio razonable con PER de 15.0%"])))
 
     client = _client_with_handler(handler)
     with caplog.at_level(logging.WARNING):
@@ -735,7 +626,7 @@ def test_reconstruct_section_capa2_asterisco_desparejado_es_none():
     """Incidente de producción 2026-09-04 (ADBE): la línea "*Veredicto:*"
     de `summary.build_veredicto_section` no tiene ningún protected token
     (ni número, ni %, ni ticker, ni ✅/❌/SÍ/NO) -> queda 100% libre para
-    que Ollama la reescriba. Si el modelo parafrasea y dropea uno de los
+    que Gemini la reescriba. Si el modelo parafrasea y dropea uno de los
     2 asteriscos ("*Veredicto:*" -> "*Veredicto:"), `_is_safe_rewrite`
     NO lo detecta (ningún protected token cambió) -- pero el mensaje final
     queda con un delimitador de negrita desparejado y Telegram rechaza el
@@ -784,7 +675,7 @@ async def test_rewrite_parts_end_to_end_veredicto_asterisco_desparejado_cae_a_or
     """Reproduce el incidente de producción 2026-09-04 (ADBE) de punta a
     punta a través de `rewrite_parts`: la sección real que arma
     `summary.build_veredicto_section` (título en negrita + líneas con
-    datos protegidos), Ollama reescribe "*Veredicto:*" rompiendo el
+    datos protegidos), Gemini reescribe "*Veredicto:*" rompiendo el
     balance de asteriscos -> esa sección tiene que volver intacta a su
     redacción original (nunca debe llegar al usuario un `*` desparejado),
     y el resto del mensaje sigue su curso normal."""
@@ -807,7 +698,7 @@ async def test_rewrite_parts_end_to_end_veredicto_asterisco_desparejado_cae_a_or
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, json={"response": _section_response([rewritten_section])}
+            200, json=gemini_response(_section_response([rewritten_section]))
         )
 
     client = _client_with_handler(handler)
@@ -818,7 +709,7 @@ async def test_rewrite_parts_end_to_end_veredicto_asterisco_desparejado_cae_a_or
     # `_run_analysis`.
     assert outcome.parts[1] == veredicto_section
     assert outcome.parts[1].count("*") % 2 == 0
-    assert outcome.used_ollama is False
+    assert outcome.used_gemini is False
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +733,7 @@ async def test_rewrite_parts_end_to_end_mezcla_prosa_y_datos_protegidos():
     response_b = f"{ph_b} — creció bastante este trimestre."
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([response_a, response_b])})
+        return httpx.Response(200, json=gemini_response(_section_response([response_a, response_b])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
@@ -851,9 +742,8 @@ async def test_rewrite_parts_end_to_end_mezcla_prosa_y_datos_protegidos():
     assert "✅ Ingresos que crecen (según el boletín)" in result[1]
     assert "reescrita con más fluidez" in result[1]
     assert "Sección B: 15.0% de crecimiento" in result[2]
-    # AI_REWRITE_INDICATOR retirado (SDD_explicaciones_interactivas_ollama.md,
-    # Decisión #5/D2) -- nunca se agrega, ni siquiera cuando hubo reescritura.
-    assert ai_rewrite.AI_REWRITE_INDICATOR not in result[-1]
+    # El indicador retirado (Decisión #5/D2) se eliminó del módulo (F3): nada
+    # se agrega al final, ni siquiera cuando hubo reescritura.
 
 
 async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_granular():
@@ -871,7 +761,7 @@ async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_gran
     response_b = "texto sin ningún placeholder"  # falla el guard de esa sección
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([response_a, response_b])})
+        return httpx.Response(200, json=gemini_response(_section_response([response_a, response_b])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
@@ -893,7 +783,7 @@ async def test_rewrite_parts_end_to_end_una_seccion_falla_guard_degradacion_gran
 )
 async def test_rewrite_parts_end_to_end_estructura_json_invalida_fallback_completo(raw_response, caplog):
     """Caso 44: matriz de estructuras JSON inválidas/inesperadas en la
-    respuesta de Ollama (claves faltantes/de más, JSON no parseable, JSON
+    respuesta de Gemini (claves faltantes/de más, JSON no parseable, JSON
     que no es un objeto, o valores que no son string) -> TODAS las
     secciones vuelven al original, WARNING."""
     section_a = "✅ Ingresos que crecen"
@@ -901,61 +791,12 @@ async def test_rewrite_parts_end_to_end_estructura_json_invalida_fallback_comple
     parts = ["*Adobe (ADBE)*", section_a, section_b]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": raw_response})
+        return httpx.Response(200, json=gemini_response(raw_response))
 
     client = _client_with_handler(handler)
     with caplog.at_level(logging.WARNING):
         result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     assert result == parts
-    assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-async def test_rewrite_parts_reintenta_una_vez_y_se_recupera(caplog):
-    """Fix 2026-09-03: si la 1a respuesta de Ollama tiene estructura JSON
-    inesperada pero la 2a (reintento) es válida, `rewrite_parts` usa la
-    reescritura del 2o intento -- no cae al fallback -- y loguea el
-    reintento a INFO."""
-    section = "Prosa libre sin ningún dato protegido."
-    parts = ["*Adobe (ADBE)*", section]
-    call_count = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return httpx.Response(200, json={"response": "esto no es json"})
-        return httpx.Response(200, json={"response": _section_response(["Prosa reescrita."])})
-
-    client = _client_with_handler(handler)
-    with caplog.at_level(logging.INFO):
-        outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-
-    assert call_count["n"] == 2
-    assert outcome.parts[1] == "Prosa reescrita."
-    assert outcome.used_ollama is True
-    assert any(
-        "reintentando" in r.message and r.levelno == logging.INFO for r in caplog.records
-    )
-
-
-async def test_rewrite_parts_ambos_intentos_fallan_cae_a_fallback(caplog):
-    """Fix 2026-09-03: si AMBOS intentos (original + reintento) devuelven
-    estructura JSON inesperada, se hacen exactamente 2 llamadas HTTP y el
-    resultado final es el fallback de siempre (texto original, WARNING)."""
-    section = "Prosa libre sin ningún dato protegido."
-    parts = ["*Adobe (ADBE)*", section]
-    call_count = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_count["n"] += 1
-        return httpx.Response(200, json={"response": "esto no es json"})
-
-    client = _client_with_handler(handler)
-    with caplog.at_level(logging.INFO):
-        outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-
-    assert call_count["n"] == 2
-    assert outcome.parts == parts
-    assert outcome.used_ollama is False
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
@@ -968,13 +809,13 @@ async def test_rewrite_parts_system_prompt_incluye_regla_6_de_placeholders():
         import json as _json
         captured["body"] = _json.loads(request.content)
         section = "✅ Dato protegido"
-        return httpx.Response(200, json={"response": _section_response([section.replace("✅ Dato protegido", "⟦PH0⟧")])})
+        return httpx.Response(200, json=gemini_response(_section_response([section.replace("✅ Dato protegido", "⟦PH0⟧")])))
 
     parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
     client = _client_with_handler(handler)
     await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert "⟦PHn⟧" in captured["body"]["system"]
-    assert captured["body"]["system"] == ai_rewrite.SYSTEM_PROMPT
+    assert "⟦PHn⟧" in system_text(captured["body"])
+    assert system_text(captured["body"]) == ai_rewrite.SYSTEM_PROMPT
 
 
 async def test_rewrite_parts_end_to_end_mismo_numero_de_lineas_tras_restitucion():
@@ -993,13 +834,12 @@ async def test_rewrite_parts_end_to_end_mismo_numero_de_lineas_tras_restitucion(
     response_text = "\n".join(reordered)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([response_text])})
+        return httpx.Response(200, json=gemini_response(_section_response([response_text])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
-    # Este es el único body part -> el indicador (caso 58-60) se le anexa
-    # como sufijo; se descarta antes de contar líneas de la sección en sí.
-    section_result = result[1].split("\n\n" + ai_rewrite.AI_REWRITE_INDICATOR)[0]
+    # Este es el único body part; no se le anexa ningún sufijo.
+    section_result = result[1]
     assert len(section_result.split("\n")) == len(section.split("\n"))
     assert "✅ Dato protegido uno" in section_result
     assert "❌ Dato protegido dos" in section_result
@@ -1011,19 +851,19 @@ async def test_rewrite_parts_end_to_end_mismo_numero_de_lineas_tras_restitucion(
 
 
 async def test_rewrite_parts_titulo_nunca_en_el_prompt():
-    """Caso 47: `parts[0]` nunca se incluye en el prompt enviado a Ollama."""
+    """Caso 47: `parts[0]` nunca se incluye en el prompt enviado a Gemini."""
     captured = {}
     titulo = "*Adobe Inc. Muy Especial (ADBE)*"
 
     def handler(request: httpx.Request) -> httpx.Response:
         import json as _json
         captured["body"] = _json.loads(request.content)
-        return httpx.Response(200, json={"response": _section_response(["Cuerpo sin cambios"])})
+        return httpx.Response(200, json=gemini_response(_section_response(["Cuerpo sin cambios"])))
 
     parts = [titulo, "Cuerpo sin cambios"]
     client = _client_with_handler(handler)
     await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert titulo not in captured["body"]["prompt"]
+    assert titulo not in user_text(captured["body"])
 
 
 @pytest.mark.parametrize(
@@ -1045,7 +885,7 @@ async def test_rewrite_parts_titulo_nunca_modificado(scenario):
         result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
     else:
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"response": _section_response(["⟦PH0⟧"])})
+            return httpx.Response(200, json=gemini_response(_section_response(["⟦PH0⟧"])))
         client = _client_with_handler(handler)
         result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
 
@@ -1055,7 +895,7 @@ async def test_rewrite_parts_titulo_nunca_modificado(scenario):
 async def test_rewrite_parts_company_name_adversarial_nunca_en_el_prompt():
     """Caso 49: `company_name` adversarial (simulando un mock de FMP con un
     intento de prompt injection) -- ese string nunca aparece en el payload
-    enviado a Ollama, reforzando la exclusión de `parts[0]` contra este
+    enviado a Gemini, reforzando la exclusión de `parts[0]` contra este
     vector específico. Se simula directamente sobre `parts[0]` (donde
     `summary.py` interpola `company_name`), sin necesidad de correr todo el
     pipeline de `fetch_and_analyze_parts` -- el punto de exclusión relevante
@@ -1068,50 +908,18 @@ async def test_rewrite_parts_company_name_adversarial_nunca_en_el_prompt():
     def handler(request: httpx.Request) -> httpx.Response:
         import json as _json
         captured["body"] = _json.loads(request.content)
-        return httpx.Response(200, json={"response": _section_response(["Cuerpo normal"])})
+        return httpx.Response(200, json=gemini_response(_section_response(["Cuerpo normal"])))
 
     parts = [titulo, "Cuerpo normal"]
     client = _client_with_handler(handler)
     await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert adversarial not in captured["body"]["prompt"]
-    assert adversarial not in captured["body"]["system"]
+    assert adversarial not in user_text(captured["body"])
+    assert adversarial not in system_text(captured["body"])
 
 
 # ---------------------------------------------------------------------------
 # K. Indicador visible de "redacción asistida por IA" (casos 58-60)
 # ---------------------------------------------------------------------------
-
-
-def test_indicador_no_revela_nombre_de_proveedor_ni_modelo():
-    """Caso 58: el texto del indicador no contiene "ollama", "tailscale",
-    ninguna IP, ni "qwen"/"llama" (nombres de modelo)."""
-    import re as _re
-
-    texto = ai_rewrite.AI_REWRITE_INDICATOR.lower()
-    assert "ollama" not in texto
-    assert "tailscale" not in texto
-    assert "qwen" not in texto
-    assert "llama" not in texto
-    assert _re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", texto) is None
-
-
-def test_indicador_no_revela_detalles_operativos():
-    """Caso 59: el indicador no revela el timeout configurado ni el estado
-    de la PC de Daniela -- ningún número seguido de "s"/"seg"."""
-    import re as _re
-
-    texto = ai_rewrite.AI_REWRITE_INDICATOR
-    assert _re.search(r"\d+\s*(s|seg)\b", texto, flags=_re.IGNORECASE) is None
-    assert "prendida" not in texto.lower()
-    assert "apagada" not in texto.lower()
-
-
-async def test_indicador_no_aparece_con_feature_deshabilitada():
-    """Caso 60: con la feature deshabilitada, el indicador no aparece en
-    ningún elemento del resultado."""
-    parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
-    result = (await ai_rewrite.rewrite_parts(parts, _disabled_config())).parts
-    assert all(ai_rewrite.AI_REWRITE_INDICATOR not in p for p in result)
 
 
 # ---------------------------------------------------------------------------
@@ -1120,18 +928,20 @@ async def test_indicador_no_aparece_con_feature_deshabilitada():
 
 
 async def test_log_fallback_no_incluye_ip_completa(caplog):
-    """Caso 61: el log de fallback (INFO) no incluye la IP/puerto completo
-    de `OLLAMA_BASE_URL` -- se loguea el tipo de excepción, no la URL del
-    request."""
+    """Caso 61 (reescrito, CA-22/CS-3): el log de fallback no incluye la key
+    ni una URL con la key -- se loguea el token, el tipo de excepción y el
+    status, no la URL del request."""
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("failed", request=request)
 
     parts = _one_section_parts()
-    config = _enabled_config(base_url="http://100.101.102.103:11434")
+    config = _enabled_config(api_key=CANARY_KEY)
     client = _client_with_handler(handler)
     with caplog.at_level(logging.INFO):
         await ai_rewrite.rewrite_parts(parts, config, http_client=client)
-    assert "100.101.102.103" not in caplog.text
+    assert "GEMINI_NETWORK" in caplog.text  # control positivo: sí hubo log
+    assert CANARY_KEY not in caplog.text
+    assert "key=" not in caplog.text
 
 
 async def test_log_warning_estructura_inesperada_no_incluye_cuerpo_crudo_con_control_chars(caplog):
@@ -1143,7 +953,7 @@ async def test_log_warning_estructura_inesperada_no_incluye_cuerpo_crudo_con_con
     payload_con_control_chars = "linea1\nlinea2\x00fake_log_injection"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": payload_con_control_chars})
+        return httpx.Response(200, json=gemini_response(payload_con_control_chars))
 
     parts = _one_section_parts()
     client = _client_with_handler(handler)
@@ -1151,17 +961,6 @@ async def test_log_warning_estructura_inesperada_no_incluye_cuerpo_crudo_con_con
         await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
     assert "fake_log_injection" not in caplog.text
     assert "\x00" not in caplog.text
-
-
-@pytest.mark.skip(
-    reason="Capa 2.5 (OLLAMA_SHARED_SECRET, shared-secret header vía reverse "
-    "proxy) es explícitamente recomendada pero NO bloqueante (security "
-    "sección 2.5) y no se implementa en esta iteración -- fuera del alcance "
-    "de código de esta spec. N/A, no un test faltante (criterio 63, "
-    "condicional a que se implemente la capa 2.5)."
-)
-def test_ollama_shared_secret_nunca_en_logs_no_aplica_capa_no_implementada():
-    """Caso 63 -- N/A en esta iteración, ver `reason` del skip."""
 
 
 # ---------------------------------------------------------------------------
@@ -1237,7 +1036,7 @@ def _real_transparency_section(**overrides) -> str:
 async def test_rewrite_parts_condensa_notas_de_transparencia_reales_preserva_ambos_disclaimers():
     """Test end-to-end sobre la sección REAL de "Notas de transparencia" que
     devuelve `build_summary_parts` (no un fixture simplificado): se simula
-    una respuesta de Ollama que intenta activamente acortar/reformular la
+    una respuesta de Gemini que intenta activamente acortar/reformular la
     prosa libre restante de la sección (respetando el contrato de
     placeholders) -- el resultado final de `rewrite_parts` contiene ambos
     disclaimers byte-idénticos al original, incluso si el resto de la
@@ -1252,7 +1051,7 @@ async def test_rewrite_parts_condensa_notas_de_transparencia_reales_preserva_amb
     parts = ["*Adobe (ADBE)*", section]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([condensado])})
+        return httpx.Response(200, json=gemini_response(_section_response([condensado])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
@@ -1264,7 +1063,7 @@ async def test_rewrite_parts_condensa_notas_de_transparencia_reales_preserva_amb
 
 async def test_rewrite_parts_adversarial_omite_placeholder_de_disclaimer_cae_a_fallback_completo():
     """Test adversarial (Spec Patch [Iter-3]): la respuesta simulada de
-    Ollama omite el placeholder de uno de los disclaimers -- el modelo
+    Gemini omite el placeholder de uno de los disclaimers -- el modelo
     "decide" no copiarlo, buscando cumplir la instrucción de acortar
     (regla 7). `_reconstruct_section` debe devolver `None` (mismo camino ya
     probado para placeholders numéricos, caso 37 de QA Iter-2) -> la
@@ -1281,7 +1080,7 @@ async def test_rewrite_parts_adversarial_omite_placeholder_de_disclaimer_cae_a_f
     parts = ["*Adobe (ADBE)*", section]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([respuesta_con_omision])})
+        return httpx.Response(200, json=gemini_response(_section_response([respuesta_con_omision])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
@@ -1300,14 +1099,14 @@ async def test_rewrite_parts_system_prompt_incluye_regla_7_de_condensacion():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"response": _section_response(["Cuerpo sin cambios"])})
+        return httpx.Response(200, json=gemini_response(_section_response(["Cuerpo sin cambios"])))
 
     parts = ["*Adobe (ADBE)*", "Cuerpo sin cambios"]
     client = _client_with_handler(handler)
     await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert "CONDENSAR" in captured["body"]["system"]
-    assert "condensar no es resumir" in captured["body"]["system"]
-    assert captured["body"]["system"] == ai_rewrite.SYSTEM_PROMPT
+    assert "CONDENSAR" in system_text(captured["body"])
+    assert "condensar no es resumir" in system_text(captured["body"])
+    assert system_text(captured["body"]) == ai_rewrite.SYSTEM_PROMPT
 
 
 def test_system_prompt_regla_4_ajustada_para_no_contradecir_la_regla_7():
@@ -1335,7 +1134,7 @@ async def test_rewrite_parts_condensacion_de_prosa_libre_sin_disclaimers_no_regr
     assert len(intro_condensada) < len(intro_larga)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([intro_condensada])})
+        return httpx.Response(200, json=gemini_response(_section_response([intro_condensada])))
 
     client = _client_with_handler(handler)
     result = (await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)).parts
@@ -1349,24 +1148,24 @@ async def test_rewrite_parts_condensacion_de_prosa_libre_sin_disclaimers_no_regr
 
 
 async def test_rewrite_parts_devuelve_rewrite_outcome():
-    """Caso 48: `rewrite_parts` devuelve un `RewriteOutcome(parts, used_ollama)`,
+    """Caso 48: `rewrite_parts` devuelve un `RewriteOutcome(parts, used_gemini)`,
     no un `list[str]` desnudo."""
     parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
     outcome = await ai_rewrite.rewrite_parts(parts, _disabled_config())
     assert isinstance(outcome, ai_rewrite.RewriteOutcome)
     assert outcome.parts == parts
-    assert outcome.used_ollama is False
+    assert outcome.used_gemini is False
 
 
-async def test_used_ollama_false_con_feature_deshabilitada():
-    """Caso 49a: deshabilitada -> `used_ollama=False`."""
+async def test_used_gemini_false_con_feature_deshabilitada():
+    """Caso 49a: deshabilitada -> `used_gemini=False`."""
     parts = ["*Adobe (ADBE)*", "✅ Dato protegido"]
     outcome = await ai_rewrite.rewrite_parts(parts, _disabled_config())
-    assert outcome.used_ollama is False
+    assert outcome.used_gemini is False
 
 
-async def test_used_ollama_false_con_timeout():
-    """Caso 49b: habilitada pero Ollama no responde -> `used_ollama=False`
+async def test_used_gemini_false_con_timeout():
+    """Caso 49b: habilitada pero Gemini no responde -> `used_gemini=False`
     (ninguna sección se reescribió efectivamente)."""
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timeout", request=request)
@@ -1374,12 +1173,12 @@ async def test_used_ollama_false_con_timeout():
     parts = _one_section_parts()
     client = _client_with_handler(handler)
     outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert outcome.used_ollama is False
+    assert outcome.used_gemini is False
 
 
-async def test_used_ollama_true_con_al_menos_una_seccion_reescrita():
+async def test_used_gemini_true_con_al_menos_una_seccion_reescrita():
     """Caso 49c: al menos 1 sección resultó distinta del original tras el
-    guard -> `used_ollama=True`."""
+    guard -> `used_gemini=True`."""
     section = "Sección con ✅ dato protegido y prosa libre reescribible."
     parts = ["*Adobe (ADBE)*", section]
     _, line_map = ai_rewrite._classify_lines(section)
@@ -1387,17 +1186,17 @@ async def test_used_ollama_true_con_al_menos_una_seccion_reescrita():
     response = f"Prosa reescrita distinta.\n{ph}"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([response])})
+        return httpx.Response(200, json=gemini_response(_section_response([response])))
 
     client = _client_with_handler(handler)
     outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert outcome.used_ollama is True
+    assert outcome.used_gemini is True
     assert outcome.parts[1] != section
 
 
-async def test_used_ollama_false_si_guard_falla_en_todas_las_secciones():
-    """Caso 49d: habilitada, Ollama responde, pero el guard rechaza todas
-    las secciones (todas vuelven al original) -> `used_ollama=False`."""
+async def test_used_gemini_false_si_guard_falla_en_todas_las_secciones():
+    """Caso 49d: habilitada, Gemini responde, pero el guard rechaza todas
+    las secciones (todas vuelven al original) -> `used_gemini=False`."""
     section_a = "✅ Ingresos que crecen"
     section_b = "❌ Utilidades crecientes"
     parts = ["*Adobe (ADBE)*", section_a, section_b]
@@ -1406,45 +1205,28 @@ async def test_used_ollama_false_si_guard_falla_en_todas_las_secciones():
         # Ninguna respuesta trae los placeholders esperados -> guard falla
         # para ambas secciones, cada una vuelve a su original.
         return httpx.Response(
-            200, json={"response": _section_response(["sin placeholder a", "sin placeholder b"])}
+            200, json=gemini_response(_section_response(["sin placeholder a", "sin placeholder b"]))
         )
 
     client = _client_with_handler(handler)
     outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert outcome.used_ollama is False
+    assert outcome.used_gemini is False
     assert outcome.parts[1] == section_a
     assert outcome.parts[2] == section_b
 
 
 def test_transparency_line_used():
-    """Caso 51a: `transparency_line(True) == TRANSPARENCY_USED`."""
-    assert ai_rewrite.transparency_line(True) == ai_rewrite.TRANSPARENCY_USED
-    assert ai_rewrite.TRANSPARENCY_USED == "🤖 Con ayuda de Ollama"
+    """Caso 51a: con rewrite habilitado, `transparency_line(config, True) ==
+    TRANSPARENCY_USED`."""
+    assert ai_rewrite.transparency_line(_enabled_config(), True) == ai_rewrite.TRANSPARENCY_USED
+    assert ai_rewrite.TRANSPARENCY_USED == "🤖 Con ayuda de Gemini"
 
 
 def test_transparency_line_not_used():
-    """Caso 51b: `transparency_line(False) == TRANSPARENCY_NOT_USED`."""
-    assert ai_rewrite.transparency_line(False) == ai_rewrite.TRANSPARENCY_NOT_USED
-    assert ai_rewrite.TRANSPARENCY_NOT_USED == "📋 Ollama no disponible esta vez"
-
-
-async def test_ai_rewrite_indicator_nunca_se_agrega_ni_con_used_ollama_true():
-    """Caso 50: `AI_REWRITE_INDICATOR` no se agrega a ningún `result[-1]`
-    bajo ningún escenario, incluido `used_ollama=True` -- retiro deliberado
-    (Decisión #5)."""
-    section = "Sección con ✅ dato protegido y prosa libre reescribible."
-    parts = ["*Adobe (ADBE)*", section]
-    _, line_map = ai_rewrite._classify_lines(section)
-    ph = next(iter(line_map))
-    response = f"Prosa reescrita distinta.\n{ph}"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": _section_response([response])})
-
-    client = _client_with_handler(handler)
-    outcome = await ai_rewrite.rewrite_parts(parts, _enabled_config(), http_client=client)
-    assert outcome.used_ollama is True
-    assert all(ai_rewrite.AI_REWRITE_INDICATOR not in p for p in outcome.parts)
+    """Caso 51b: con rewrite habilitado, `transparency_line(config, False) ==
+    TRANSPARENCY_NOT_USED`."""
+    assert ai_rewrite.transparency_line(_enabled_config(), False) == ai_rewrite.TRANSPARENCY_NOT_USED
+    assert ai_rewrite.TRANSPARENCY_NOT_USED == "📋 Gemini no disponible esta vez"
 
 
 def test_protected_tokens_alias_publico_misma_implementacion():
@@ -1452,3 +1234,572 @@ def test_protected_tokens_alias_publico_misma_implementacion():
     -- reusado por `ai_explain.py` sin importar un símbolo privado."""
     text = "El PER es de 15.0% y el veredicto es ✅"
     assert ai_rewrite.protected_tokens(text) == ai_rewrite._protected_tokens(text)
+
+
+# ===========================================================================
+# SDD_migracion_gemini.md (F3) -- tests nuevos del rewrite migrado:
+# CA-12, CA-19/20/21 (rewrite), CA-23, CA-29 a CA-37, CA-65, CA-66, CA-68,
+# CA-69, CS-5, CS-6, CS-19(a).
+# ===========================================================================
+
+import re as _re
+import traceback as _traceback
+
+from investbot import gemini_client
+from .gemini_helpers import SleepRecorder
+
+_TOKEN_RE = _re.compile(r"GEMINI_[A-Z0-9_]+")
+_PROSA = "Prosa libre sin datos para reescribir con más claridad."
+_PARTS_BASE = ["*Adobe (ADBE)*", _PROSA, "Sección con dato 15.0% protegido"]
+
+
+@pytest.fixture(autouse=True)
+def _logging_explicito_gemini(caplog):
+    """CQ-17: niveles explícitos; `bot.configure_logging()` no contamina."""
+    for name in ("investbot", "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=name)
+
+
+def _ph(section: str) -> dict:
+    return ai_rewrite._classify_lines(section)[1]
+
+
+async def _rewrite(parts, handler, config=None, **client_kwargs):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), **client_kwargs
+    ) as client:
+        return await ai_rewrite.rewrite_parts(parts, config or _enabled_config(), http_client=client)
+
+
+def _json_handler(sections: list[str]):
+    def handler(request):
+        return httpx.Response(200, json=gemini_response(_section_response(sections)))
+
+    return handler
+
+
+# --- CA-12 / CA-32: body del rewrite, timeout propio, 0 reintentos -------------
+
+
+async def test_ca12_body_del_rewrite_json_mime_2048_sin_schema_ni_campos_prohibidos():
+    capturas = []
+
+    def handler(request):
+        capturas.append(request)
+        return httpx.Response(200, json=gemini_response(_section_response(["Prosa nueva.", "⟦PH0⟧"])))
+
+    await _rewrite(_PARTS_BASE, handler)
+    assert len(capturas) == 1
+    body = request_body(capturas[0])
+    assert set(body) == {"systemInstruction", "contents", "generationConfig"}
+    assert body["generationConfig"] == {
+        "maxOutputTokens": 2048,
+        "responseMimeType": "application/json",
+        "thinkingConfig": {"thinkingLevel": "minimal"},
+    }
+    assert system_text(body) == ai_rewrite.SYSTEM_PROMPT
+    assert len(body["contents"]) == 1 and "role" not in body["contents"][0]
+    prohibidas = {"temperature", "topP", "topK", "candidateCount", "thinkingBudget", "tools",
+                  "safetySettings", "responseSchema", "responseJsonSchema"}
+    assert not (prohibidas & set(body["generationConfig"]))
+    assert not (prohibidas & set(body))
+    assert capturas[0].headers["x-goog-api-key"] == DUMMY_KEY
+    assert capturas[0].url.query == b""
+    assert ai_rewrite.REWRITE_MAX_OUTPUT_TOKENS == 2048
+
+
+async def test_ca32_el_rewrite_usa_rewrite_timeout_y_no_el_de_las_explicaciones():
+    capturas = []
+
+    def handler(request):
+        capturas.append(request)
+        return httpx.Response(200, json=gemini_response(_section_response(["a", "b"])))
+
+    config = _enabled_config(timeout_seconds=9.5, rewrite_timeout_seconds=3.5)
+    await _rewrite(_PARTS_BASE, handler, config)
+    assert capturas[0].extensions["timeout"] == {
+        "connect": 3.5, "read": 3.5, "write": 3.5, "pool": 3.5,
+    }
+
+
+async def test_ca12_thinking_level_configurado_llega_al_rewrite():
+    capturas = []
+
+    def handler(request):
+        capturas.append(request)
+        return httpx.Response(200, json=gemini_response(_section_response(["a", "b"])))
+
+    await _rewrite(_PARTS_BASE, handler, _enabled_config(thinking_level="low"))
+    assert request_body(capturas[0])["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+# --- CA-29 / CA-30: no-op ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        GeminiConfig(),
+        GeminiConfig(enabled=True, api_key=DUMMY_KEY, rewrite_enabled=False),  # key sin flag
+        GeminiConfig(enabled=False, api_key="", rewrite_enabled=True),  # flag sin key válida
+    ],
+    ids=["config_none", "deshabilitada", "key_sin_flag", "flag_sin_key"],
+)
+async def test_ca29_sin_rewrite_enabled_es_noop_sin_llamadas(config):
+    spy = _CountingClient()
+    outcome = await ai_rewrite.rewrite_parts(_PARTS_BASE, config, http_client=spy)
+    assert outcome.parts == _PARTS_BASE
+    assert outcome.used_gemini is False
+    assert spy.call_count == 0
+
+
+async def test_ca30_solo_titulo_es_noop_sin_llamadas():
+    spy = _CountingClient()
+    outcome = await ai_rewrite.rewrite_parts(["*Solo titulo*"], _enabled_config(), http_client=spy)
+    assert outcome.parts == ["*Solo titulo*"] and outcome.used_gemini is False
+    assert spy.call_count == 0
+
+
+# --- CA-31 / CA-19..21 / CA-69 (rewrite): matriz de fallas ---------------------------
+
+_FALLAS_ESTRUCTURA = [
+    pytest.param("no es json {{", id="texto_no_json"),
+    pytest.param(json.dumps({"0": "a"}), id="faltan_claves"),
+    pytest.param(json.dumps({"0": "a", "1": "b", "2": "c"}), id="claves_de_mas"),
+    pytest.param(json.dumps({"x": "a", "y": "b"}), id="claves_distintas"),
+    pytest.param(json.dumps({"0": "a", "1": 5}), id="valor_no_str"),
+    pytest.param(json.dumps(["a", "b"]), id="lista_en_vez_de_objeto"),
+]
+
+
+@pytest.mark.parametrize("case", FAILURE_TABLE, ids=lambda c: c.id)
+async def test_ca31_matriz_de_fallas_vuelve_al_original_sin_reintento(case, caplog, gemini_sleeps):
+    handler, seen = sequence_handler(case.steps)
+    config = _enabled_config(api_key=CANARY_KEY)
+    outcome = await _rewrite(_PARTS_BASE, handler, config)
+
+    assert outcome.parts == _PARTS_BASE
+    assert outcome.used_gemini is False
+    assert len(seen) == case.rewrite_calls == 1  # una sola llamada, sin reintento
+    assert gemini_sleeps.calls == []
+    # CA-69: exactamente 1 registro con token y ningún llamador lo duplica
+    tokens = [r for r in caplog.records if _TOKEN_RE.search(r.getMessage())]
+    assert len(tokens) == 1
+    assert case.rewrite_token in tokens[0].getMessage()
+    assert tokens[0].name == "investbot.gemini_client"
+    assert tokens[0].levelname == case.rewrite_level
+    # A11: ni la key, ni el cuerpo, ni el texto de la excepción
+    exc_texts = "".join(str(r.exc_text) for r in caplog.records)
+    for blob in (caplog.text, exc_texts):
+        assert CANARY_KEY not in blob
+        assert CANARY_BODY not in blob
+        assert "Illegal header value" not in blob
+
+
+@pytest.mark.parametrize("texto", _FALLAS_ESTRUCTURA)
+async def test_ca31_estructura_json_invalida_vuelve_al_original_con_una_llamada(texto, caplog):
+    handler, seen = sequence_handler((("body", gemini_response(texto)),))
+    outcome = await _rewrite(_PARTS_BASE, handler)
+    assert outcome.parts == _PARTS_BASE and outcome.used_gemini is False
+    assert len(seen) == 1
+    tokens = [r for r in caplog.records if _TOKEN_RE.search(r.getMessage())]
+    assert len(tokens) == 1 and "GEMINI_MALFORMED" in tokens[0].getMessage()
+
+
+async def test_ca23_cancelled_error_se_propaga_desde_rewrite_parts():
+    async def cancelado(request):
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _rewrite(_PARTS_BASE, cancelado)
+
+
+# --- CA-65: sin cliente HTTP ---------------------------------------------------------
+
+
+async def test_ca65_rewrite_enabled_sin_http_client_es_noop_con_warning_y_sin_crear_cliente(
+    monkeypatch, caplog
+):
+    creados = []
+    real = httpx.AsyncClient
+
+    class Espia(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *a, **k):
+            creados.append(1)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Espia)
+    outcome = await ai_rewrite.rewrite_parts(_PARTS_BASE, _enabled_config(), http_client=None)
+    assert outcome.parts == _PARTS_BASE and outcome.used_gemini is False
+    assert creados == []
+    tokens = [r for r in caplog.records if _TOKEN_RE.search(r.getMessage())]
+    assert len(tokens) == 1 and tokens[0].levelno == logging.WARNING
+    assert "GEMINI_NO_CLIENT" in tokens[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "parts,config",
+    [(["*Solo titulo*"], None), (_PARTS_BASE, GeminiConfig()), (_PARTS_BASE, None)],
+    ids=["solo_titulo", "deshabilitada", "config_none"],
+)
+async def test_ca65_sin_http_client_pero_sin_nada_que_hacer_no_loguea_no_client(
+    parts, config, caplog
+):
+    cfg = config if config is not None else None
+    if parts == ["*Solo titulo*"]:
+        cfg = _enabled_config()  # habilitado, pero sin secciones: no-op antes del chequeo
+    outcome = await ai_rewrite.rewrite_parts(parts, cfg, http_client=None)
+    assert outcome.parts == parts and outcome.used_gemini is False
+    assert "GEMINI_NO_CLIENT" not in caplog.text
+    # control positivo: con todo habilitado y secciones, SÍ se loguea
+    await ai_rewrite.rewrite_parts(_PARTS_BASE, _enabled_config(), http_client=None)
+    assert "GEMINI_NO_CLIENT" in caplog.text
+
+
+# --- CA-66: la key no se filtra por la ruta del rewrite --------------------------------
+
+
+async def test_ca66_rewrite_con_error_de_transporte_con_key_no_filtra_ni_con_exc_info(caplog):
+    handler, _ = sequence_handler((("raise", "protocol"),))
+    outcome = await _rewrite(_PARTS_BASE, handler, _enabled_config(api_key=CANARY_KEY))
+    assert outcome.parts == _PARTS_BASE
+    # un llamador que loguea con exc_info=True el error de Gemini tampoco filtra
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await gemini_client.generate_text(
+                client, _enabled_config(api_key=CANARY_KEY), system_prompt="s", user_text="u",
+                max_output_tokens=5, timeout_seconds=3.0, max_retries=0, feature="rewrite",
+            )
+    except gemini_client.GeminiError:
+        logging.getLogger("test_llamador").error("fallo del llamador", exc_info=True)
+    assert "Traceback" in caplog.text  # control positivo
+    exc_texts = "".join(str(r.exc_text) for r in caplog.records)
+    assert CANARY_KEY not in caplog.text and CANARY_KEY not in exc_texts
+
+
+# --- CA-68: contrato de la llamada desde el rewrite ---------------------------------------
+
+
+async def test_ca68_el_rewrite_llama_post_con_el_contrato_exacto():
+    llamadas = []
+
+    class Espia:
+        async def post(self, *args, **kwargs):
+            llamadas.append((args, kwargs))
+            return httpx.Response(
+                200, json=gemini_response(_section_response(["a", "b"])),
+                request=httpx.Request("POST", args[0]),
+            )
+
+    config = _enabled_config(rewrite_timeout_seconds=4.5)
+    await ai_rewrite.rewrite_parts(_PARTS_BASE, config, http_client=Espia())
+    assert len(llamadas) == 1
+    args, kwargs = llamadas[0]
+    assert len(args) == 1 and args[0].endswith(":generateContent")
+    assert set(kwargs) == {"headers", "json", "timeout", "follow_redirects"}
+    assert kwargs["headers"] == {"x-goog-api-key": DUMMY_KEY}
+    assert kwargs["timeout"] == httpx.Timeout(4.5)
+    assert kwargs["follow_redirects"] is False
+
+
+# --- CA-33: el guard de integridad sigue rechazando (vía rewrite_parts) -------------------
+
+_SEC_A = "Prosa de la sección A.\n✅ Ingresos que crecen"
+_SEC_B = "Otra prosa de la sección B."
+
+
+def _resp_con(seccion_a: str, seccion_b: str = "Prosa B reescrita con claridad.") -> str:
+    return _section_response([seccion_a, seccion_b])
+
+
+@pytest.mark.parametrize(
+    "rewritten_a",
+    [
+        "Prosa con número 99.5 inventado.\n⟦PH1⟧",  # número agregado
+        "Prosa con ticker ZZZZ inventado.\n⟦PH1⟧",  # ticker agregado
+        "Prosa con ❌ cambiado.\n⟦PH1⟧",  # ✅/❌ agregado
+        "Prosa con veredicto SÍ agregado.\n⟦PH1⟧",  # SÍ/NO agregado
+        "Prosa sin el placeholder.",  # placeholder faltante
+        "Prosa.\n⟦PH1⟧\n⟦PH1⟧",  # placeholder duplicado
+        "Prosa.\n⟦PH1⟧\n⟦PH7⟧",  # placeholder desconocido
+    ],
+)
+async def test_ca33_guard_de_integridad_rechaza_y_degrada_solo_esa_seccion(rewritten_a):
+    parts = ["*Adobe (ADBE)*", _SEC_A, _SEC_B]
+    assert list(_ph(_SEC_A)) == ["⟦PH1⟧"]  # control: la línea ✅ es el placeholder
+    outcome = await _rewrite(parts, _json_handler_text(_resp_con(rewritten_a)))
+    assert outcome.parts[1] == _SEC_A  # sección rechazada: original
+    assert outcome.parts[2] == "Prosa B reescrita con claridad."  # la otra sigue su curso
+    assert outcome.used_gemini is True
+
+
+def _json_handler_text(text: str):
+    def handler(request):
+        return httpx.Response(200, json=gemini_response(text))
+
+    return handler
+
+
+async def test_ca33_el_disclaimer_omitido_o_alterado_vuelve_al_original():
+    disclaimer = ai_rewrite.DISCLAIMER_NO_ASESORAMIENTO
+    seccion = f"Prosa previa.\n{disclaimer}"
+    assert list(_ph(seccion)) == ["⟦PH1⟧"]
+    parts = ["*Adobe (ADBE)*", seccion]
+    omitido = _section_response(["Prosa previa reescrita."])
+    outcome = await _rewrite(parts, _json_handler_text(omitido))
+    assert outcome.parts == parts and outcome.used_gemini is False
+    ok = _section_response(["Prosa previa reescrita.\n⟦PH1⟧"])
+    outcome_ok = await _rewrite(parts, _json_handler_text(ok))  # control positivo
+    assert outcome_ok.used_gemini is True and disclaimer in outcome_ok.parts[1]
+
+
+# --- CA-34: balance de Markdown --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "original,rewritten",
+    [
+        ("Una *nota* clara.", "Una nota* clara."),
+        ("Una _nota_ clara.", "Una _nota clara."),
+        ("Un `dato` claro.", "Un `dato claro."),
+        ("Ver [[nota]] clara.", "Ver [nota clara."),
+    ],
+)
+async def test_ca34_delimitador_de_markdown_desparejado_vuelve_al_original(original, rewritten):
+    parts = ["*Adobe (ADBE)*", original]
+    outcome = await _rewrite(parts, _json_handler([rewritten]))
+    assert outcome.parts == parts and outcome.used_gemini is False
+
+
+async def test_ca34_control_positivo_markdown_balanceado_si_se_acepta():
+    parts = ["*Adobe (ADBE)*", "Una *nota* clara."]
+    outcome = await _rewrite(parts, _json_handler(["Una *nota* más clara."]))
+    assert outcome.parts[1] == "Una *nota* más clara." and outcome.used_gemini is True
+
+
+# --- CA-35: privacidad del rewrite ------------------------------------------------------------
+
+
+async def test_ca35_el_body_del_rewrite_no_lleva_canarios_y_el_titulo_nunca_se_envia():
+    pillars = {
+        "ingresos_crecientes": True, "utilidades_crecientes": True,
+        "deuda_controlada": True, "precio_razonable": False,
+    }
+    risk_fit = {"encaja": True, "perfil": "CANARY_PERFIL", "beta": 1.1, "etiqueta_activo": "x"}
+    scenarios = {
+        "conservador": {"valor_justo_total": 496.0}, "pesimista": {"valor_justo_total": 456.7},
+        "optimista": {"valor_justo_total": 536.7},
+    }
+    partes = summary.build_summary_parts_short(
+        ticker="ZZCANARY", company_name="CANARY_EMPRESA_SA", precio_actual=550.0,
+        pillars=pillars, risk_fit=risk_fit, scenarios=scenarios, escenario_elegido="conservador",
+    )
+    capturas = []
+
+    def handler(request):
+        capturas.append(request)
+        n = len(partes) - 1
+        return httpx.Response(200, json=gemini_response(_section_response(["Texto reescrito."] * n)))
+
+    outcome = await _rewrite(partes, handler)
+    assert len(capturas) == 1
+    request = capturas[0]
+    headers = {k: v for k, v in request.headers.items() if k.lower() != "x-goog-api-key"}
+    blob = "\n".join([str(request.url), repr(headers), request.content.decode(),
+                      user_text(request_body(request))])
+    assert "⟦PH" in blob  # control positivo: el payload legítimo (placeholders) sí viaja
+    resumen = "\n".join(partes)
+    assert "ZZCANARY" in resumen and "CANARY" in partes[0]  # control: el título lleva los canarios
+    for canario in ("CANARY_EMPRESA_SA", "ZZCANARY", "CANARY", "CANARY_PERFIL"):
+        assert canario not in blob
+    assert outcome.parts[0] == partes[0]  # título intacto
+
+
+# --- CS-5: filtro de salida (rewrite) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prosa",
+    ["[a](http://x)[b](http://y)", "t.me/x", "@alguien", "www.x.com", "a‮b", "a‍b",
+     "mirá https://evil.example"],
+)
+async def test_cs5_prosa_con_enlace_mencion_o_invisible_vuelve_al_original(prosa, caplog):
+    parts = ["*Adobe (ADBE)*", _PROSA, "Otra prosa de relleno."]
+    outcome = await _rewrite(parts, _json_handler([f"Texto {prosa} fin.", "Otra prosa mejorada."]))
+    assert outcome.parts[1] == _PROSA  # sección rechazada
+    assert outcome.parts[2] == "Otra prosa mejorada."  # la otra sigue su curso
+    rechazos = [r for r in caplog.records if "guard=salida" in r.getMessage()]
+    assert len(rechazos) == 1 and "GEMINI_GUARD_REJECT" in rechazos[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "prosa",
+    ["est.me", "net.media", "@ $50", "👇 Elegí", "⚠️", "⟦PH0⟧", "a\r\nb"],
+)
+async def test_cs5_controles_positivos_no_se_rechazan(prosa):
+    # `@ $50` y `⟦PH0⟧` contienen un protected token / placeholder: se evalúa el
+    # filtro directo; el resto, de punta a punta.
+    assert gemini_client.violates_output_filter(prosa) is False
+    if "$" in prosa or "⟦" in prosa:
+        return
+    parts = ["*Adobe (ADBE)*", "Prosa libre original sin datos."]
+    outcome = await _rewrite(parts, _json_handler([f"Nueva prosa {prosa} clara."]))
+    assert outcome.used_gemini is True and prosa in outcome.parts[1]
+
+
+async def test_cs5_linea_restituida_con_corchete_parentesis_no_se_filtra(caplog):
+    # La sección real de eventos del reporte completo lleva `](` en cada
+    # línea de evento, pero esas líneas son placeholders (tienen fecha): nunca
+    # son salida del modelo y el filtro no las ve (el filtro corre ANTES de
+    # restituir). Con 2 eventos el conteo de `[` es par y el guard de Markdown
+    # no interviene.
+    seccion = summary.build_corporate_events_section([
+        {"filing_date": "2026-08-01", "labels": ["Fusión/adquisición"], "filing_url": "https://sec.gov/x"},
+        {"filing_date": "2026-07-15", "labels": ["Resultados"], "filing_url": "https://sec.gov/y"},
+    ])
+    assert gemini_client.violates_output_filter(seccion) is True  # control: `](` presente
+    mapa = _ph(seccion)
+    claves = list(mapa)
+    assert len(mapa) == len(seccion.split("\n"))  # todo es placeholder
+    reordenado = "\n".join([claves[0], claves[2], claves[1], *claves[3:]])
+    parts = ["*Adobe (ADBE)*", seccion]
+    outcome = await _rewrite(parts, _json_handler([reordenado]))
+    assert "guard=salida" not in caplog.text
+    assert outcome.used_gemini is True
+    assert "](https://sec.gov/x)" in outcome.parts[1] and "](https://sec.gov/y)" in outcome.parts[1]
+
+
+async def test_cs5_prosa_con_url_se_rechaza_aun_con_placeholders_validos():
+    seccion = "Evento 2026-08-01.\nProsa libre."
+    parts = ["*Adobe (ADBE)*", seccion]
+    outcome = await _rewrite(parts, _json_handler(["⟦PH0⟧\nMirá https://evil.example/x"]))
+    assert outcome.parts == parts and outcome.used_gemini is False
+
+
+# --- CS-6: tope de longitud ---------------------------------------------------------------------
+
+
+def _prosa(n: int) -> str:
+    base = "palabra libre "
+    return (base * (n // len(base) + 1))[:n].rstrip() + "x" * (n - len((base * (n // len(base) + 1))[:n].rstrip()))
+
+
+@pytest.mark.parametrize(
+    "len_original,len_reescrita,pasa",
+    [(100, 200, True), (100, 201, False),  # piso de 200
+     (200, 300, True), (200, 301, False),  # 1.5x (int(300.0))
+     (35, 150, True)],  # una sección corta que crece por debajo del piso
+)
+async def test_cs6_tope_de_longitud_bordes_y_piso(len_original, len_reescrita, pasa):
+    original = _prosa(len_original)
+    nueva = _prosa(len_reescrita) + ""
+    assert len(original) == len_original and len(nueva) == len_reescrita
+    assert nueva != original
+    parts = ["*Adobe (ADBE)*", original]
+    outcome = await _rewrite(parts, _json_handler([nueva]))
+    assert (outcome.parts[1] == nueva) is pasa
+    assert (outcome.parts[1] == original) is (not pasa)
+
+
+async def test_cs6_el_tope_se_mide_sobre_la_seccion_reconstruida_no_sobre_el_texto_crudo():
+    prosa40 = ("palabra " * 5).strip()  # 39 caracteres de prosa sin datos
+    protegida = "Dato " + "9" * 295  # línea protegida de 300 caracteres
+    assert len(protegida) == 300
+    original = f"{prosa40}\n{protegida}"
+    assert list(_ph(original)) == ["⟦PH1⟧"]
+    limite = max(int(1.5 * len(original)), 200)
+    expandida = ("palabra " * 31).strip()  # ~247 caracteres de prosa
+    reescrita = f"{expandida}\n⟦PH1⟧"
+    assert len(reescrita) < limite  # el texto CRUDO pasaría el tope...
+    assert len(expandida) + 1 + len(protegida) > limite  # ...la sección reconstruida no
+    parts = ["*Adobe (ADBE)*", original]
+    outcome = await _rewrite(parts, _json_handler([reescrita]))
+    assert outcome.parts == parts and outcome.used_gemini is False
+    # control positivo: una expansión que sí cabe se acepta
+    chica = f"{('palabra ' * 6).strip()}\n⟦PH1⟧"
+    ok = await _rewrite(parts, _json_handler([chica]))
+    assert ok.used_gemini is True and protegida in ok.parts[1]
+
+
+# --- CS-19(a): JSON anidado en el texto del modelo -------------------------------------------------
+
+
+async def test_cs19_texto_anidado_100000_niveles_no_propaga_recursion_error():
+    profundo = "[" * 100000 + "]" * 100000
+    assert ai_rewrite._parse_json_sections(profundo, 1) is None
+    outcome = await _rewrite(_PARTS_BASE, _json_handler_text(profundo))
+    assert outcome.parts == _PARTS_BASE and outcome.used_gemini is False
+
+
+async def test_cs19_control_5000_sin_cerrar_cae_a_json_decode_error():
+    with pytest.raises(json.JSONDecodeError):
+        json.loads("[" * 5000)
+    assert ai_rewrite._parse_json_sections("[" * 5000, 1) is None
+    outcome = await _rewrite(_PARTS_BASE, _json_handler_text("[" * 5000))
+    assert outcome.parts == _PARTS_BASE
+
+
+# --- Fallo inesperado en la reconstrucción -----------------------------------------------------------
+
+
+async def test_fallo_inesperado_en_reconstruccion_conserva_traceback_y_cae_al_original(
+    monkeypatch, caplog
+):
+    def explota(*args, **kwargs):
+        raise RuntimeError("bug de programación simulado")
+
+    monkeypatch.setattr(ai_rewrite, "_reconstruct_section", explota)
+    outcome = await _rewrite(_PARTS_BASE, _json_handler(["Prosa nueva.", "⟦PH0⟧"]))
+    assert outcome.parts == _PARTS_BASE and outcome.used_gemini is False
+    assert "Traceback" in caplog.text and "RuntimeError" in caplog.text
+    assert CANARY_KEY not in caplog.text
+
+
+# --- Transparencia de 4 estados (3.6 / 3.7 / CA-37 / CA-38) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "config,used,esperado",
+    [
+        (None, False, "TRANSPARENCY_FIXED_NO_BUTTONS"),
+        (None, True, "TRANSPARENCY_FIXED_NO_BUTTONS"),
+        (GeminiConfig(), True, "TRANSPARENCY_FIXED_NO_BUTTONS"),
+        (GeminiConfig(enabled=True, api_key=DUMMY_KEY), False, "TRANSPARENCY_FIXED_WITH_BUTTONS"),
+        (GeminiConfig(enabled=True, api_key=DUMMY_KEY), True, "TRANSPARENCY_FIXED_WITH_BUTTONS"),
+        (GeminiConfig(enabled=True, api_key=DUMMY_KEY, rewrite_enabled=True), True, "TRANSPARENCY_USED"),
+        (GeminiConfig(enabled=True, api_key=DUMMY_KEY, rewrite_enabled=True), False, "TRANSPARENCY_NOT_USED"),
+    ],
+)
+def test_ca38_transparency_line_cuatro_estados(config, used, esperado):
+    assert ai_rewrite.transparency_line(config, used) == getattr(ai_rewrite, esperado)
+
+
+def test_ca37_las_cuatro_constantes_de_transparencia_no_tienen_caracteres_markdown():
+    constantes = [
+        ai_rewrite.TRANSPARENCY_USED, ai_rewrite.TRANSPARENCY_NOT_USED,
+        ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS, ai_rewrite.TRANSPARENCY_FIXED_WITH_BUTTONS,
+    ]
+    assert len(set(constantes)) == 4  # control positivo: son 4 textos distintos
+    for texto in constantes:
+        for ch in ("*", "_", "`", "["):
+            assert ch not in texto
+    assert ai_rewrite.TRANSPARENCY_USED == "🤖 Con ayuda de Gemini"
+    assert ai_rewrite.TRANSPARENCY_NOT_USED == "📋 Gemini no disponible esta vez"
+
+
+def test_ca38_advanced_command_referencia_las_constantes_de_ai_rewrite():
+    from investbot import advanced_command
+
+    assert advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS == ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS
+    assert advanced_command.TRANSPARENCY_FIXED_WITH_BUTTONS == ai_rewrite.TRANSPARENCY_FIXED_WITH_BUTTONS
+
+
+def test_el_modulo_no_conserva_la_infraestructura_retirada():
+    retirados = [
+        "Olla" + "maConfig", "load" + "_config", "ENV_" + "ENABLED", "ENV_" + "BASE_URL",
+        "CONNECT_" + "TIMEOUT_SECONDS", "MAX_OUTPUT" + "_TOKENS", "AI_REWRITE_" + "INDICATOR",
+    ]
+    for nombre in retirados:
+        assert not hasattr(ai_rewrite, nombre), nombre
+    assert hasattr(ai_rewrite, "REWRITE_MAX_OUTPUT_TOKENS")  # control positivo

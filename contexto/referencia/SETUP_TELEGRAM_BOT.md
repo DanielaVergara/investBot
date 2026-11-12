@@ -131,139 +131,119 @@ proyecto, extendida a cualquier persona adicional que se autorice.
 
 ---
 
-## Redacción mejorada por IA local (Ollama + Tailscale) — opcional
+## Gemini API key — opcional
 
-Feature opt-in, apagada por defecto (`SDD_redaccion_ia_ollama.md`): reescribe
-el TONO del mensaje ya armado por `summary.py` (nunca cambia ningún número,
-ticker, porcentaje o veredicto — un guard de código, no una instrucción de
-prompt, lo garantiza). Requiere Ollama corriendo en la PC de Daniela y
-alcanzable desde el VPS vía Tailscale. Solo funciona cuando la PC está
-prendida; con la PC apagada (o sin la feature habilitada) el bot responde
-exactamente igual que hoy, sin reescritura, sin error visible.
+Feature opt-in (`SDD_migracion_gemini.md`): con una `GEMINI_API_KEY` válida el
+bot muestra mensaje corto + botones "paso a paso" con explicaciones de IA, y
+(con `GEMINI_REWRITE_ENABLED=true`) reescribe el tono del primer mensaje.
+Sin key, el bot funciona igual con todo calculado por Python.
 
-Pasos de alto nivel (no es un tutorial exhaustivo — cada paso tiene su
-propia documentación oficial):
+**Seguridad de la key:** nunca pegar la key en chats, tickets ni commits; no
+pegar la salida de `docker compose config` ni de `docker inspect`, que
+imprimen el entorno (incluida la key).
 
-### 1. Conectividad VPS ↔ PC vía Tailscale
+### 1. Crear el proyecto y la key en Google AI Studio
 
-Elegida sobre Cloudflare Tunnel/ngrok/SSH reverso (evaluación completa en
-`contexto/specs/abiertas/SDD_redaccion_ia_ollama.md`, Decisión de diseño #1 +
-revisión de `security`, sección 1) porque ningún extremo necesita publicar
-un puerto público — ambos son clientes salientes de una mesh VPN
-(WireGuard), coherente con el modelo "sin puertos publicados" que ya usa
-`bot.py` para hablarle a Telegram.
+Antes de provisionar nada en el VPS (gate de privacidad y de gasto):
 
-1. Instalar Tailscale en el **host** del VPS (no dentro del contenedor
-   Docker) y en la PC de Daniela: https://tailscale.com/download
-2. Loguear ambos dispositivos en el mismo tailnet (cuenta personal, gratis
-   hasta 100 dispositivos).
-3. Verificar que el contenedor `investbot-bot` (red bridge por defecto,
-   sin `network_mode: host`) alcanza la IP del tailnet de la PC:
-   `docker compose exec investbot-bot curl -sS --max-time 5 http://<ip-tailscale-pc>:11434/api/tags`
-   — si responde, no hace falta tocar `docker-compose.prod.yml`. Si falla,
-   la alternativa mínima es `network_mode: host` para ese servicio (evaluar
-   antes qué puertos del host VPS quedan expuestos a loopback, `ss -tlnp`).
+1. En Google AI Studio crear un **proyecto nuevo solo para InvestBot** y la
+   key de ese proyecto, **vinculando la facturación activa** (tier de pago),
+   la misma cuenta de facturación que FoodMind. Si el panel lo ofrece,
+   restringir la key a la API "Generative Language".
+2. **Confirmar facturación activa:** el proyecto de la key debe mostrar
+   facturación activa y la key debe pertenecer a ese proyecto. Anotar la
+   confirmación (captura o nota). Si no se puede confirmar el tier de pago,
+   **no** poner la key en el `.env` de producción: en el tier gratuito los
+   prompts pueden usarse para mejorar productos de Google y ser leídos por
+   personas (términos vigentes: https://aistudio.google.com/docs/terms).
+3. **Registrar el control de gasto:** una alerta de presupuesto del proyecto
+   o un tope de cuota, si el panel lo permite (si no, anotar "no disponible"
+   y revisar el saldo cada semana); anotar quién se entera si ocurre un
+   error 402 (saldo agotado: frena a todos los proyectos de la misma cuenta
+   de facturación; InvestBot degrada solo al contenido determinístico).
+4. Ensayar una vez "revocar primero, rotar después" con una key descartable.
 
-### 2. Instalar Ollama + el modelo en la PC de Daniela — vía Docker
+### 2. Provisionar la key en el `.env` del VPS
 
-**Decisión de Daniela (2026-08-10): Ollama corre dentro de un contenedor
-Docker en su PC, no instalado nativo, como capa extra de contención del
-propio binario/proceso de Ollama** (defensa en profundidad adicional a las
-4 capas de aislamiento de red de la sección 3 — esas 4 capas valen igual
-esté Ollama nativo o en contenedor, porque filtran a nivel de red, no de
-proceso). Costo aceptado explícitamente: en Docker Desktop para Mac, los
-contenedores **no tienen acceso a la GPU (Metal)** — la inferencia corre
-por CPU, más lenta que nativo. Daniela decidió priorizar el aislamiento
-extra sobre la velocidad.
-
-1. Instalar Docker Desktop si no está: `brew install --cask docker`, o
-   https://docker.com/products/docker-desktop
-2. Obtener la IP de Tailscale de la PC (con Tailscale ya instalado y
-   logueado, paso 1 de arriba): `tailscale ip -4`
-3. Levantar el contenedor de Ollama, publicando el puerto **únicamente**
-   en la IP de Tailscale (no en `0.0.0.0`, no en todas las interfaces —
-   este `-p <ip>:puerto:puerto` es el equivalente en Docker al bind
-   address nativo de la sección 3.1):
-   ```bash
-   docker run -d --name ollama --restart unless-stopped \
-     -v ollama:/root/.ollama \
-     -p 100.x.y.z:11434:11434 \
-     ollama/ollama
-   ```
-   (reemplazar `100.x.y.z` por la IP real del paso 2)
-4. Bajar el modelo dentro del contenedor:
-   ```bash
-   docker exec ollama ollama pull qwen2.5:7b-instruct
-   ```
-   (alternativa configurable sin tocar código del bot: `llama3.1:8b`, vía
-   `OLLAMA_MODEL`)
-5. **Verificación empírica pendiente, no asumir que funciona:** confirmar
-   que el firewall `pf` del host (sección 3, capa 4) sigue filtrando el
-   tráfico correctamente cuando el puerto lo expone el proxy de Docker
-   Desktop y no el proceso de Ollama directamente — mismo criterio de
-   "verificar con curl real" que ya usa este proyecto en otros hallazgos.
-   Si el filtrado de `pf` no alcanza al tráfico redirigido por Docker
-   Desktop, la mitigación cae enteramente en las capas 1-3 (bind a IP de
-   Tailscale + ACL + aprobación de dispositivos), que siguen siendo
-   independientes de esto y deben verificarse igual.
-
-### 3. Aislar el puerto 11434 — solo el VPS puede alcanzarlo
-
-Bloqueante (pedido explícito de Daniela, revisión completa de `security` en
-la spec, sección 2). 4 capas independientes, cada una debe fallar por
-separado para romper el aislamiento:
-
-1. **Bind address**: resuelto en la sección 2 vía `-p 100.x.y.z:11434:11434`
-   de Docker (equivalente al `OLLAMA_HOST` nativo) — el puerto nunca queda
-   publicado en `0.0.0.0` ni accesible por todas las interfaces.
-2. **ACL de Tailscale**: política con `tagOwners` restringido a
-   `autogroup:admin` para `tag:investbot-vps`/`tag:daniela-pc`, y una única
-   regla `accept` de `tag:investbot-vps` hacia `tag:daniela-pc:11434` — sin
-   ningún otro `accept` (default-deny implícito para el resto del tailnet).
-   Se edita en la consola de administración de Tailscale → Access controls.
-3. **Aprobación manual de dispositivos**: activar "require device
-   authorization" en la consola de Tailscale (Device management) — un
-   dispositivo nuevo no puede rutear tráfico hasta que Daniela lo apruebe.
-4. **Firewall del host (macOS, `pf`)**: permitir el puerto 11434 solo desde
-   la subred CGNAT de Tailscale (`100.64.0.0/10`), nunca por nombre de
-   interfaz (`utunN` cambia entre reinicios):
-   ```
-   block in proto tcp from any to any port 11434
-   pass in proto tcp from 100.64.0.0/10 to any port 11434
-   ```
-
-Verificación empírica antes de dar por cerrado (no alcanza con "debería
-funcionar"): `curl` exitoso desde el VPS hacia `<ip-tailscale-pc>:11434`;
-`curl` fallido desde un dispositivo fuera del tailnet; `curl` fallido desde
-un dispositivo del tailnet sin el tag `investbot-vps`; `curl
-127.0.0.1:11434` en la PC confirmando que el bind no quedó en loopback.
-
-*(Opcional, no bloqueante: capa 2.5 de defensa en profundidad adicional —
-reverse proxy con shared-secret delante de Ollama, ver la spec completa,
-sección 2.5, si se quiere ese nivel extra de mitigación ante un fallo
-simultáneo de las 4 capas de arriba.)*
-
-**Nota de seguridad (`security`, sección 1):** se evaluó explícitamente
-Cloudflare Tunnel como alternativa a Tailscale y se descartó — expone una
-superficie orientada a Internet (hostname público + política HTTP-layer)
-innecesaria para un enlace privado punto a punto entre 2 dispositivos de
-una sola persona. No hace falta re-evaluar esto en el futuro salvo que
-cambie el caso de uso (ej. exponer Ollama a más de 1 VPS o a colaboradores
-externos).
-
-### 4. Habilitar la feature en el `.env` del VPS
-
-Setear las 2 variables obligatorias (ver `.env.example` para las 4
-variables completas, incluidos los defaults):
+En el VPS, en el directorio donde está `docker-compose.prod.yml`, en este
+orden exacto (sin dejar la key en el historial del shell ni imprimirla):
 
 ```
-OLLAMA_REWRITE_ENABLED=true
-OLLAMA_BASE_URL=http://<ip-tailscale-pc>:11434
+# 1) Permisos: debe dar 600. Si no, corregir ANTES de agregar la key.
+stat -c %a .env
+chmod 600 .env
+
+# 2) Asegurar newline final (si no, la key quedaría pegada a la última línea).
+[ -n "$(tail -c1 .env)" ] && echo >> .env
+tail -c1 .env | od -An -c
+
+# 3) Agregar la key sin que quede en el historial.
+read -rs K; printf 'GEMINI_API_KEY=%s\n' "$K" >> .env; unset K
+
+# 4) Debe dar 1 (una sola línea), sin imprimir el valor.
+grep -c '^GEMINI_API_KEY=' .env
+
+# 5) Activar la reescritura de tono (opcional; sin esta línea el bot
+#    funciona con mensaje corto y botones, pero sin reescritura).
+echo 'GEMINI_REWRITE_ENABLED=true' >> .env
 ```
 
-Reiniciar el contenedor para que tome la configuración nueva:
-`docker compose -f docker-compose.prod.yml up -d --force-recreate`.
+Verificar `ls -l .env` → `-rw-------`, con dueño el usuario sin privilegios
+de root. Opcionales solo si se quiere cambiar el default: `GEMINI_MODEL`,
+`GEMINI_THINKING_LEVEL`, `GEMINI_TIMEOUT_SECONDS`,
+`GEMINI_REWRITE_TIMEOUT_SECONDS` (ver `.env.example`).
 
-Con la PC apagada o Ollama no disponible, el bot sigue funcionando
-exactamente igual que sin esta feature — fallback silencioso, sin error
-visible, logueado a `INFO` (estado esperado, no una anomalía).
+### 3. Deploy y qué log esperar
+
+```
+docker compose -f docker-compose.prod.yml build && docker compose -f docker-compose.prod.yml up -d
+docker logs investbot-bot
+```
+
+El log de arranque debe decir `Gemini habilitado model=... rewrite=on` (o
+`rewrite=off` si no se agregó `GEMINI_REWRITE_ENABLED=true`). Si dice
+`GEMINI_KEY_INVALID`, la key tiene un formato inválido (espacios, comillas,
+saltos de línea): corregirla antes de seguir. Después, un análisis real y un
+botón "paso a paso" deben mostrar una línea `Gemini OK feature=... finishReason=STOP`.
+El bot nunca imprime la key en los logs.
+
+Rollback rápido si algo falla: poner `GEMINI_REWRITE_ENABLED=false` y
+`docker compose -f docker-compose.prod.yml up -d --force-recreate` si el
+problema es solo la reescritura; vaciar `GEMINI_API_KEY` para volver al modo
+100% determinístico.
+
+### 4. Rotación de la key
+
+1. Crear la key nueva en AI Studio (mismo proyecto).
+2. Reemplazar la línea en `.env` (mismo procedimiento de la sección 2: sin
+   historial del shell, sin imprimir) y reiniciar:
+   `docker compose -f docker-compose.prod.yml up -d --force-recreate`.
+3. **Revocar la key anterior** en AI Studio.
+4. Comprobar con `grep -c '^GEMINI_API_KEY=' .env` que sigue habiendo una
+   sola línea, y que el log de arranque dice `Gemini habilitado`.
+
+---
+
+## Respuesta a incidente: key de Gemini comprometida
+
+Si la key de Gemini se filtra (commit accidental, pegada en un chat o ticket,
+salida de `docker compose config` / `docker inspect` compartida, captura de
+pantalla), tratarla como un secreto comprometido. **Orden: revocar primero,
+rotar después.**
+
+1. **Revocar la key de inmediato** en Google AI Studio (proyecto de InvestBot
+   → API keys → eliminar la key afectada). Deja de funcionar en el acto y
+   el bot cae solo al contenido determinístico (fallback sin error visible
+   para el usuario; el log registrará `GEMINI_AUTH` o `GEMINI_BAD_REQUEST`; el status real de una key revocada se anota en CA-S4).
+2. **Crear una key nueva** en el mismo proyecto y actualizar el `.env` del
+   VPS con el procedimiento de la sección 2 (sin historial del shell).
+3. **Reiniciar el contenedor** para que tome la key nueva:
+   `docker compose -f docker-compose.prod.yml up -d --force-recreate`.
+4. Comprobar con `docker logs investbot-bot` que dice `Gemini habilitado` y
+   con `grep -c '^GEMINI_API_KEY=' .env` que hay una sola línea.
+5. Revisar en el panel de AI Studio el uso y el gasto del período expuesto
+   (llamadas que no sean del bot) y, si hay consumo anómalo, avisar a quien
+   administra la facturación compartida.
+6. Revisar cómo se filtró la key para no repetir la causa. Si quedó en un
+   commit, revocarla igual (el historial de git la conserva) y no reescribir
+   el historial como sustituto de la revocación.

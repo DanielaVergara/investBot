@@ -32,7 +32,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import CommandHandler, ContextTypes
 
-from investbot import ai_explain, fmp_client, market_context, query_handler, rules
+from investbot import ai_explain, ai_rewrite, fmp_client, market_context, query_handler, rules
 from investbot.advanced_scoring import (
     calculate_altman_z,
     calculate_altman_z_prime_prime,
@@ -64,14 +64,14 @@ NOT_APPLICABLE_MSG = (
 )
 
 # Línea de transparencia fija (SDD_explicaciones_interactivas_ollama.md,
-# Decisión de diseño #6) — `/avanzado` nunca usa Ollama para su mensaje base
-# (decisión ya cerrada, no se reabre), así que esto no depende de ningún
-# resultado de red: solo de si la feature de botones de explicación está
-# habilitada, para no invitar a apretar un botón que siempre va a fallar.
-TRANSPARENCY_FIXED_NO_BUTTONS = "📋 Análisis con formato fijo (sin IA)."
-TRANSPARENCY_FIXED_WITH_BUTTONS = (
-    "📋 Análisis con formato fijo — pedí una explicación con los botones de abajo."
-)
+# Decisión de diseño #6) — `/avanzado` nunca usa el rewrite para su mensaje
+# base, así que esto no depende de ningún resultado de red: solo de si la
+# feature de botones de explicación está habilitada, para no invitar a apretar
+# un botón que siempre va a fallar. Las constantes viven en `ai_rewrite`
+# (3.7 de SDD_migracion_gemini.md; evita un ciclo de imports) y se
+# referencian acá como alias para no tocar sus tests.
+TRANSPARENCY_FIXED_NO_BUTTONS = ai_rewrite.TRANSPARENCY_FIXED_NO_BUTTONS
+TRANSPARENCY_FIXED_WITH_BUTTONS = ai_rewrite.TRANSPARENCY_FIXED_WITH_BUTTONS
 
 
 def _parse_ticker(args: Optional[list[str]]) -> Optional[str]:
@@ -150,7 +150,7 @@ def _build_message(
     `short` (`SDD_menu_por_capas_explicaciones.md`, Decisión de diseño #9):
     default `False` (comportamiento idéntico al de siempre — desglose
     completo de los 5 modelos). `True` solo cuando el llamador ya confirmó
-    que Ollama está habilitado — regla de no-regresión D3."""
+    que Gemini está habilitado — regla de no-regresión D3."""
     income_reciente = income_statements[0]
     income_anterior = income_statements[1] if len(income_statements) > 1 else {}
     balance_reciente = balance_sheets[0]
@@ -424,8 +424,8 @@ def build_advanced_command_handler(
 
         # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 —
         # calculado ANTES de `_build_message` (regla de no-regresión D3: el
-        # acortamiento del mensaje solo aplica con Ollama habilitado).
-        ollama_enabled = bool(clients.ollama_config and clients.ollama_config.enabled)
+        # acortamiento del mensaje solo aplica con Gemini habilitado).
+        gemini_enabled = bool(clients.gemini_config and clients.gemini_config.enabled)
 
         try:
             profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
@@ -464,7 +464,7 @@ def build_advanced_command_handler(
                 balance_sheets=balance_sheets,
                 cash_flows=cash_flows,
                 explain_context_sink=explain_context_sink,
-                short=ollama_enabled,
+                short=gemini_enabled,
             )
         except fmp_client.FMPError as exc:
             await update.message.reply_text(str(exc))
@@ -480,17 +480,17 @@ def build_advanced_command_handler(
             return
 
         # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #6 —
-        # línea de transparencia FIJA (nunca depende de Ollama, `/avanzado`
+        # línea de transparencia FIJA (nunca depende del rewrite, `/avanzado`
         # no lo usa para su mensaje base): variante "con botones" solo si la
         # feature está efectivamente habilitada, para no invitar a apretar
         # un botón que siempre va a fallar.
         transparency = (
-            TRANSPARENCY_FIXED_WITH_BUTTONS if ollama_enabled else TRANSPARENCY_FIXED_NO_BUTTONS
+            TRANSPARENCY_FIXED_WITH_BUTTONS if gemini_enabled else TRANSPARENCY_FIXED_NO_BUTTONS
         )
         message = f"{transparency}\n\n{message}"
 
         keyboard = None
-        if ollama_enabled and explain_context_sink:
+        if gemini_enabled and explain_context_sink:
             explanation_context = ai_explain.ExplanationContext(
                 chat_id=update.effective_chat.id,
                 kind="avanzado",

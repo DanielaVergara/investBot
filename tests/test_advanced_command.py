@@ -110,7 +110,7 @@ def _router(empresa_completa, empresa_asset_light, etf_profile, request_log=None
 
 
 def _make_clients(
-    empresa_completa, empresa_asset_light, etf_profile, request_log=None, ollama_config=None
+    empresa_completa, empresa_asset_light, etf_profile, request_log=None, gemini_config=None,
 ) -> query_handler.Clients:
     fmp_http = httpx.AsyncClient(
         transport=httpx.MockTransport(_router(empresa_completa, empresa_asset_light, etf_profile, request_log))
@@ -122,7 +122,7 @@ def _make_clients(
         treasury_gov_http=httpx.AsyncClient(transport=empty_transport),
         fmp_api_key="test-key",
         fred_api_key="test-key",
-        ollama_config=ollama_config,
+        gemini_config=gemini_config,
     )
 
 
@@ -545,20 +545,17 @@ def test_ticker_invalido_se_loguea_saneado(caplog):
 # ---------------------------------------------------------------------------
 
 
-def _enabled_ollama_config():
-    from investbot import ai_rewrite
+def _enabled_gemini_config():
+    from investbot.gemini_client import GeminiConfig
 
-    return ai_rewrite.OllamaConfig(
-        enabled=True, base_url="http://100.101.102.103:11434",
-        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
-    )
+    return GeminiConfig(enabled=True, api_key="TEST-DUMMY-KEY-0123456789ABCDEF")
 
 
 async def test_transparencia_fija_con_botones_habilitados(empresa_completa, empresa_asset_light, etf_profile):
-    """J.42a: con `clients.ollama_config.enabled=True`, el mensaje empieza
+    """J.42a: con `clients.gemini_config.enabled=True`, el mensaje empieza
     con `TRANSPARENCY_FIXED_WITH_BUTTONS`."""
     clients = _make_clients(
-        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+        empresa_completa, empresa_asset_light, etf_profile, gemini_config=_enabled_gemini_config()
     )
     callback = _handler_callback(clients, FakeRateLimiter())
 
@@ -573,7 +570,7 @@ async def test_transparencia_fija_con_botones_habilitados(empresa_completa, empr
 
 
 async def test_transparencia_fija_sin_botones_deshabilitado(empresa_completa, empresa_asset_light, etf_profile):
-    """J.42b: sin la feature habilitada (default `ollama_config=None`),
+    """J.42b: sin la feature habilitada (default `gemini_config=None`),
     `TRANSPARENCY_FIXED_NO_BUTTONS`."""
     clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
     callback = _handler_callback(clients, FakeRateLimiter())
@@ -585,15 +582,15 @@ async def test_transparencia_fija_sin_botones_deshabilitado(empresa_completa, em
     assert mensaje.startswith(advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS)
 
 
-async def test_mensaje_corto_con_ollama_habilitado_omite_desglose_completo(
+async def test_mensaje_corto_con_gemini_habilitado_omite_desglose_completo(
     empresa_completa, empresa_asset_light, etf_profile
 ):
     """SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — con
-    Ollama habilitado, el primer (único) mensaje de `/avanzado` contiene
+    Gemini habilitado, el primer (único) mensaje de `/avanzado` contiene
     SOLO título + síntesis de 1-2 líneas + invitación, nunca el desglose
     completo de los 5 modelos ni "Fuente de los datos"."""
     clients = _make_clients(
-        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+        empresa_completa, empresa_asset_light, etf_profile, gemini_config=_enabled_gemini_config()
     )
     callback = _handler_callback(clients, FakeRateLimiter())
 
@@ -607,10 +604,10 @@ async def test_mensaje_corto_con_ollama_habilitado_omite_desglose_completo(
     assert "Piotroski F-Score: " not in mensaje or "evaluables (" not in mensaje
 
 
-async def test_mensaje_completo_con_ollama_deshabilitado_sin_cambios(
+async def test_mensaje_completo_con_gemini_deshabilitado_sin_cambios(
     empresa_completa, empresa_asset_light, etf_profile
 ):
-    """Regla de no-regresión D3 — sin Ollama habilitado, el desglose
+    """Regla de no-regresión D3 — sin Gemini habilitado, el desglose
     completo de siempre, byte-idéntico al comportamiento pre-spec."""
     clients = _make_clients(empresa_completa, empresa_asset_light, etf_profile)
     callback = _handler_callback(clients, FakeRateLimiter())
@@ -635,7 +632,7 @@ async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_re
     from investbot import ai_explain
 
     clients = _make_clients(
-        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+        empresa_completa, empresa_asset_light, etf_profile, gemini_config=_enabled_gemini_config()
     )
     store = ai_explain.ExplanationContextStore()
     callback = _handler_callback(clients, FakeRateLimiter(), store)
@@ -657,7 +654,7 @@ async def test_explanation_context_avanzado_contiene_los_mismos_resultados_no_re
     assert ctx.factors is not None
 
     # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — con
-    # Ollama habilitado el mensaje base queda corto (el desglose de Z'' se
+    # Gemini habilitado el mensaje base queda corto (el desglose de Z'' se
     # movió detrás del botón `azp`); el dato en sí sigue disponible, sin
     # recalcular, en el `ExplanationContext` guardado (ya verificado arriba).
     (mensaje,), _ = update.message.reply_text.call_args_list[0]
@@ -679,7 +676,7 @@ async def test_explanation_context_avanzado_propaga_los_6_campos_de_aqm_sin_llam
     request_log: list = []
     clients = _make_clients(
         empresa_completa, empresa_asset_light, etf_profile, request_log,
-        ollama_config=_enabled_ollama_config(),
+        gemini_config=_enabled_gemini_config(),
     )
     store = ai_explain.ExplanationContextStore()
     callback = _handler_callback(clients, FakeRateLimiter(), store)
@@ -717,7 +714,7 @@ async def test_explanation_context_avanzado_propaga_los_6_campos_de_aqm_sin_llam
     assert ctx.momentum["pct_vs_avg_200"] == esperado.pct_vs_avg_200
     assert ctx.momentum["etiqueta"] == esperado.etiqueta
 
-    # Y el payload que ve Ollama para "aqm" expone esos mismos 3 campos.
+    # Y el payload que ve Gemini para "aqm" expone esos mismos 3 campos.
     datos_aqm = ai_explain._build_explain_payload(ctx, "aqm")
     assert datos_aqm["precio_actual"] == quote["price"]
     assert datos_aqm["price_avg_50"] == quote["priceAvg50"]
@@ -731,7 +728,7 @@ async def test_reply_markup_con_5_botones_solo_en_ultimo_chunk(
     únicamente al último chunk entregado -- acá `/avanzado` nunca parte en
     2+ en la práctica, así que el único chunk es también el último."""
     clients = _make_clients(
-        empresa_completa, empresa_asset_light, etf_profile, ollama_config=_enabled_ollama_config()
+        empresa_completa, empresa_asset_light, etf_profile, gemini_config=_enabled_gemini_config()
     )
     callback = _handler_callback(clients, FakeRateLimiter())
 
@@ -809,3 +806,55 @@ async def test_reply_text_es_siempre_un_mock_nunca_red_real(empresa_completa, em
     update, context = _fake_avanzado_update(["MFG"])
     assert isinstance(update.message.reply_text, AsyncMock)
     await callback(update, context)
+
+
+# ---------------------------------------------------------------------------
+# SDD_migracion_gemini.md (F2) — CA-39: el primer renglón de `/avanzado` y el
+# acortamiento dependen de `gemini_config.enabled` ÚNICAMENTE; nunca llama
+# al rewrite (`/avanzado` no lo usa).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "gemini_enabled,rewrite_enabled,esperado",
+    [
+        (True, False, "FIXED_WITH_BUTTONS"),
+        (True, True, "FIXED_WITH_BUTTONS"),
+        (False, False, "FIXED_NO_BUTTONS"),
+    ],
+)
+async def test_ca39_avanzado_transparencia_depende_solo_de_gemini_y_no_llama_al_rewrite(
+    empresa_completa, empresa_asset_light, etf_profile, monkeypatch,
+    gemini_enabled, rewrite_enabled, esperado,
+):
+    from investbot import ai_rewrite
+    from investbot.gemini_client import GeminiConfig
+
+    rewrite_calls = []
+
+    async def spy_rewrite(*args, **kwargs):  # pragma: no cover - no debe llamarse
+        rewrite_calls.append((args, kwargs))
+
+    monkeypatch.setattr(ai_rewrite, "rewrite_parts", spy_rewrite)
+    gemini = GeminiConfig(
+        enabled=gemini_enabled, api_key="TEST-DUMMY-KEY-0123456789ABCDEF",
+        rewrite_enabled=gemini_enabled and rewrite_enabled,
+    )
+    clients = _make_clients(
+        empresa_completa, empresa_asset_light, etf_profile, gemini_config=gemini,
+    )
+    callback = _handler_callback(clients, FakeRateLimiter())
+
+    update, context = _fake_avanzado_update(["MFG"])
+    await callback(update, context)
+
+    (mensaje,), _ = update.message.reply_text.call_args_list[0]
+    esperado_txt = getattr(advanced_command, f"TRANSPARENCY_{esperado}")
+    otro = (
+        advanced_command.TRANSPARENCY_FIXED_NO_BUTTONS
+        if esperado == "FIXED_WITH_BUTTONS"
+        else advanced_command.TRANSPARENCY_FIXED_WITH_BUTTONS
+    )
+    assert mensaje.startswith(esperado_txt)
+    assert otro not in mensaje
+    assert rewrite_calls == []

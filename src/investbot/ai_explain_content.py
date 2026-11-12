@@ -5,7 +5,7 @@ Separado de `ai_explain.py` (Decisión de diseño, sección "Presupuesto/
 impacto" — a discreción de `implementer`) para que el mecanismo (store,
 keyboard, handler, guard) no quede enterrado entre 27 preguntas fijas y las
 2 tablas de 13/14 entradas de fórmula/fuente. Nada acá hace I/O ni conoce
-Telegram/Ollama — son estructuras de datos puras, importables directamente
+Telegram/Gemini — son estructuras de datos puras, importables directamente
 en tests (criterio de Testabilidad de `qa`).
 
 Ningún string de este módulo interpola texto libre de terceros (FMP) — todo
@@ -18,13 +18,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 # Decisión de diseño #1 (SDD_explicacion_paso_a_paso.md) -- 3 variantes,
-# reemplazan el booleano `requires_ollama` de la spec anterior:
+# reemplazan el booleano de la spec anterior:
 # - "dato_y_paso_a_paso": 2 botones -- "Ver dato" (determinístico, nunca
-#   llama a Ollama) y "Explicame paso a paso" (llama a Ollama con la cuenta
+#   llama a Gemini) y "Explicame paso a paso" (llama a Gemini con la cuenta
 #   ya resuelta como dato garantizado).
-# - "narrativa": 1 botón, llama a Ollama, sin cuenta (no hay fórmula propia
+# - "narrativa": 1 botón, llama a Gemini, sin cuenta (no hay fórmula propia
 #   del bot detrás -- mod/ben/ren).
-# - "deterministico": 1 botón, nunca llama a Ollama (evt/inf).
+# - "deterministico": 1 botón, nunca llama a Gemini (evt/inf).
 VARIANT_DATO_Y_PASO_A_PASO = "dato_y_paso_a_paso"
 VARIANT_NARRATIVA = "narrativa"
 VARIANT_DETERMINISTICO = "deterministico"

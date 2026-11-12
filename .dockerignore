@@ -1,0 +1,13 @@
+# El Dockerfile solo copia requirements.txt y src/ — todo lo demás queda fuera
+# del contexto de build (en especial los secretos del entorno).
+.env
+.env.*
+!.env.example
+.git
+.venv
+.pytest_cache
+.idea
+.coverage
+tests
+contexto
+scripts

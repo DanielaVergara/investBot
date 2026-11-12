@@ -226,32 +226,103 @@ Treasury.gov.
 
 ---
 
-## Redacción mejorada por IA local (Ollama) — opcional
+## Explicaciones con IA (Gemini) — opcional
 
-**Opcional, apagada por defecto — el bot funciona igual sin configurarla.**
-Post-procesa el TONO del mensaje que `summary.py` ya terminó de armar (más
-claro, más natural), corriendo un LLM local en Ollama, en la PC de
-Daniela — nunca un servicio pago en la nube, nunca en el VPS. Solo
-disponible cuando esa PC está prendida y alcanzable por Tailscale; con la
-PC apagada, el bot responde exactamente igual que hoy, sin reescritura, sin
-error visible.
+**Opcional: se activa solo si hay una `GEMINI_API_KEY` válida. Sin key, el bot
+funciona igual (todo lo calcula Python).** Dos funciones comparten un único
+cliente HTTP a la API de Google (Gemini, modelo `gemini-3.5-flash-lite` por
+defecto, REST directo sobre `httpx`, sin SDK):
 
-**Garantía de integridad — es código, no una instrucción de prompt:** el
-LLM nunca ve datos crudos de FMP, no participa de ningún cálculo ni de
-ninguna decisión financiera (pilares, valor justo, veredicto). Antes de
-enviar una sección a Ollama, cada línea con un dato protegido (número, %,
-ticker, ✅/❌, SÍ/NO) se reemplaza por un placeholder opaco — el modelo solo
-reescribe la prosa alrededor, nunca ve ni puede alterar el dato real, que
-se restituye verbatim después de la respuesta (`ai_rewrite.py`, ver
-`contexto/specs/abiertas/SDD_redaccion_ia_ollama.md` para el detalle
-completo del mecanismo). El título del mensaje (nombre de la empresa +
-ticker) nunca se envía a Ollama, bajo ningún escenario.
+1. **Explicaciones interactivas** (botones "paso a paso" del mensaje corto y
+   de `/avanzado`): el modelo redacta 2-4 oraciones de explicación sobre
+   números que Python ya calculó. La cuenta, el desglose, la fórmula y la
+   fuente son siempre determinísticos y no pasan por el modelo.
+2. **Reescritura de tono del primer mensaje** (`ai_rewrite.py`): opt-in aparte
+   con `GEMINI_REWRITE_ENABLED=true`; solo reescribe la prosa libre del
+   resumen corto.
 
-Setup completo (Tailscale + Ollama + aislamiento del puerto 11434) en
-`contexto/referencia/SETUP_TELEGRAM_BOT.md`, sección "Redacción mejorada
-por IA local". Variables de entorno en `.env.example`
-(`OLLAMA_REWRITE_ENABLED`/`OLLAMA_BASE_URL`/`OLLAMA_MODEL`/
-`OLLAMA_TIMEOUT_SECONDS`).
+### Variables de entorno (ver `.env.example`)
+
+| Variable | Qué hace | Default |
+|---|---|---|
+| `GEMINI_API_KEY` | Activa Gemini (mensaje corto + botones). Vacía = todo determinístico | vacía |
+| `GEMINI_REWRITE_ENABLED` | Activa SOLO la reescritura de tono; requiere key válida | `false` |
+| `GEMINI_MODEL` | Modelo (solo IDs 3.x o superiores) | `gemini-3.5-flash-lite` |
+| `GEMINI_THINKING_LEVEL` | `minimal`, `low`, `medium` o `high` | `minimal` |
+| `GEMINI_TIMEOUT_SECONDS` | Timeout de las explicaciones | `12.0` |
+| `GEMINI_REWRITE_TIMEOUT_SECONDS` | Timeout de la reescritura | `8.0` |
+
+Estados posibles:
+
+| Key válida | `GEMINI_REWRITE_ENABLED` | Mensaje | Botones | Llamadas a Gemini al analizar | Primer renglón |
+|---|---|---|---|---|---|
+| no | false o true | completo | no | 0 | aviso fijo "sin botones" |
+| sí | false | corto | sí | 0 | aviso fijo "con botones" |
+| sí | true, la reescritura cambia algo | corto reescrito | sí | 1 | "Con ayuda de Gemini" |
+| sí | true, falla o no cambia nada | corto original | sí | 1 | "Gemini no disponible esta vez" |
+
+### Qué viaja a Google (lista cerrada)
+
+- **Explicaciones:** la pregunta fija del botón, números ya calculados,
+  etiquetas de modelo (p. ej. nombres de métodos de valuación),
+  `escenario_elegido`, el `sector` solo si pasa la allow-list GICS (si no,
+  viaja `"no disponible"`), la `cuenta` (texto generado por Python), para la
+  comparación con peers los tickers de los peers (públicos, filtrados con
+  una regex estricta, máximo 10) y, para el encaje de riesgo, el `perfil` de
+  riesgo validado contra el enum de la base (si no pertenece, viaja
+  `"no disponible"`). Los prompts de sistema son constantes.
+- **Reescritura:** únicamente la prosa constante del mensaje corto (las líneas
+  sin números, sin ticker, sin SÍ/NO, sin ✅/❌), con marcadores opacos en
+  lugar de cada línea protegida. Nunca el título.
+- **NUNCA viajan:** el `chat_id`, el ticker ni el nombre de la empresa
+  consultada, `industry`, ni texto crudo de terceros (FMP, Finnhub, SEC).
+
+### Privacidad del proveedor (riesgo residual aceptado)
+
+Según los términos vigentes (https://aistudio.google.com/docs/terms): en el
+**tier de pago**, Google indica que no usa los prompts ni las respuestas para
+mejorar sus productos, pero los registra por un período limitado, sin
+duración publicada, solo para detectar y prevenir abusos. En el **tier
+gratuito**, el contenido puede usarse para mejorar productos y ser leído por
+personas. Por eso se usa un proyecto con facturación activa (tier de pago).
+Riesgo residual aceptado: la duración de ese registro y el comportamiento del
+proyecto si se agota el saldo prepago (no verificado).
+
+### Costo estimado
+
+Aproximadamente USD 2 por cada 1.000 explicaciones. Es una **estimación por
+análisis de código, no una medición**: el log `Gemini OK feature=... promptTokens=...
+outputTokens=... thoughtsTokens=...` de cada llamada exitosa la reemplaza con
+datos reales.
+
+### Fallback determinístico
+
+Sin key, con la key inválida o ante cualquier falla de Gemini (timeout, error
+HTTP, respuesta bloqueada, cortada o vacía, o rechazo de los guards de
+integridad), el bot responde igual con el contenido calculado por Python: la
+explicación se reemplaza por un aviso de "no disponible" y la reescritura
+devuelve el texto original.
+
+### Garantía de integridad (es código, no una instrucción de prompt)
+
+El modelo no participa de ningún cálculo ni decisión financiera (pilares,
+valor justo, veredicto). Guards determinísticos rechazan cualquier respuesta
+que cambie un número, agregue o quite un ticker o un SÍ/NO, o contenga
+enlaces, menciones o caracteres invisibles. En la reescritura, cada línea con
+un dato protegido se reemplaza por un placeholder y se restituye verbatim
+(`ai_rewrite.py`; detalle en
+`contexto/specs/cerradas/SDD_redaccion_ia_ollama.md`, documento histórico).
+
+### Seguridad de la key
+
+Nunca pegar la key en chats, tickets ni commits; no pegar la salida de
+`docker compose config` ni de `docker inspect`, que imprimen el entorno. La
+key viaja en el header `x-goog-api-key`, nunca en la URL ni en los logs.
+Provisión, rotación y respuesta a incidentes en
+`contexto/referencia/SETUP_TELEGRAM_BOT.md`, sección "Gemini API key". El
+script `scripts/gemini_smoke.py` es un smoke manual contra la API real (con
+una key de pruebas distinta de la de producción); no es un test de pytest y
+no entra a la imagen Docker.
 
 ---
 
@@ -270,7 +341,7 @@ Daniela (Telegram) <--long polling--> investbot-bot (Docker) --HTTPS--> FMP
                                                           `----HTTPS--> FRED / Treasury.gov
                                                           `----HTTPS--> Finnhub (opcional, peers dinámicos)
                                                           `----HTTPS--> SEC EDGAR (opcional, eventos corporativos)
-                                                          `----Tailscale (opcional)--> Ollama en la PC de Daniela (redacción)
+                                                          `----HTTPS--> Google Gemini (opcional, explicaciones y redacción)
                                                           `----lectura/escritura--> SQLite (volumen)
 ```
 
@@ -395,13 +466,17 @@ src/investbot/
   treasury_client.py   FRED (DGS20) + fallback Treasury.gov
   sec_edgar_client.py   wrapper HTTP a SEC EDGAR (mapeo ticker→CIK cacheado + submissions, opcional)
   corporate_events.py   extracción pura de eventos 8-K relevantes desde submissions
-  ai_rewrite.py          redacción mejorada por IA local (Ollama, opcional) — guard de integridad por placeholder-y-restitución
+  gemini_client.py       cliente REST a Gemini compartido (config validada, errores con token, sin reintentos salvo 500/503 en explicaciones)
+  ai_rewrite.py          redacción con Gemini (opcional) — guard de integridad por placeholder-y-restitución
+  ai_explain.py          explicaciones interactivas (botones) con Gemini sobre contenido determinístico
   rules.py              ratios financieros + pilares de buena empresa
   valuation.py           motor propio de valoración (3 modelos + promedio parcial)
   risk_fit.py            encaje beta vs perfil de riesgo
   market_context.py       momentum de precio + comparación con peers + VIX
   summary.py               texto dummy-friendly con las analogías de Daniela
   db.py                     SQLite (tabla risk_profile, fila única)
+scripts/
+  gemini_smoke.py     smoke manual contra la API real de Gemini (key de pruebas; no es un test, no entra a la imagen)
 tests/
   fixtures/adobe/     caso de regresión (ver tests/fixtures/adobe/README.md)
   fixtures/fmp/       fixtures genéricos de FMP (quote, search)

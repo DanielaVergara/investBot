@@ -30,6 +30,7 @@ from investbot import (
     db,
     finnhub_client,
     fmp_client,
+    gemini_client,
     market_context,
     peers,
     risk_fit,
@@ -139,13 +140,14 @@ class Clients:
     finnhub_api_key: Optional[str] = None
     sec_edgar_http: Optional[httpx.AsyncClient] = None
     sec_edgar_user_agent: Optional[str] = None
-    # NUEVO (SDD_redaccion_ia_ollama.md) — mismo criterio que finnhub_http/
+    # NUEVO (SDD_migracion_gemini.md) — mismo criterio que finnhub_http/
     # sec_edgar_http de arriba: default `None` explícito para no romper los
-    # call-sites existentes de `Clients(...)` en tests. `ollama_config` con
-    # `enabled=False` (o `None`) hace que `ai_rewrite.rewrite_parts` sea un
-    # no-op inmediato en `_run_analysis`.
-    ollama_http: Optional[httpx.AsyncClient] = None
-    ollama_config: Optional[ai_rewrite.OllamaConfig] = None
+    # call-sites existentes de `Clients(...)` en tests. `gemini_config.enabled`
+    # (key válida) gobierna el mensaje corto y los botones de explicación;
+    # `gemini_config.rewrite_enabled` gobierna SOLO la reescritura de tono
+    # (`ai_rewrite.rewrite_parts` es un no-op inmediato sin él).
+    gemini_http: Optional[httpx.AsyncClient] = None
+    gemini_config: Optional[gemini_client.GeminiConfig] = None
 
 
 def _annual_series(statements: list[dict], field: str) -> list[float]:
@@ -194,8 +196,8 @@ async def fetch_and_analyze_parts(
     `use_short_summary` (`SDD_menu_por_capas_explicaciones.md`, Decisión de
     diseño #9): keyword-only, default `False` (comportamiento idéntico al
     de siempre — `summary.build_summary_parts`, el reporte completo). `True`
-    solo cuando `_run_analysis` ya confirmó `ollama_config.enabled` — regla
-    de no-regresión D3: sin Ollama habilitado, nunca se acorta el mensaje.
+    solo cuando `_run_analysis` ya confirmó `gemini_config.enabled` — regla
+    de no-regresión D3: sin Gemini habilitado, nunca se acorta el mensaje.
     """
     quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
     profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
@@ -611,7 +613,7 @@ async def fetch_and_analyze_parts(
 
     if use_short_summary:
         # SDD_menu_por_capas_explicaciones.md, Decisión de diseño #9 — solo
-        # se llega acá con Ollama habilitado (regla de no-regresión D3, ver
+        # se llega acá con Gemini habilitado (regla de no-regresión D3, ver
         # `_run_analysis`). Ningún dato nuevo: mismos dicts ya calculados
         # arriba, versión corta del mensaje.
         return summary.build_summary_parts_short(
@@ -855,7 +857,7 @@ def build_query_handlers(
 
     `explanation_store` (`SDD_explicaciones_interactivas_ollama.md`,
     Decisión de diseño #3): keyword-only opcional con default `None` — mismo
-    criterio retrocompatible que `ollama_http`/`ollama_config` en `Clients`,
+    criterio retrocompatible que `gemini_http`/`gemini_config` en `Clients`,
     para no romper los call-sites existentes de este builder. En producción,
     `bot.py::build_application` siempre pasa la MISMA instancia ya
     compartida con `ai_explain.build_explain_handler`; sin ella, se
@@ -1047,16 +1049,15 @@ def build_query_handlers(
                 sanitize_for_log(ticker), exc,
             )
 
-        # SDD_redaccion_ia_ollama.md — con la feature deshabilitada
-        # (`clients.ollama_config` ausente o `enabled=False`) `rewrite_parts`
-        # es un no-op inmediato, sin latencia ni llamadas HTTP —
-        # comportamiento idéntico al bot de hoy. Se calcula ACÁ (antes de
-        # `fetch_and_analyze_parts`) porque `SDD_menu_por_capas_explicaciones.md`
-        # Decisión de diseño #9 necesita el flag para decidir si arma el
-        # mensaje corto o el reporte completo — regla de no-regresión D3.
-        ollama_config = clients.ollama_config or ai_rewrite.OllamaConfig(
-            enabled=False, base_url="", model="", timeout_seconds=0.0
-        )
+        # SDD_migracion_gemini.md (3.6) — `gemini_config.enabled` (key válida)
+        # gobierna el mensaje corto y los botones; `gemini_config.rewrite_enabled`
+        # gobierna SOLO la reescritura (`rewrite_parts` es un no-op inmediato,
+        # sin latencia ni llamadas HTTP, si está apagado). Se calcula ACÁ
+        # (antes de `fetch_and_analyze_parts`) porque
+        # `SDD_menu_por_capas_explicaciones.md` Decisión de diseño #9 necesita
+        # el flag para decidir si arma el mensaje corto o el reporte completo
+        # — regla de no-regresión D3.
+        gemini_config = clients.gemini_config or gemini_client.GeminiConfig()
 
         keyboard = None
         try:
@@ -1066,7 +1067,7 @@ def build_query_handlers(
                 escenario_elegido=escenario_elegido,
                 ventana_trimestres=ventana_trimestres,
                 explain_context_sink=explain_context_sink,
-                use_short_summary=ollama_config.enabled,
+                use_short_summary=gemini_config.enabled,
             )
         except (fmp_client.FMPError, treasury_client.TreasuryError) as exc:
             final_parts, kwargs = [str(exc)], {}
@@ -1076,20 +1077,20 @@ def build_query_handlers(
             logger.exception("Error inesperado analizando %s", sanitize_for_log(ticker))
             final_parts, kwargs = [GENERIC_ERROR_MSG], {}
         else:
-            # SDD_redaccion_ia_ollama.md — única llamada a `ai_rewrite`,
-            # solo en el camino exitoso (nunca sobre los mensajes de error
-            # de 1 línea de los 2 `except` de arriba).
+            # Única llamada a `ai_rewrite`, solo en el camino exitoso (nunca
+            # sobre los mensajes de error de 1 línea de los 2 `except` de
+            # arriba). Se llama siempre: es no-op si `not rewrite_enabled`.
             outcome = await ai_rewrite.rewrite_parts(
-                parts, ollama_config, http_client=clients.ollama_http
+                parts, gemini_config, http_client=clients.gemini_http
             )
-            # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño
-            # #5 — línea de transparencia SIEMPRE primera línea del camino
-            # exitoso, reemplaza `AI_REWRITE_INDICATOR` (retirado). Copia de
+            # Línea de transparencia (3.7, 4 estados) SIEMPRE primera línea del
+            # camino exitoso; refleja el estado real (con la feature apagada
+            # nunca dice "no disponible"). Copia de
             # la lista para no mutar `outcome.parts`/`parts` compartidos con
             # otros llamadores (ej. tests que inspeccionan el original).
             final_parts = list(outcome.parts)
             final_parts[0] = (
-                f"{ai_rewrite.transparency_line(outcome.used_ollama)}\n\n{final_parts[0]}"
+                f"{ai_rewrite.transparency_line(gemini_config, outcome.used_gemini)}\n\n{final_parts[0]}"
             )
             kwargs = {"parse_mode": "Markdown"}
 
@@ -1098,7 +1099,7 @@ def build_query_handlers(
             # sink queda vacío en el camino de "no pude obtener suficientes
             # datos", que no lanza excepción pero tampoco tiene contexto
             # útil que ofrecer en botones).
-            if ollama_config.enabled and explain_context_sink:
+            if gemini_config.enabled and explain_context_sink:
                 explanation_context = ai_explain.ExplanationContext(
                     chat_id=int(chat_id),
                     kind="texto_libre",

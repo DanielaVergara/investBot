@@ -219,24 +219,25 @@ def test_main_arranca_sin_finnhub_ni_sec_edgar_configuradas(monkeypatch, tmp_pat
 
 
 # ---------------------------------------------------------------------------
-# SDD_redaccion_ia_ollama.md — wiring de `ai_rewrite.load_config()` +
-# `httpx.AsyncClient` de Ollama en `main()`/`build_application` (grupo J,
+# SDD_redaccion_ia_ollama.md (migrado por SDD_migracion_gemini.md) — wiring de
+# `gemini_client.load_config()` + `httpx.AsyncClient` de Gemini en
+# `main()`/`build_application` (grupo J,
 # casos 56-57). Mismo patrón best-effort ya usado para Finnhub/SEC EDGAR:
-# ninguna combinación de configuración de Ollama aborta el arranque.
+# ninguna combinación de configuración de Gemini aborta el arranque.
 # ---------------------------------------------------------------------------
 
 
-def test_main_arranca_sin_ollama_configurado(monkeypatch, tmp_path):
-    """Caso 56: sin `OLLAMA_REWRITE_ENABLED` seteada, `main()` llega hasta
+def test_main_arranca_sin_gemini_configurado(monkeypatch, tmp_path):
+    """Caso 56: sin `GEMINI_API_KEY` seteada, `main()` llega hasta
     `run_polling` sin abortar -- mismo patrón que Finnhub/SEC EDGAR
     ausentes."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
     monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
     monkeypatch.delenv("FRED_API_KEY", raising=False)
-    monkeypatch.delenv("OLLAMA_REWRITE_ENABLED", raising=False)
-    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
-    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_ollama_ausente.db"))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_REWRITE_ENABLED", raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_gemini_ausente.db"))
 
     from telegram.ext import Application
 
@@ -251,17 +252,17 @@ def test_main_arranca_sin_ollama_configurado(monkeypatch, tmp_path):
     assert run_polling_calls["n"] == 1
 
 
-def test_main_arranca_con_ollama_enabled_pero_base_url_incompleta(monkeypatch, tmp_path):
-    """Caso 57: `OLLAMA_REWRITE_ENABLED=true` sin `OLLAMA_BASE_URL` (config
+def test_main_arranca_con_gemini_enabled_pero_base_url_incompleta(monkeypatch, tmp_path):
+    """Caso 57: `GEMINI_REWRITE_ENABLED=true` sin `GEMINI_API_KEY` (config
     incompleta) -- `main()` sigue sin abortar, feature opcional no
     fail-closed (Decisión de diseño #5)."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
     monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
     monkeypatch.delenv("FRED_API_KEY", raising=False)
-    monkeypatch.setenv("OLLAMA_REWRITE_ENABLED", "true")
-    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
-    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_ollama_incompleto.db"))
+    monkeypatch.setenv("GEMINI_REWRITE_ENABLED", "true")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / "bot_main_gemini_incompleto.db"))
 
     from telegram.ext import Application
 
@@ -276,24 +277,21 @@ def test_main_arranca_con_ollama_enabled_pero_base_url_incompleta(monkeypatch, t
     assert run_polling_calls["n"] == 1
 
 
-def test_build_application_acepta_ollama_http_y_config_opcionales(tmp_path):
-    """Regresión: `build_application` con los 2 parámetros nuevos de Ollama
-    (con default `None`) no rompe la construcción existente, y con valores
-    reales poblados tampoco."""
-    from investbot import ai_rewrite
+def test_build_application_acepta_gemini_http_y_config_opcionales(tmp_path):
+    """Regresión: `build_application` con el parámetro `gemini_config` (con
+    default `None`) no rompe la construcción existente, y con un valor real
+    poblado tampoco."""
+    from investbot import gemini_client
 
-    db_path = str(tmp_path / "bot_test_ollama.db")
-    ollama_config = ai_rewrite.OllamaConfig(
-        enabled=True, base_url="http://100.101.102.103:11434",
-        model="qwen2.5:7b-instruct", timeout_seconds=8.0,
-    )
+    db_path = str(tmp_path / "bot_test_gemini.db")
+    gemini_config = gemini_client.GeminiConfig(enabled=True, api_key="TEST-DUMMY-KEY-0123456789ABCDEF")
     application = bot.build_application(
         telegram_token="123456:dummy-token-for-tests",
         allowed_chat_ids=frozenset({12345}),
         db_path=db_path,
         fmp_api_key="test-fmp-key",
         fred_api_key="test-fred-key",
-        ollama_config=ollama_config,
+        gemini_config=gemini_config,
     )
     assert application is not None
 
@@ -441,3 +439,193 @@ def test_main_arranca_con_finnhub_y_sec_edgar_configuradas(monkeypatch, tmp_path
 
     bot.main()
     assert run_polling_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# SDD_migracion_gemini.md (F2) — cableado de `gemini_client.load_config()`
+# en `main()`: CS-21, CA-47 (parte de F2), CA-48.
+# ---------------------------------------------------------------------------
+
+_DUMMY_GEMINI_KEY = "TEST-DUMMY-KEY-0123456789ABCDEF"
+# `build_application` emite el PTBUserWarning del ConversationHandler de
+# onboarding (preexistente); los tests nuevos no suman al conteo de warnings.
+_SIN_WARNING_PTB = pytest.mark.filterwarnings("ignore::telegram.warnings.PTBUserWarning")
+
+
+def _env_main_base(monkeypatch, tmp_path, name):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:dummy-token-for-tests")
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    for var in (
+        "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_THINKING_LEVEL",
+        "GEMINI_TIMEOUT_SECONDS", "GEMINI_REWRITE_ENABLED",
+        "GEMINI_REWRITE_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("INVESTBOT_DB_PATH", str(tmp_path / name))
+
+
+def _spy_main(monkeypatch):
+    """Espía `build_application` y `gemini_client.load_config`; no hace polling."""
+    from telegram.ext import Application
+
+    captured: dict = {"build": None, "load_config_calls": 0}
+    real_build = bot.build_application
+    real_load = bot.gemini_client.load_config
+
+    def spy_build(**kwargs):
+        captured["build"] = kwargs
+        return real_build(**kwargs)
+
+    def spy_load(*args, **kwargs):
+        captured["load_config_calls"] += 1
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(bot, "build_application", spy_build)
+    monkeypatch.setattr(bot.gemini_client, "load_config", spy_load)
+    monkeypatch.setattr(Application, "run_polling", lambda self, **kw: None)
+    return captured
+
+
+def test_cs21_allowlist_invalida_aborta_antes_de_cargar_gemini(monkeypatch, tmp_path):
+    _env_main_base(monkeypatch, tmp_path, "cs21_a.db")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "no-es-un-numero")
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_GEMINI_KEY)
+    captured = _spy_main(monkeypatch)
+    with pytest.raises(security.ConfigurationError):
+        bot.main()
+    assert captured["load_config_calls"] == 0
+    assert captured["build"] is None
+
+
+@pytest.mark.parametrize("faltante", ["TELEGRAM_BOT_TOKEN", "FMP_API_KEY"])
+def test_cs21_token_o_fmp_faltante_aborta_antes_de_cargar_gemini(monkeypatch, tmp_path, faltante):
+    _env_main_base(monkeypatch, tmp_path, "cs21_b.db")
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_GEMINI_KEY)
+    monkeypatch.delenv(faltante)
+    captured = _spy_main(monkeypatch)
+    with pytest.raises(SystemExit):
+        bot.main()
+    assert captured["load_config_calls"] == 0
+
+
+@_SIN_WARNING_PTB
+def test_cs21_allowlist_valida_con_gemini_invalido_arranca_y_loguea_error_sin_valor(
+    monkeypatch, tmp_path, caplog
+):
+    _env_main_base(monkeypatch, tmp_path, "cs21_c.db")
+    valor_malo = "CANARY-MODELO-INVALIDO-NO-FILTRAR"
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_GEMINI_KEY)
+    monkeypatch.setenv("GEMINI_MODEL", valor_malo)
+    caplog.set_level(logging.INFO, logger="investbot")
+    captured = _spy_main(monkeypatch)
+    bot.main()
+    assert captured["load_config_calls"] == 1
+    assert captured["build"]["gemini_http"] is None
+    assert captured["build"]["gemini_config"].enabled is False
+    errores = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("GEMINI_MODEL" in r.getMessage() for r in errores)
+    assert valor_malo not in caplog.text
+    assert _DUMMY_GEMINI_KEY not in caplog.text
+
+
+@_SIN_WARNING_PTB
+def test_ca47_sin_key_arranca_deshabilitado_sin_cliente_http(monkeypatch, tmp_path, caplog):
+    _env_main_base(monkeypatch, tmp_path, "ca47_a.db")
+    caplog.set_level(logging.INFO, logger="investbot")
+    captured = _spy_main(monkeypatch)
+    bot.main()
+    assert captured["build"]["gemini_http"] is None
+    assert captured["build"]["gemini_config"].enabled is False
+    assert "Gemini deshabilitado (GEMINI_API_KEY ausente)" in caplog.text
+    assert not any(r.levelno >= logging.ERROR and "Gemini" in r.getMessage() for r in caplog.records)
+
+
+@_SIN_WARNING_PTB
+def test_ca47_con_key_valida_y_flag_crea_un_solo_cliente_y_loguea_habilitado(
+    monkeypatch, tmp_path, caplog
+):
+    _env_main_base(monkeypatch, tmp_path, "ca47_b.db")
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_GEMINI_KEY)
+    monkeypatch.setenv("GEMINI_REWRITE_ENABLED", "true")
+    caplog.set_level(logging.INFO, logger="investbot")
+    captured = _spy_main(monkeypatch)
+    bot.main()
+    assert captured["load_config_calls"] == 1
+    assert captured["build"]["gemini_http"] is not None
+    assert captured["build"]["gemini_config"].enabled is True
+    assert "Gemini habilitado model=gemini-3.5-flash-lite rewrite=on" in caplog.text
+    assert caplog.text.count("Gemini habilitado") == 1  # main() no duplica el log
+    assert _DUMMY_GEMINI_KEY not in caplog.text
+
+
+@_SIN_WARNING_PTB
+def test_ca47_con_key_y_sin_flag_loguea_rewrite_off(monkeypatch, tmp_path, caplog):
+    _env_main_base(monkeypatch, tmp_path, "ca47_c.db")
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_GEMINI_KEY)
+    caplog.set_level(logging.INFO, logger="investbot")
+    captured = _spy_main(monkeypatch)
+    bot.main()
+    assert captured["build"]["gemini_http"] is not None
+    assert "Gemini habilitado model=gemini-3.5-flash-lite rewrite=off" in caplog.text
+
+
+@_SIN_WARNING_PTB
+def test_ca47_key_presente_pero_invalida_arranca_deshabilitado_con_error_sin_valor(
+    monkeypatch, tmp_path, caplog
+):
+    _env_main_base(monkeypatch, tmp_path, "ca47_d.db")
+    key_mala = "CANARY-KEY'CON-COMILLA-INVALIDA"
+    monkeypatch.setenv("GEMINI_API_KEY", key_mala)
+    caplog.set_level(logging.INFO, logger="investbot")
+    captured = _spy_main(monkeypatch)
+    bot.main()
+    assert captured["build"]["gemini_http"] is None
+    assert "GEMINI_KEY_INVALID" in caplog.text
+    assert key_mala not in caplog.text
+
+
+@_SIN_WARNING_PTB
+def test_ca48_build_application_acepta_gemini_http_y_config_opcionales(tmp_path):
+    import httpx
+
+    from investbot import gemini_client
+
+    gemini_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    config = gemini_client.GeminiConfig(enabled=True, api_key=_DUMMY_GEMINI_KEY)
+    application = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=str(tmp_path / "ca48.db"),
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+        gemini_http=gemini_http,
+        gemini_config=config,
+    )
+    assert application is not None
+    sin_gemini = bot.build_application(
+        telegram_token="123456:dummy-token-for-tests",
+        allowed_chat_ids=frozenset({12345}),
+        db_path=str(tmp_path / "ca48b.db"),
+        fmp_api_key="test-fmp-key",
+        fred_api_key="test-fred-key",
+    )
+    assert sin_gemini is not None
+
+
+@_SIN_WARNING_PTB
+def test_bloque_dunder_main_ejecuta_main_y_llega_a_run_polling(monkeypatch, tmp_path):
+    """Cubre `if __name__ == "__main__": main()` (preexistente, sin cubrir):
+    se ejecuta el archivo como script con `run_polling` parcheado, sin red."""
+    import runpy
+
+    from telegram.ext import Application
+
+    _env_main_base(monkeypatch, tmp_path, "dunder_main.db")
+    llamadas = []
+    monkeypatch.setattr(Application, "run_polling", lambda self, **kw: llamadas.append(1))
+    runpy.run_path(bot.__file__, run_name="__main__")
+    assert llamadas == [1]

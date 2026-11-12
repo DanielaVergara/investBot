@@ -680,10 +680,9 @@ _PEERS_NOTE_FINNHUB = (
 # Disclaimers de transparencia — hoisteados a constantes públicas (Spec Patch
 # [Iter-3] de `SDD_redaccion_ia_ollama.md`, Opción C elegida por `architect`):
 # `ai_rewrite.py` las importa directamente para protegerlas del guard de
-# condensación (nunca se envían a Ollama como texto libre). Mismo patrón que
+# condensación (nunca se envían a Gemini como texto libre). Mismo patrón que
 # `_PEERS_NOTE_FIJO`/`_PEERS_NOTE_FINNHUB` arriba, pero sin `_` inicial porque
-# ahora son consumidas fuera de este módulo (mismo criterio que
-# `AI_REWRITE_INDICATOR` en `ai_rewrite.py`). Texto byte-idéntico al que antes
+# ahora son consumidas fuera de este módulo (`ai_rewrite.py`). Texto byte-idéntico al que antes
 # vivía inline en `build_summary_parts` — cero cambio de comportamiento.
 DISCLAIMER_WACC_DCF = (
     "_El DCF es una aproximación con supuestos simplificados de WACC "
@@ -804,7 +803,7 @@ def _build_peers_note(fuente_peers: Optional[str]) -> str:
 def build_intro_section() -> str:
     """Intro "Tienda de Limonada" (Decisión de diseño #9 de
     `SDD_menu_por_capas_explicaciones.md`: hoisteada a función propia para
-    que, con Ollama habilitado, pase a formar parte de la primera línea del
+    que, con Gemini habilitado, pase a formar parte de la primera línea del
     leaf `inf` — texto byte-idéntico al que antes vivía inline acá, cero
     cambio de comportamiento en `build_summary_parts`)."""
     return (
@@ -892,7 +891,7 @@ def build_summary_parts_short(
     escenario_elegido: Optional[str] = None,
 ) -> list[str]:
     """Versión acortada del primer mensaje (Decisión de diseño #9 de
-    `SDD_menu_por_capas_explicaciones.md`) — SOLO se usa cuando Ollama está
+    `SDD_menu_por_capas_explicaciones.md`) — SOLO se usa cuando Gemini está
     habilitado (regla de no-regresión D3: deshabilitado -> siempre
     `build_summary_parts`, el reporte completo de siempre). Título +
     Veredicto (ya corto, sin cambios) + teaser de Valor Justo + invitación a
