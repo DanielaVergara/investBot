@@ -46,8 +46,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -76,6 +78,52 @@ _CONTROL_CHARS_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f]")
 
 def _sanitize_for_log(text: str) -> str:
     return _CONTROL_CHARS_RE.sub(" ", text)
+
+
+# --- Presentación segura de texto no confiable (SDD Iter-2, CS-28 C3 / M-6) ---
+_SAFE_DISPLAY_MAX_LINES = 40
+_SAFE_DISPLAY_KEEP_CATEGORIES = frozenset("LMNPS")
+
+
+def _safe_display(texto: str, max_chars: int = 2500, keep_newlines: bool = True) -> str:
+    """Texto no confiable (salida del modelo) -> string imprimible sin riesgo.
+
+    Lista BLANCA por `unicodedata.category`: se conserva todo carácter L, M, N,
+    P o S; los separadores Zs pasan a un espacio ASCII; el salto de línea se conserva (o pasa
+    a espacio con `keep_newlines=False`, p. ej. para una línea de log); todo lo
+    demás (Cc incl. ESC y C1, Cf incl. bidi/ZWJ/tag chars, Cs, Co, Cn, Zl, Zp)
+    se escribe `<U+XXXX>`. Máximo `max_chars` caracteres de SALIDA (nunca se
+    parte un `<U+XXXX>`) y `_SAFE_DISPLAY_MAX_LINES` líneas.
+    """
+    if texto is None:
+        return ""
+    if not isinstance(texto, str):
+        texto = str(texto)
+    partes: list[str] = []
+    usados = 0
+    lineas = 1
+    for ch in texto:
+        if ch == "\n":
+            if keep_newlines:
+                if lineas >= _SAFE_DISPLAY_MAX_LINES:
+                    break
+                pieza = "\n"
+                lineas += 1
+            else:
+                pieza = " "
+        else:
+            categoria = unicodedata.category(ch)
+            if categoria == "Zs":
+                pieza = " "
+            elif categoria[0] in _SAFE_DISPLAY_KEEP_CATEGORIES:
+                pieza = ch
+            else:
+                pieza = f"<U+{ord(ch):04X}>"
+        if usados + len(pieza) > max_chars:
+            break
+        partes.append(pieza)
+        usados += len(pieza)
+    return "".join(partes)
 
 
 # Texto idéntico a `query_handler.RATE_LIMITED_MSG` — mismo balde compartido.
@@ -662,6 +710,12 @@ def _fmt_pct_or_nd(value: object) -> str:
     return f"{value * 100:.1f}%" if isinstance(value, (int, float)) and not isinstance(value, bool) else "N/D"
 
 
+def _fmt_pp_or_nd(value: object) -> str:
+    """Como `_fmt_pct_or_nd` pero para valores que YA están en puntos
+    porcentuales (p.ej. `pct_vs_*` de `market_context._pct_vs`): no multiplica."""
+    return f"{value:.1f}%" if isinstance(value, (int, float)) and not isinstance(value, bool) else "N/D"
+
+
 def _fmt_ratio_or_nd(value: object) -> str:
     return f"{value:.2f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "N/D"
 
@@ -708,7 +762,7 @@ def _dato_texto_libre(question_code: str, datos: dict) -> str:
         return f"Encaje: {'SÍ' if encaja else 'NO'} (beta {beta_txt})"
     if question_code == "mom":
         etiqueta = datos.get("etiqueta") or "sin datos"
-        return f"Momentum: {etiqueta} (vs. máx 52 sem.: {_fmt_pct_or_nd(datos.get('pct_vs_year_high'))})"
+        return f"Momentum: {etiqueta} (vs. máx 52 sem.: {_fmt_pp_or_nd(datos.get('pct_vs_year_high'))})"
     if question_code == "cmp":
         return (
             f"PER propio: {_fmt_ratio_or_nd(datos.get('per_propio'))} vs. "
@@ -772,6 +826,7 @@ def _build_leaf_message(
     *,
     cuenta: Optional[str] = None,
     desglose: Optional[str] = None,
+    grafico: Optional[str] = None,
 ) -> str:
     """Orden fijo (Decisión de diseño #5, extendido por SDD_explicacion_
     paso_a_paso.md y por SDD_desglose_terminos_formula.md): header -> Dato ->
@@ -788,6 +843,8 @@ def _build_leaf_message(
     partes = [ai_rewrite.TRANSPARENCY_USED, f"📌 Dato: {dato_line}"]
     if cuenta:
         partes.append(f"🧮 Cuenta: {cuenta}")
+    if grafico:
+        partes.append(grafico)
     if desglose:
         partes.append(desglose)
     partes.append(respuesta)
@@ -864,6 +921,107 @@ def _enforce_cuenta_length(cuenta: str, max_chars: int = _MAX_CUENTA_CHARS) -> O
         )
         return None
     return cuenta
+
+
+# --- Bloque "📊 Gráfico" (barras Unicode) -- SDD_redaccion_gemini_iter2.md
+# sección 6 + CS-27 + 18.6-A7. 100% Python, nunca por Gemini: se arma desde el
+# `datos` CRUDO ya validado de `_dispatch_leaf` (sin store/chat_id/context_id),
+# DESPUÉS de la respuesta del modelo, y NUNCA entra a `datos_del_contexto` ni a
+# `datos_tokens`. Solo emite `█`, `░`, etiquetas constantes y salidas de
+# `_money`. Sin red, sin FS, sin `parse_mode`.
+
+_MAX_GRAFICO_CHARS = 400
+_GRAFICO_ANCHO = 12
+_GRAFICO_ETIQUETA_ANCHO = 15
+_GRAFICO_ND = "n/d"
+
+
+def _valor_grafico_valido(valor: object) -> bool:
+    """CS-27(b): `type(v) in (int, float)` (excluye `bool`), finito y > 0."""
+    try:
+        return type(valor) in (int, float) and math.isfinite(valor) and valor > 0
+    except OverflowError:  # int más grande que un float
+        return False
+
+
+def _bar(valor: object, maximo: object, ancho: int = _GRAFICO_ANCHO) -> str:
+    """Barra `█`/`░` de `ancho` bloques, o el literal "n/d" si `valor` o
+    `maximo` no cumplen CS-27(b). Half-up explícito (no `round`, que es
+    half-even): `int(valor / maximo * ancho + 0.5)`, mínimo 1 bloque."""
+    if not (_valor_grafico_valido(valor) and _valor_grafico_valido(maximo)):
+        return _GRAFICO_ND
+    proporcion = min(valor / maximo, 1.0)
+    llenos = max(1, int(proporcion * ancho + 0.5))
+    return "█" * llenos + "░" * (ancho - llenos)
+
+
+def _bloque_grafico(titulo: str, filas: list[tuple[str, object]]) -> Optional[str]:
+    """Escala común al máximo del conjunto. `None` si hay < 2 valores válidos
+    o si el bloque supera `_MAX_GRAFICO_CHARS` (no se trunca)."""
+    validos = [v for _, v in filas if _valor_grafico_valido(v)]
+    if len(validos) < 2:
+        return None
+    maximo = max(validos)
+    lineas = [titulo]
+    for etiqueta, valor in filas:
+        if _valor_grafico_valido(valor):
+            lineas.append(f"{etiqueta.ljust(_GRAFICO_ETIQUETA_ANCHO)}{_bar(valor, maximo)}  {_money(valor)}")
+        else:
+            lineas.append(f"{etiqueta.ljust(_GRAFICO_ETIQUETA_ANCHO)}{_GRAFICO_ND}")
+    bloque = "\n".join(lineas)
+    if _len16(bloque) > _MAX_GRAFICO_CHARS:
+        return None
+    return bloque
+
+
+def _build_grafico_vf(datos: dict) -> Optional[str]:
+    """`vf`: Múltiplos, Graham, DCF, Valor Justo Total y precio actual."""
+    try:
+        return _bloque_grafico("📊 Valor justo vs precio", [
+            ("Múltiplos", datos.get("valor_justo_multiplos")),
+            ("Graham", datos.get("valor_justo_graham")),
+            ("Flujo (DCF)", datos.get("valor_justo_dcf")),
+            ("Valor Justo", datos.get("valor_justo_total")),
+            ("Precio actual", datos.get("precio_actual")),
+        ])
+    except Exception as exc:
+        logger.warning("GEMINI_GRAFICO_FALLO tipo=%s", type(exc).__name__)
+        return None
+
+
+def _build_grafico_escenarios(datos: dict) -> Optional[str]:
+    """`gra`/`dcf`/`mul`: los 3 escenarios del modelo y el precio actual."""
+    try:
+        return _bloque_grafico("📊 Escenarios vs precio", [
+            ("Pesimista", datos.get("pesimista")),
+            ("Conservador", datos.get("conservador")),
+            ("Optimista", datos.get("optimista")),
+            ("Precio actual", datos.get("precio_actual")),
+        ])
+    except Exception as exc:
+        logger.warning("GEMINI_GRAFICO_FALLO tipo=%s", type(exc).__name__)
+        return None
+
+
+def _build_grafico_ver(datos: dict) -> Optional[str]:
+    """`ver`: Valor Justo Total vs precio actual (2 barras)."""
+    try:
+        return _bloque_grafico("📊 Valor justo vs precio", [
+            ("Valor Justo", datos.get("valor_justo_total")),
+            ("Precio actual", datos.get("precio_actual")),
+        ])
+    except Exception as exc:
+        logger.warning("GEMINI_GRAFICO_FALLO tipo=%s", type(exc).__name__)
+        return None
+
+
+_GRAFICO_POR_PREGUNTA: dict[str, Callable[[dict], Optional[str]]] = {
+    "vf": _build_grafico_vf,
+    "ver": _build_grafico_ver,
+    "gra": _build_grafico_escenarios,
+    "dcf": _build_grafico_escenarios,
+    "mul": _build_grafico_escenarios,
+}
 
 
 # --- Bloque "🔍 Desglose" (paso a paso) -- SDD_desglose_terminos_
@@ -1931,69 +2089,473 @@ def _build_deterministic_content(context: ExplanationContext, question_code: str
     raise ValueError(f"question_code determinístico desconocido: {question_code}")
 
 
-# --- Prompt + guard de brevedad/integridad (sin cambios de mecanismo) ------
+# --- Prompts + redacción: etiquetas, normalizador y recorte (SDD Iter-2, F1) ---
 
-SYSTEM_PROMPT_EXPLAIN = (
-    "Sos un profesor de finanzas que explica en español rioplatense, en un\n"
-    "mensaje de chat. Vas a recibir un JSON con una pregunta puntual y los\n"
-    "datos ya calculados para responderla.\n\n"
-    "Reglas estrictas:\n"
-    "1. Respondé SOLO la pregunta puntual, en 2 a 4 oraciones cortas — nunca\n"
-    "   más. No repitas la pregunta, no agregues introducción ni cierre.\n"
-    "2. Usá ÚNICAMENTE los números/datos del JSON que te paso — nunca\n"
-    "   inventes, estimes ni completes un dato que no esté ahí.\n"
-    "3. Nunca dés una recomendación de compra/venta ni asesoramiento\n"
-    "   financiero personalizado — solo explicá qué significa el dato.\n"
-    "4. Copiá los números exactamente como aparecen en el JSON: mismo\n"
-    "   formato, punto decimal, sin separador de miles.\n"
-    "5. Con tono de análisis de inversionista: si el JSON trae la clave\n"
-    "   \"modelo\" o \"modelos\", nombrá ese/esos modelo(s) financiero(s) al\n"
-    "   principio de tu respuesta y decí en general qué mide -- sin salirte\n"
-    "   de las 2 a 4 oraciones de la regla 1.\n"
-    "6. Respondé en español rioplatense.\n"
+# Encabezados de sección (16.2/18.6 A2). Sin dígitos, sin palabras en MAYÚSCULAS,
+# sin ✅/❌ y sin emojis con ZWJ: pasan el guard de números y el filtro de salida.
+# Los usan el prompt, el normalizador, `_fit_respuesta` y los tests.
+SECTION_LABELS: dict[str, tuple[str, str, str]] = {
+    "narrativa": ("💡 En simple", "🔎 Qué dicen los datos", "🧭 Cómo leerlo"),
+    "paso_a_paso": ("💡 En simple", "🔎 Qué es cada pieza", "🧭 Qué significa el resultado"),
+}
+_ALL_LABELS: tuple[str, ...] = tuple(
+    dict.fromkeys(etiqueta for trio in SECTION_LABELS.values() for etiqueta in trio)
 )
+
+# Reglas 3 y 4 son idénticas en ambos prompts (3.2: "idéntica a la regla 3/4 de
+# EXPLAIN"); la regla 1 y las reglas 5/6 difieren.
+_PROMPT_REGLA_3 = (
+    "3. No escribas palabras enteras en MAYÚSCULAS ni siglas, salvo que\n"
+    "   aparezcan tal cual en el JSON; si no, escribí el nombre completo en\n"
+    "   palabras. No uses números ni listas numeradas para ordenar ideas:\n"
+    "   usá viñetas con \"• \" y palabras como \"primero\" o \"después\".\n"
+)
+_PROMPT_REGLA_4 = (
+    "4. Formato: texto plano. Nada de Markdown (ni asteriscos, ni guiones bajos,\n"
+    "   ni numerales, ni tablas), ni enlaces, ni menciones con arroba. Nunca\n"
+    "   escribas nombres de claves del JSON (los que llevan guion bajo): traducilos\n"
+    "   a palabras normales. Tampoco uses emojis en el texto, salvo los encabezados.\n"
+)
+_PROMPT_COPIAR_VALORES = (
+    "(por ejemplo \"$1,234.56\", \"15.3%\", \"$2.5 mil millones\"): copialos\n"
+    "   exactamente como están, con su símbolo y sus decimales"
+)
+_PROMPT_CANTIDADES_CON_LETRAS = (
+    " No escribas cantidades con letras (\"el doble\", \"la mitad\", \"diez por\n"
+    "   ciento\"): comparar con palabras vagas sí, expresar una cantidad que no\n"
+    "   está en el JSON no."
+)
+
+_PROMPT_EXPLAIN_PLANTILLA = (
+    "Sos un profesor de finanzas que explica con claridad y calidez, en español rioplatense,\n"
+    "por un chat de Telegram. Vas a recibir un JSON con una pregunta\n"
+    "puntual y los datos ya calculados para responderla. Escribí como lo haría una\n"
+    "persona que explica bien: frases completas y naturales, sin telegrafismo.\n\n"
+    "Reglas, sin excepción:\n"
+    "1. Integridad de los datos: usá ÚNICAMENTE las cifras y datos del JSON.\n"
+    "   Nunca inventes, estimes ni calcules cifras nuevas (diferencias,\n"
+    "   porcentajes, promedios, proyecciones, años, fechas). Para comparar usá\n"
+    "   palabras (\"bastante por encima\", \"casi igual\") o citá cifras que ya\n"
+    "   estén en el JSON. Los valores del JSON ya vienen escritos para leerse\n"
+    "   " + _PROMPT_COPIAR_VALORES + ", sin cambiar los\n"
+    "   separadores ni expresarlos de otra forma." + _PROMPT_CANTIDADES_CON_LETRAS + "\n"
+    "2. Nunca des una recomendación de compra o venta ni asesoramiento\n"
+    "   financiero personalizado: solo explicá qué significa el dato.\n"
+    + _PROMPT_REGLA_3
+    + _PROMPT_REGLA_4
+    + "5. Nombrá el modelo financiero (\"modelo\" o \"modelos\" en el JSON) y decí en\n"
+    "   general qué mide, con tono de análisis de inversionista, pero accesible\n"
+    "   para quien no estudió finanzas. Una comparación cotidiana ayuda si es\n"
+    "   corta.\n"
+    "6. Estructura: tres bloques separados por una línea en blanco, cada uno\n"
+    "   con su encabezado exacto en una línea:\n"
+    "   {S1}\n"
+    "   (qué mide el modelo y qué responde la pregunta)\n"
+    "   {S2}\n"
+    "   (las cifras clave del JSON y qué significa cada una; podés usar viñetas)\n"
+    "   {S3}\n"
+    "   (cómo interpretarlo, con matices y límites del modelo)\n"
+    "   El largo es el que haga falta para que se entienda, sin relleno: no\n"
+    "   repitas la pregunta, ni saludes, ni te despidas.\n"
+    "7. Respondé siempre en español rioplatense, sin mezclar otros idiomas.\n"
+)
+
+_PROMPT_PASO_A_PASO_PLANTILLA = (
+    "Sos un profesor de finanzas que explica con claridad y calidez, en español rioplatense,\n"
+    "por un chat de Telegram. Vas a recibir un JSON con una pregunta\n"
+    "puntual, los datos ya calculados y una clave \"cuenta\" con la fórmula YA\n"
+    "RESUELTA paso a paso (números reales, cada término calculado, resultado\n"
+    "final). El usuario ya ve esa cuenta arriba de tu respuesta.\n\n"
+    "Reglas, sin excepción:\n"
+    "1. La cuenta en \"cuenta\" YA ESTÁ CALCULADA Y ES CORRECTA: no la recalcules\n"
+    "   ni la repitas entera. Usá ÚNICAMENTE las cifras y datos del JSON; nunca\n"
+    "   inventes, estimes ni calcules cifras nuevas (diferencias, porcentajes,\n"
+    "   promedios, proyecciones, años, fechas). Para comparar usá palabras o\n"
+    "   citá cifras que ya estén en el JSON. Los valores vienen escritos para\n"
+    "   leerse " + _PROMPT_COPIAR_VALORES + "." + _PROMPT_CANTIDADES_CON_LETRAS + "\n"
+    "2. Nunca des una recomendación de compra o venta ni asesoramiento\n"
+    "   financiero personalizado: solo explicá qué significa el resultado.\n"
+    + _PROMPT_REGLA_3
+    + _PROMPT_REGLA_4
+    + "5. Nombrá el modelo financiero (\"modelo\" o \"modelos\" en el JSON) y decí\n"
+    "   qué mide. Explicá QUÉ ES cada valor clave de la cuenta, uno por uno, y\n"
+    "   no dejes ningún término sin explicar. Usá un lenguaje simple, con una\n"
+    "   comparación cotidiana si ayuda (por ejemplo, pensar en la empresa como\n"
+    "   una tienda de limonada).\n"
+    "6. Estructura: tres bloques separados por una línea en blanco, cada uno\n"
+    "   con su encabezado exacto en una línea:\n"
+    "   {S1}\n"
+    "   (qué mide el modelo, en lenguaje simple)\n"
+    "   {S2}\n"
+    "   (una viñeta \"• \" por cada término de la cuenta: \"Término (cifra): qué es\")\n"
+    "   {S3}\n"
+    "   (qué significa el resultado para quien lee, con sus límites)\n"
+    "   El largo es el que haga falta; sin saludo, cierre ni repetir la pregunta.\n"
+    "7. Respondé siempre en español rioplatense, sin mezclar otros idiomas.\n"
+)
+
+
+def _armar_prompt(plantilla: str, etiquetas: tuple[str, str, str]) -> str:
+    # `str.replace`, no `.format` (la plantilla no escapa llaves). Se llama UNA
+    # sola vez al importar (CA-41): `systemInstruction` es la constante del módulo.
+    s1, s2, s3 = etiquetas
+    return plantilla.replace("{S1}", s1).replace("{S2}", s2).replace("{S3}", s3)
+
+
+SYSTEM_PROMPT_EXPLAIN = _armar_prompt(_PROMPT_EXPLAIN_PLANTILLA, SECTION_LABELS["narrativa"])
 
 # Decisión de diseño #4 de SDD_explicacion_paso_a_paso.md -- NO reemplaza
-# `SYSTEM_PROMPT_EXPLAIN` (ese sigue usándose sin cambios para `mod`/`ben`/
-# `ren`, variant="narrativa"): exclusivo del camino "paso a paso" de las 22
-# preguntas `dato_y_paso_a_paso`. Mismo tope de tokens y mismo timeout.
-SYSTEM_PROMPT_PASO_A_PASO = (
-    "Sos un profesor de finanzas que explica en español rioplatense, en un\n"
-    "mensaje de chat. Vas a recibir un JSON con una pregunta puntual, los\n"
-    "datos ya calculados, y una clave \"cuenta\" con la fórmula YA RESUELTA paso\n"
-    "a paso (números reales, cada término calculado, resultado final).\n\n"
-    "Reglas estrictas:\n"
-    "1. La cuenta en \"cuenta\" YA ESTÁ CALCULADA Y ES CORRECTA — no la\n"
-    "   recalcules ni repitas los números tal cual (el usuario ya los ve\n"
-    "   arriba de tu respuesta). Tu trabajo es explicar, en 2 a 4 oraciones\n"
-    "   cortas y en criollo bien simple (como si le explicaras a alguien que\n"
-    "   nunca estudió finanzas, con una comparación cotidiana si ayuda —\n"
-    "   mismo estilo que \"pensá en una empresa como una tienda de\n"
-    "   limonada\"), QUÉ ES cada valor clave de la cuenta (ej. qué\n"
-    "   representa \"Valor Justo Total\" o \"Precio actual\", no solo que\n"
-    "   uno es mayor que el otro) y QUÉ SIGNIFICA el resultado final para\n"
-    "   quien lee. Nunca dejes un término de la cuenta sin explicar qué es.\n"
-    "2. Usá ÚNICAMENTE los números/datos del JSON que te paso — nunca inventes,\n"
-    "   estimes ni completes un dato que no esté ahí.\n"
-    "3. Nunca dés una recomendación de compra/venta ni asesoramiento financiero\n"
-    "   personalizado — solo explicá qué significa el resultado.\n"
-    "4. Copiá los números exactamente como aparecen en el JSON: mismo\n"
-    "   formato, punto decimal, sin separador de miles.\n"
-    "5. Con tono de análisis de inversionista: nombrá el modelo financiero\n"
-    "   (\"modelo\"/\"modelos\" en el JSON) al principio de tu respuesta y decí en\n"
-    "   general qué mide -- sin salirte de las 2 a 4 oraciones de la regla 1.\n"
-    "6. Respondé en español rioplatense.\n"
+# `SYSTEM_PROMPT_EXPLAIN` (ese sigue usándose para `mod`/`ben`/`ren`,
+# variant="narrativa"): exclusivo del camino "paso a paso" de las 22
+# preguntas `dato_y_paso_a_paso`.
+SYSTEM_PROMPT_PASO_A_PASO = _armar_prompt(_PROMPT_PASO_A_PASO_PLANTILLA, SECTION_LABELS["paso_a_paso"])
+
+MAX_EXPLANATION_OUTPUT_TOKENS = 2048
+
+# --- Longitud (SDD Iter-2, 18.4) --------------------------------------------
+_MAX_RESPUESTA_CHARS = 1800
+_MIN_RESPUESTA_CHARS = 400
+_MAX_RAW_CHARS = 6000
+_TELEGRAM_LIMIT = 4096  # propio: un test lo iguala a `query_handler.TELEGRAM_MESSAGE_LIMIT`
+_MARGEN_TELEGRAM = 100
+_NOTA_ACORTADA = "(explicación acortada por el largo del mensaje)"
+_FIT_PISO = 0.4
+# Fin de oración: [.!?] seguido de espacio o fin de texto (el "." de un decimal va
+# seguido de un dígito y no cuenta).
+_FIN_ORACION_RE = re.compile(r"[.!?](?= |\Z)")
+
+
+def _len16(texto: str) -> int:
+    """Longitud en unidades UTF-16 (la que cuenta Telegram para los emojis
+    fuera del BMP)."""
+    return len(texto.encode("utf-16-le")) // 2
+
+
+# Emojis del marco determinístico (CS-36): 🤖 📌 🧮 🔍(U+1F50D) 📐 📊 📋. NO incluye
+# U+1F50E (la lupa de la etiqueta "Qué dicen los datos").
+_MARCO_EMOJIS = "\U0001F916\U0001F4CC\U0001F9EE\U0001F50D\U0001F4D0\U0001F4CA\U0001F4CB"
+_NORMALIZE_BORRAR = str.maketrans("", "", "*_`" + _MARCO_EMOJIS)
+_TRES_SALTOS_RE = re.compile(r"\n{3,}")
+
+
+def _normalize_layout(texto: str) -> str:
+    """Limpia Markdown inofensivo y espaciado ANTES de los guards (18.2).
+
+    Pura, idempotente en una pasada y lineal. Solo borra caracteres, une
+    líneas o agrega viñeta, espacio y salto de línea. Puede crear
+    coincidencias del filtro de salida: los guards corren SIEMPRE sobre su
+    salida. Orden fijo."""
+    t = texto.replace("\r\n", "\n").replace("\r", "\n").translate(_NORMALIZE_BORRAR)
+    salida: list[str] = []
+    for linea in t.split("\n"):
+        s = linea.lstrip(" \t")
+        if s.startswith("#"):
+            s = s.lstrip("# \t")
+            linea = s
+        if s[:1] in ("-", "–") and len(s) > 1 and s[1] in " \t":
+            linea = "• " + s[1:].lstrip(" \t")
+        linea = linea.rstrip(" \t")
+        if salida and salida[-1] != "" and linea.startswith(_ALL_LABELS):
+            salida.append("")
+        salida.append(linea)
+    return _TRES_SALTOS_RE.sub("\n\n", "\n".join(salida)).strip(" \t\n")
+
+
+def _candidato_en_rango(texto: str, fin: int, piso: float, max_chars: int) -> bool:
+    return piso <= _len16(texto[:fin]) <= max_chars
+
+
+def _fit_respuesta(texto: str, max_chars: int) -> Optional[str]:
+    """Recorta la respuesta del modelo sin partir un número (18.4).
+
+    Párrafo completo antes que oración; ambos con longitud UTF-16 en
+    `[0.4 * max_chars, max_chars]`. NUNCA corta en un espacio ni agrega "…".
+    `None` si no hay corte válido (el llamador entrega el mensaje de "no
+    disponible"). Log solo de enteros."""
+    if _len16(texto) <= max_chars:
+        return texto
+    piso = _FIT_PISO * max_chars
+    candidato: Optional[str] = None
+    i = texto.rfind("\n\n")
+    while i != -1:
+        if _candidato_en_rango(texto, i, piso, max_chars):
+            candidato = texto[:i]
+            break
+        i = texto.rfind("\n\n", 0, i + 1)
+    if candidato is None:
+        for m in reversed(list(_FIN_ORACION_RE.finditer(texto))):
+            if _candidato_en_rango(texto, m.end(), piso, max_chars):
+                candidato = texto[: m.end()]
+                break
+    if candidato is None:
+        return None
+    res = candidato.rstrip()
+    while res:
+        ultima = res.rsplit("\n", 1)[-1].strip()
+        if ultima not in _ALL_LABELS:
+            break
+        res = res[: len(res) - len(res.rsplit("\n", 1)[-1])].rstrip()
+    if res == "":
+        return None
+    logger.info("GEMINI_RESPUESTA_RECORTADA chars=%d max=%d", _len16(texto), max_chars)
+    return res
+
+
+# --- Escala de montos (CS-31 / 18.5) -----------------------------------------
+_ESCALA_RE = re.compile(
+    r"(\$?\d[\d.,]*)(?:\s*(mil millones|miles de millones|millones|billones|trillones|mil)\b)?",
+    re.IGNORECASE,
 )
 
-MAX_EXPLANATION_OUTPUT_TOKENS = 1024
-_MAX_EXPLANATION_CHARS = 480
+
+def _pares_escala(texto: str) -> set[tuple[str, Optional[str]]]:
+    pares: set[tuple[str, Optional[str]]] = set()
+    for m in _ESCALA_RE.finditer(texto):
+        sufijo = m.group(2)
+        pares.add((_normalize_numeric_token(m.group(1)), sufijo.lower() if sufijo else None))
+    return pares
 
 
-def _enforce_brevity(texto: str) -> str:
-    if len(texto) <= _MAX_EXPLANATION_CHARS:
-        return texto
-    corte = texto.rfind(".", 0, _MAX_EXPLANATION_CHARS)
-    return texto[: corte + 1] if corte > 0 else texto[:_MAX_EXPLANATION_CHARS] + "…"
+def _escalas_consistentes(payload_presentado: dict, respuesta: str) -> bool:
+    """Tercer chequeo (DESPUÉS de `_no_new_protected_tokens`, que no se toca):
+    el guard compara solo la cifra, no la escala (`$394.3 millones` pasaría
+    con un payload de `$394.3 mil millones`). Regla 1: todo (cifra, sufijo)
+    con sufijo de la respuesta debe estar en el payload presentado. Regla 2:
+    una cifra que en el payload aparece SOLO con sufijo no puede aparecer sin
+    ese sufijo."""
+    p = _pares_escala(json.dumps(payload_presentado, ensure_ascii=False, default=str))
+    for numero, sufijo in _pares_escala(respuesta):
+        if sufijo is not None:
+            if (numero, sufijo) not in p:
+                return False
+        elif (numero, None) not in p and any(n == numero and s is not None for n, s in p):
+            return False
+    return True
+
+
+# --- Números presentados al modelo (SDD Iter-2, 18.3) -------------------------
+_LIMITE_HOJA_NUMERICA = 1e15
+
+
+def _money_compact(x: float) -> str:
+    """Monto legible, en el formato del resto del bot: `$1,234.56` por debajo
+    de un millón, `$X.X millones`, `$X.X mil millones` (nunca "billón"). El
+    signo va como lo pone `_money` (`$-5.00`). `round(a/1e6, 1) >= 1000` promueve
+    la unidad para no escribir `$1,000.0 millones`."""
+    a = abs(x)
+    if a >= 1e9 or round(a / 1e6, 1) >= 1000.0:
+        return f"${x / 1e9:,.1f} mil millones"
+    if a >= 1e6:
+        return f"${x / 1e6:,.1f} millones"
+    return _money(x)
+
+
+# Unidad por clave, tomada de lo que YA muestran al usuario `_dato_*`, las
+# `_cuenta_*` y los `_valor_desglose_*` (misma unidad que ve quien lee, no una
+# heurística). Una clave no listada queda numérica y redondeada. Las `pct_vs_*`
+# de `mom` NO se listan: `_dato_texto_libre` las multiplica por 100 y
+# `_cuenta_mom`/`_valor_desglose_mom` no (están en puntos porcentuales).
+_PAYLOAD_KIND_POR_PREGUNTA: dict[str, dict[str, str]] = {
+    "ver": {"precio_actual": "money", "valor_justo_total": "money"},
+    "vf": {
+        "precio_actual": "money", "valor_justo_multiplos": "money", "valor_justo_graham": "money",
+        "valor_justo_dcf": "money", "valor_justo_total": "money",
+    },
+    "gra": {
+        "pesimista": "money", "conservador": "money", "optimista": "money",
+        "eps_ttm": "money", "y_value": "pct", "g_aplicado": "pct",
+    },
+    "mul": {
+        "pesimista": "money", "conservador": "money", "optimista": "money",
+        "eps_ttm": "money", "per_promedio_peers": "ratio",
+    },
+    "dcf": {
+        "pesimista": "money", "conservador": "money", "optimista": "money",
+        "dcf_wacc": "pct", "dcf_g_fcf": "pct", "dcf_fcf_base": "money",
+        "dcf_valor_presente_flujos": "money", "dcf_valor_terminal_descontado": "money",
+        "dcf_equity_value": "money",
+    },
+    "rat": {
+        "ratio_liquidez": "ratio", "margen_bruto": "pct", "per": "ratio", "ps": "ratio",
+        "current_assets": "money", "current_liabilities": "money", "revenue": "money",
+        "cost_of_revenue": "money", "market_cap": "money", "eps_ttm": "money",
+        "precio_actual": "money",
+    },
+    "pil": {
+        "revenue_reciente": "money", "revenue_antiguo": "money", "net_income_reciente": "money",
+        "net_income_antiguo": "money", "ratio_liquidez": "ratio",
+    },
+    "ren": {"roe": "pct"},
+    "rsk": {"beta": "ratio", "beta_umbral_bajo": "ratio", "beta_umbral_alto": "ratio"},
+    "mom": {
+        "precio_actual": "money", "year_high": "money", "year_low": "money",
+        "price_avg_50": "money", "price_avg_200": "money",
+    },
+    "cmp": {
+        "per_propio": "ratio", "per_promedio_peers": "ratio", "eps_ttm": "money",
+        "precio_actual": "money",
+    },
+    "alz": {"z": "ratio", "a": "ratio", "b": "ratio", "c": "ratio", "d": "ratio", "e": "ratio"},
+    "azp": {"z": "ratio", "a": "ratio", "b": "ratio", "c": "ratio", "d": "ratio"},
+    "pig": {
+        "net_income_t": "money", "cfo_t": "money", "roa_t": "ratio", "roa_t1": "ratio",
+        "apalancamiento_t": "ratio", "apalancamiento_t1": "ratio", "liquidez_t": "ratio",
+        "liquidez_t1": "ratio", "shares_t": "ratio", "shares_t1": "ratio", "margen_t": "pct",
+        "margen_t1": "pct", "rotacion_t": "ratio", "rotacion_t1": "ratio",
+    },
+    "mgr": {
+        "roic": "pct", "ebit": "money", "capital_invertido": "money", "current_assets": "money",
+        "current_liabilities": "money", "ppe_net": "money",
+    },
+    "mge": {
+        "earnings_yield": "pct", "ebit": "money", "ev": "money", "market_cap": "money",
+        "total_debt": "money", "cash": "money",
+    },
+    "aqv": {"earnings_yield": "pct", "umbral_alto": "pct", "umbral_bajo": "pct"},
+    "aqq": {
+        "roe": "pct", "gross_margin": "pct", "piotroski_ratio": "pct", "roe_umbral_alto": "pct",
+        "roe_umbral_bajo": "pct", "gross_margin_umbral_alto": "pct",
+        "gross_margin_umbral_bajo": "pct", "piotroski_ratio_umbral_alto": "pct",
+        "piotroski_ratio_umbral_bajo": "pct",
+    },
+    "aqm": {"precio_actual": "money", "price_avg_50": "money", "price_avg_200": "money"},
+    "aql": {"beta": "ratio", "beta_umbral_bajo": "ratio", "beta_umbral_alto": "ratio"},
+}
+# `pir`/`pia`/`pie` comparten los `valores` de Piotroski con `pig`.
+for _code in ("pir", "pia", "pie"):
+    _PAYLOAD_KIND_POR_PREGUNTA[_code] = _PAYLOAD_KIND_POR_PREGUNTA["pig"]
+
+
+def _unir_unidades(por_pregunta: dict[str, dict[str, str]]) -> dict[str, str]:
+    union: dict[str, str] = {}
+    for kinds in por_pregunta.values():
+        for clave, unidad in kinds.items():
+            if union.setdefault(clave, unidad) != unidad:
+                # Colisión de unidad entre preguntas: habría que pasar a
+                # `(question_code, clave)`. Hoy no ocurre (lo fija un test).
+                raise RuntimeError(f"colisión de unidad para la clave {clave!r}")
+    return union
+
+
+_PAYLOAD_KIND: dict[str, str] = _unir_unidades(_PAYLOAD_KIND_POR_PREGUNTA)
+
+
+def _presentar_hoja(valor, clave: Optional[str]):
+    # `type(v) in (int, float)`: `bool` (subclase de int), `str`, `None` no se tocan.
+    if type(valor) not in (int, float):
+        return valor
+    if abs(valor) >= _LIMITE_HOJA_NUMERICA or not math.isfinite(valor):
+        return None
+    unidad = _PAYLOAD_KIND.get(clave) if clave is not None else None
+    if unidad == "money":
+        return _money_compact(valor)
+    if unidad == "pct":
+        return _pct1(valor)
+    if unidad == "ratio":
+        return f"{valor:.2f}"
+    return valor if type(valor) is int else round(valor, 4)
+
+
+def _present_payload(datos, _clave: Optional[str] = None):
+    """Copia del payload con los números ya escritos para leerse (`$1,234.56`,
+    `15.3%`, `$2.5 mil millones`) en el formato del resto del bot. Pura; no
+    muta la entrada. La clave de una hoja es la del dict padre más cercano.
+    Toda hoja numérica no finita o con |v| >= 1e15 pasa a `None`; una
+    numérica sin clasificar queda numérica (float redondeado a 4 decimales)."""
+    if isinstance(datos, dict):
+        return {k: _present_payload(v, k) for k, v in datos.items()}
+    if isinstance(datos, list):
+        return [_present_payload(v, _clave) for v in datos]
+    return _presentar_hoja(datos, _clave)
+
+
+def _derivar_posicion_vs_precio(valor_justo, precio) -> dict:
+    """Campos derivados de `vf`/`ver` (CS-33), calculados en Python desde los
+    valores CRUDOS: dirección y diferencia SIN signo, sobre el valor ya
+    redondeado a 1 decimal. `{}` si algún dato falta o no es numérico válido."""
+    for v in (valor_justo, precio):
+        # abs(v) primero: math.isfinite(10**400) lanza OverflowError; la comparación int/float es exacta.
+        if type(v) not in (int, float) or abs(v) >= _LIMITE_HOJA_NUMERICA or not math.isfinite(v):
+            return {}
+    if precio <= 0:
+        return {}
+    # Con ambos finitos y precio > 0 la división no lanza (desborda a inf): se filtra abajo.
+    diferencia = float(f"{(valor_justo / precio - 1) * 100:.1f}")
+    if not math.isfinite(diferencia) or abs(diferencia) >= _LIMITE_HOJA_NUMERICA:
+        return {}
+    if diferencia == 0:
+        posicion = "igual"
+    else:
+        posicion = "por encima" if diferencia > 0 else "por debajo"
+    return {"posicion_vs_precio": posicion, "diferencia_vs_precio_abs": f"{abs(diferencia):.1f}%"}
+
+
+def _datos_para_el_modelo(question_code: str, datos_crudos: dict) -> dict:
+    """Payload que viaja al modelo (QB-9/A3). `datos_crudos` queda intacto
+    (Dato/Cuenta/Desglose lo reciben CRUDO). Al modelo va una COPIA presentada;
+    solo `vf`/`ver` suman los campos derivados (`posicion_vs_precio`,
+    `diferencia_vs_precio_abs`), calculados en Python desde los valores
+    crudos. Lo usan el handler y `scripts/gemini_smoke.py`; los tokens del
+    guard son `_compute_datos_tokens(crudo, presentado)`."""
+    datos_modelo = _present_payload(datos_crudos)
+    if question_code in ("vf", "ver"):
+        datos_modelo.update(
+            _derivar_posicion_vs_precio(datos_crudos.get("valor_justo_total"), datos_crudos.get("precio_actual"))
+        )
+    return datos_modelo
+
+
+def _fit_leaf_message(
+    dato_line: str,
+    respuesta: str,
+    formula: Optional[str],
+    fuente: Optional[str],
+    *,
+    cuenta: Optional[str] = None,
+    desglose: Optional[str] = None,
+    grafico: Optional[str] = None,
+) -> Optional[str]:
+    """Presupuesto de entrega contra el límite de Telegram (UTF-16) y recorte
+    de la respuesta (SDD Iter-2, 18.4). Omite bloques OPCIONALES completos
+    (primero el Gráfico, luego el Desglose), nunca los trunca; `Dato`, `Cuenta`,
+    respuesta y disclaimer no se omiten. `None` -> el handler envía
+    `EXPLAIN_UNAVAILABLE_MSG`. La nota de recorte se agrega acá, DESPUÉS de los
+    guards."""
+
+    def restante(g: Optional[str], d: Optional[str]) -> int:
+        base = _build_leaf_message(dato_line, "", formula, fuente, cuenta=cuenta, desglose=d, grafico=g)
+        return _TELEGRAM_LIMIT - _MARGEN_TELEGRAM - _len16(base)
+
+    def omitir(motivo: str) -> None:
+        logger.info("GEMINI_ENTREGA_OMITIDA motivo=%s chars=%d", motivo, _len16(respuesta))
+
+    g, d = grafico, desglose
+    r = restante(g, d)
+    if r < _MIN_RESPUESTA_CHARS and g:
+        g = None
+        r = restante(g, d)
+    if r < _MIN_RESPUESTA_CHARS and d:
+        d = None
+        r = restante(g, d)
+    if r < 0:
+        omitir("presupuesto")
+        return None
+    if _len16(respuesta) <= min(_MAX_RESPUESTA_CHARS, r):
+        cuerpo = respuesta
+    else:
+        if r < _MIN_RESPUESTA_CHARS:
+            omitir("presupuesto")
+            return None
+        res = _fit_respuesta(respuesta, min(_MAX_RESPUESTA_CHARS, r - _len16("\n\n" + _NOTA_ACORTADA)))
+        if res is None:
+            omitir("sin_corte")
+            return None
+        cuerpo = res + "\n\n" + _NOTA_ACORTADA
+    msg = _build_leaf_message(dato_line, cuerpo, formula, fuente, cuenta=cuenta, desglose=d, grafico=g)
+    if _len16(msg) > _TELEGRAM_LIMIT:
+        omitir("presupuesto")
+        return None
+    return msg
 
 
 _NUMERIC_TOKEN_RE = re.compile(r"^[+-]?\$?\d[\d.,]*%?$")
@@ -2050,6 +2612,30 @@ def _percent_token_a_decimal(token: str) -> Optional[str]:
     return repr(value / 100)
 
 
+def _compute_datos_tokens(datos_crudos: dict, datos_presentados: Optional[dict] = None) -> set[str]:
+    """Conjunto de tokens protegidos que el guard acepta en la respuesta.
+
+    Única implementación, usada por el handler y por `scripts/gemini_smoke.py`
+    (SDD Iter-2, CS-25b). Con `datos_presentados=None` es EXACTAMENTE el
+    cálculo de HEAD: tokens de `json.dumps(crudo, ensure_ascii=False,
+    default=str)` sin redondear. Con `datos_presentados` es la unión (nunca
+    reemplaza) con los tokens del payload presentado al modelo."""
+    tokens = {
+        _normalize_numeric_token(token)
+        for token in ai_rewrite.protected_tokens(
+            json.dumps(datos_crudos, ensure_ascii=False, default=str)
+        )
+    }
+    if datos_presentados is not None:
+        tokens |= {
+            _normalize_numeric_token(token)
+            for token in ai_rewrite.protected_tokens(
+                json.dumps(datos_presentados, ensure_ascii=False, default=str)
+            )
+        }
+    return tokens
+
+
 def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
     respuesta_tokens = {
         _normalize_numeric_token(token) for token in ai_rewrite.protected_tokens(respuesta)
@@ -2065,6 +2651,12 @@ def _no_new_protected_tokens(datos_tokens: set[str], respuesta: str) -> bool:
 
 
 _GUARD_LOG_MAX_CHARS = 500
+
+
+def _log_guard_reject_contadores(guard: str, chars: int) -> None:
+    """Rechazos nuevos (`largo`/`escala`/`vacio`): solo contadores enteros,
+    nunca el texto del modelo (SDD Iter-2, CS-23a)."""
+    logger.warning("GEMINI_GUARD_REJECT feature=explain guard=%s chars=%d", guard, chars)
 
 
 class _ExplainUnavailable(Exception):
@@ -2108,22 +2700,36 @@ async def _fetch_explanation(
     except GeminiError:
         raise _ExplainUnavailable() from None
 
-    respuesta = result.text
-    # Guard de números + filtro de salida, ANTES de `_enforce_brevity` (una
-    # URL pasada la posición 480 también se rechaza).
-    guard = None
+    # Pipeline fijo (SDD Iter-2, CS-24a): tope crudo -> normalizar -> guard de
+    # números -> guard de escala -> filtro de salida -> devolver el texto
+    # NORMALIZADO sin cortar (el recorte es de `_fit_leaf_message`). Los guards
+    # corren sobre lo mismo que se entrega.
+    crudo = result.text
+    largo_crudo = len(crudo)
+    if largo_crudo > _MAX_RAW_CHARS:
+        _log_guard_reject_contadores("largo", largo_crudo)
+        raise _ExplainUnavailable()
+    respuesta = _normalize_layout(crudo)
+    if respuesta == "":
+        _log_guard_reject_contadores("vacio", largo_crudo)
+        raise _ExplainUnavailable()
     if not _no_new_protected_tokens(datos_tokens, respuesta):
         guard = "numeros"
+    elif not _escalas_consistentes(datos_del_contexto, respuesta):
+        _log_guard_reject_contadores("escala", len(respuesta))
+        raise _ExplainUnavailable()
     elif violates_output_filter(respuesta):
         guard = "salida"
-    if guard is not None:
-        logger.warning(
-            "GEMINI_GUARD_REJECT feature=explain guard=%s respuesta=%s",
-            guard,
-            _sanitize_for_log(respuesta)[:_GUARD_LOG_MAX_CHARS],
-        )
-        raise _ExplainUnavailable()
-    return _enforce_brevity(respuesta)
+    else:
+        return respuesta
+    logger.warning(
+        "GEMINI_GUARD_REJECT feature=explain guard=%s respuesta=%s",
+        guard,
+        _safe_display(
+            _sanitize_for_log(respuesta), max_chars=_GUARD_LOG_MAX_CHARS, keep_newlines=False
+        ),
+    )
+    raise _ExplainUnavailable()
 
 
 # --- Teclados (Nivel 1 / Nivel 2 — Decisión de diseño #1/#2/#3, extendidos
@@ -2361,12 +2967,12 @@ async def _dispatch_leaf(
             # dato garantizado, nunca la genera.
             datos_del_contexto["cuenta"] = cuenta
 
-    datos_tokens = {
-        _normalize_numeric_token(token)
-        for token in ai_rewrite.protected_tokens(
-            json.dumps(datos_del_contexto, ensure_ascii=False, default=str)
-        )
-    }
+    # `datos_del_contexto` queda CRUDO para Dato/Cuenta/Desglose (CA-81); al
+    # modelo viaja una COPIA presentada (`$1,234.56`, `15.3%`) con los campos
+    # derivados de `vf`/`ver` ya calculados en Python, y `datos_tokens` es la
+    # unión de ambos (SDD Iter-2, QB-9/A3).
+    datos_modelo = _datos_para_el_modelo(question_code, datos_del_contexto)
+    datos_tokens = _compute_datos_tokens(datos_del_contexto, datos_modelo)
     config = clients.gemini_config or GeminiConfig()
 
     pensando = await bot.send_message(chat_id=chat_id, text=EXPLAIN_PENDING_MSG)
@@ -2384,7 +2990,7 @@ async def _dispatch_leaf(
             config=config,
             question_code=question_code,
             pregunta_fija=pregunta_fija,
-            datos_del_contexto=datos_del_contexto,
+            datos_del_contexto=datos_modelo,
             datos_tokens=datos_tokens,
             system_prompt=system_prompt,
         )
@@ -2398,7 +3004,25 @@ async def _dispatch_leaf(
     formula = ai_explain_content.formulas(stored.kind).get(question_code)
     fuente = ai_explain_content.fuentes(stored.kind).get(question_code)
     desglose = _build_desglose_block(stored.kind, question_code, datos_del_contexto, context=stored)
-    texto = _build_leaf_message(dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose)
+    # Gráfico (F2): se arma DESPUÉS de la respuesta, con una COPIA del `datos`
+    # crudo (+ `precio_actual` del contexto para gra/dcf/mul, cuyo payload no lo
+    # trae); jamás entra a `datos_del_contexto`, `datos_tokens` ni al modelo.
+    constructor_grafico = _GRAFICO_POR_PREGUNTA.get(question_code)
+    grafico = None
+    if constructor_grafico is not None:
+        datos_grafico = dict(datos_del_contexto)
+        datos_grafico.setdefault("precio_actual", stored.precio_actual)
+        grafico = constructor_grafico(datos_grafico)
+    texto = _fit_leaf_message(
+        dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=desglose, grafico=grafico
+    )
+    if texto is None:
+        # Sin presupuesto o sin corte válido: nunca se envía >4096 ni un texto a
+        # medias -- mismo mensaje que cualquier otro fallo de la explicación.
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=pensando.message_id, text=EXPLAIN_UNAVAILABLE_MSG
+        )
+        return
     try:
         await bot.edit_message_text(
             chat_id=chat_id, message_id=pensando.message_id, text=texto, reply_markup=reply_markup

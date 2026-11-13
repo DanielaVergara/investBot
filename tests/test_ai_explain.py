@@ -974,27 +974,27 @@ def test_guard_extendido_rechaza_alucinacion_en_los_20_codes_nuevos(question_cod
 
 
 # ---------------------------------------------------------------------------
-# F. `_enforce_brevity` (sin cambios de mecanismo)
+# F. `_fit_respuesta` (reemplaza al antiguo tope de 480 -- SDD Iter-2, 17.3)
 # ---------------------------------------------------------------------------
 
 
-def test_enforce_brevity_texto_corto_se_devuelve_sin_modificar():
+def test_fit_respuesta_texto_corto_se_devuelve_sin_modificar():
     texto = "Una explicación breve."
-    assert ai_explain._enforce_brevity(texto) == texto
+    assert ai_explain._fit_respuesta(texto, ai_explain._MAX_RESPUESTA_CHARS) == texto
 
 
-def test_enforce_brevity_texto_largo_con_punto_corta_en_ultimo_punto():
-    relleno = "Dato. " * 200
-    resultado = ai_explain._enforce_brevity(relleno)
-    assert len(resultado) <= ai_explain._MAX_EXPLANATION_CHARS
+def test_fit_respuesta_texto_largo_corta_en_ultimo_fin_de_oracion():
+    relleno = "Dato. " * 400
+    resultado = ai_explain._fit_respuesta(relleno, ai_explain._MAX_RESPUESTA_CHARS)
+    assert len(resultado) <= ai_explain._MAX_RESPUESTA_CHARS
     assert resultado.endswith(".")
     assert "…" not in resultado
 
 
-def test_enforce_brevity_texto_largo_sin_punto_corte_duro_con_puntos_suspensivos():
-    relleno = "X" * (ai_explain._MAX_EXPLANATION_CHARS + 50)
-    resultado = ai_explain._enforce_brevity(relleno)
-    assert resultado == relleno[: ai_explain._MAX_EXPLANATION_CHARS] + "…"
+def test_fit_respuesta_sin_corte_valido_devuelve_none():
+    # Cambio de comportamiento deliberado (16.5-D): jamás se corta en un espacio ni se agrega "…".
+    relleno = "X" * (ai_explain._MAX_RESPUESTA_CHARS + 50)
+    assert ai_explain._fit_respuesta(relleno, ai_explain._MAX_RESPUESTA_CHARS) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1080,10 +1080,7 @@ _DATOS_EVIDENCIA_REAL = {
 def _tokens_de(datos: dict) -> set[str]:
     """Mismo cálculo que `_dispatch_leaf` hace en producción antes de
     llamar a `_fetch_explanation`."""
-    return {
-        ai_explain._normalize_numeric_token(t)
-        for t in ai_rewrite.protected_tokens(json.dumps(datos, ensure_ascii=False, default=str))
-    }
+    return ai_explain._compute_datos_tokens(datos, None)
 
 
 async def test_fetch_explanation_respuesta_limpia_sin_eco_pasa_normal():
@@ -1646,7 +1643,7 @@ def test_mensajes_no_revelan_infraestructura():
 def test_system_prompt_explain_pide_texto_plano_con_marcador_y_brevedad():
     """El prompt pide texto plano (sin objeto JSON de salida)."""
     assert "{\"respuesta\"" not in ai_explain.SYSTEM_PROMPT_EXPLAIN
-    assert "2 a 4 oraciones" in ai_explain.SYSTEM_PROMPT_EXPLAIN
+    assert "2 a 4 oraciones" not in ai_explain.SYSTEM_PROMPT_EXPLAIN
 
 
 def test_system_prompt_explain_regla_5_pide_nombrar_el_modelo():
@@ -4026,11 +4023,12 @@ def test_build_desglose_vf_ticker_e_peor_caso_montos_extremos_bajo_el_tope():
     dato_line = ai_explain._build_dato_line("texto_libre", "vf", datos_vf)
     formula = ai_explain_content.formulas("texto_libre").get("vf")
     fuente = ai_explain_content.fuentes("texto_libre").get("vf")
-    respuesta = "x" * ai_explain._MAX_EXPLANATION_CHARS
-    mensaje_completo = ai_explain._build_leaf_message(
+    respuesta = "Dato. " * 300
+    mensaje_completo = ai_explain._fit_leaf_message(
         dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=bloque,
     )
-    assert len(mensaje_completo) <= TELEGRAM_MESSAGE_LIMIT
+    assert mensaje_completo is not None
+    assert ai_explain._len16(mensaje_completo) <= TELEGRAM_MESSAGE_LIMIT
 
 
 def test_build_desglose_vf_excepcion_en_un_sub_modelo_cae_a_no_calculable(monkeypatch):
@@ -4636,11 +4634,12 @@ def test_build_desglose_block_dcf_peor_caso_montos_extremos_bajo_el_tope():
     dato_line = ai_explain._build_dato_line("texto_libre", "dcf", datos)
     formula = ai_explain_content.formulas("texto_libre").get("dcf")
     fuente = ai_explain_content.fuentes("texto_libre").get("dcf")
-    respuesta = "x" * ai_explain._MAX_EXPLANATION_CHARS
-    mensaje_completo = ai_explain._build_leaf_message(
+    respuesta = "Dato. " * 300
+    mensaje_completo = ai_explain._fit_leaf_message(
         dato_line, respuesta, formula, fuente, cuenta=cuenta, desglose=bloque,
     )
-    assert len(mensaje_completo) < TELEGRAM_MESSAGE_LIMIT
+    assert mensaje_completo is not None
+    assert ai_explain._len16(mensaje_completo) < TELEGRAM_MESSAGE_LIMIT
 
 
 # --- Funciones puras, sin I/O (extendido a las 13 preguntas nuevas) -------
@@ -5142,12 +5141,13 @@ async def test_cs5_fetch_explanation_acepta_los_controles_positivos():
     assert await ai_explain._fetch_explanation(**_fetch_kwargs(http_client=client)) == texto
 
 
-async def test_cs5_el_filtro_corre_antes_de_enforce_brevity_url_pasada_la_posicion_480():
-    relleno = "una frase de relleno sin datos. " * 16  # 512 caracteres, termina en ". "
-    assert len(relleno) > ai_explain._MAX_EXPLANATION_CHARS
+async def test_cs5_el_filtro_corre_sobre_el_texto_completo_url_pasada_la_posicion_1800():
+    relleno = "una frase de relleno sin datos. " * 60  # 1920 caracteres, termina en ". "
+    assert ai_explain._MAX_RESPUESTA_CHARS < len(relleno) < ai_explain._MAX_RAW_CHARS
     texto = relleno + "mirá http://evil.example/x"
-    # Control: `_enforce_brevity` por sí sola recortaría la URL y la dejaría pasar.
-    assert "http://" not in ai_explain._enforce_brevity(texto)
+    # Control: `_fit_respuesta` por sí sola recortaría la URL (o no entregaría nada) y la dejaría pasar.
+    recortado = ai_explain._fit_respuesta(texto, ai_explain._MAX_RESPUESTA_CHARS)
+    assert recortado is None or "http://" not in recortado
     client = _client_with_handler(_ok_handler(texto))
     with pytest.raises(ai_explain._ExplainUnavailable):
         await ai_explain._fetch_explanation(**_fetch_kwargs(http_client=client))
@@ -5559,13 +5559,13 @@ def test_ca65_ai_explain_no_usa_asyncclient_ni_httpx():
 
 
 @pytest.mark.parametrize("nombre", ["SYSTEM_PROMPT_EXPLAIN", "SYSTEM_PROMPT_PASO_A_PASO"])
-def test_ca67_prompts_reglas_1_a_6_contiguas_y_contenido(nombre):
+def test_ca67_prompts_reglas_1_a_7_contiguas_y_contenido(nombre):
     prompt = getattr(ai_explain, nombre)
     numeros = [int(m.group(1)) for m in re.finditer(r"(?m)^(\d+)\. ", prompt)]
-    assert numeros == [1, 2, 3, 4, 5, 6]
+    assert numeros == [1, 2, 3, 4, 5, 6, 7]
     assert "5." in prompt and "modelo" in prompt
-    assert "Copiá los números exactamente como aparecen en el JSON" in prompt
-    assert "mismo formato, punto decimal, sin separador de miles" in prompt.replace("\n   ", " ")
+    assert "copialos" in prompt.replace("\n   ", " ")
+    assert "exactamente como están, con su símbolo y sus decimales" in prompt.replace("\n   ", " ")
     assert "español rioplatense" in prompt
     for prohibido in ("###" + "RESPUESTA" + "###", '{"respuesta"', "portugués"):
         assert prohibido not in prompt
@@ -5578,11 +5578,11 @@ def test_ca67_paso_a_paso_conserva_cuenta_y_ya_esta_calculada():
     assert "YA ESTÁ CALCULADA" in ai_explain.SYSTEM_PROMPT_PASO_A_PASO
 
 
-def test_ca11_tope_de_tokens_de_explicaciones_es_1024():
-    assert ai_explain.MAX_EXPLANATION_OUTPUT_TOKENS == 1024
+def test_ca11_tope_de_tokens_de_explicaciones_es_2048():
+    assert ai_explain.MAX_EXPLANATION_OUTPUT_TOKENS == 2048
 
 
-async def test_ca11_fetch_explanation_usa_1024_tokens_timeout_configurado_y_un_reintento(
+async def test_ca11_fetch_explanation_usa_2048_tokens_timeout_configurado_y_un_reintento(
     gemini_sleeps,
 ):
     capturas = []
@@ -5599,7 +5599,7 @@ async def test_ca11_fetch_explanation_usa_1024_tokens_timeout_configurado_y_un_r
     )
     assert len(capturas) == 2 and gemini_sleeps.calls == [1.0]
     body = request_body(capturas[0])
-    assert body["generationConfig"]["maxOutputTokens"] == 1024
+    assert body["generationConfig"]["maxOutputTokens"] == 2048
     assert capturas[0].extensions["timeout"]["read"] == 9.5
 
 

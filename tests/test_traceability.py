@@ -29,7 +29,16 @@ NAME_RE = re.compile(r"^test_(ca|cs)(\d+)(?=_|$)")
 S7_PREFIX = "test_ca_s7_"
 
 CA_AUTO = (*range(1, 7), *range(8, 22), *range(23, 49), *range(65, 70))
+# SDD_redaccion_gemini_iter2.md 17.4: F1 agrega CA-70..CA-85 (len(CA_AUTO) == 67).
+CA_AUTO = (*CA_AUTO, *range(70, 86))
 CS_AUTO = (1, 2, 3, 4, 5, 6, 13, 16, 17, 18, 19, 21, 22)
+# SDD_redaccion_gemini_iter2.md 17.4: F0 agrega CS-25 (b) y CS-28 (len(CS_AUTO) == 15).
+CS_AUTO = (*CS_AUTO, 25, 28)
+# F1 agrega CS-23, 24, 26, 29, 30, 31, 32, 33, 34, 35, 36 (len(CS_AUTO) == 26).
+CS_AUTO = (*CS_AUTO, 23, 24, 26, 29, 30, 31, 32, 33, 34, 35, 36)
+# F2 agrega CA-86..CA-88 y CS-27 (barras Unicode).
+CA_AUTO = (*CA_AUTO, 86, 87, 88)
+CS_AUTO = (*CS_AUTO, 27)
 CA_REEMPLAZADOS = (7, 22, 49)  # fuera de la lista: reemplazados por CS-1, CS-3, CS-16
 
 
@@ -154,8 +163,8 @@ def test_ca64_el_detector_encuentra_los_faltantes_control_positivo():
 
 def test_ca64_los_reemplazados_quedan_fuera_de_la_lista_auto():
     assert 7 not in CA_AUTO and 22 not in CA_AUTO and 49 not in CA_AUTO
-    assert len(CA_AUTO) == 6 + 14 + 26 + 5
-    assert len(CS_AUTO) == 13
+    assert len(CA_AUTO) == 6 + 14 + 26 + 5 + 16 + 3
+    assert len(CS_AUTO) == 15 + 11 + 1
 
 
 # --- Manifiestos de tests conservados (aserciones minimas de HEAD 957f11d) ------------
@@ -293,9 +302,9 @@ M_CA42_BOT = ("test_bot.py", {
 })
 
 M_BREV = ("test_ai_explain.py", {
-    "test_enforce_brevity_texto_corto_se_devuelve_sin_modificar": 1,
-    "test_enforce_brevity_texto_largo_con_punto_corta_en_ultimo_punto": 3,
-    "test_enforce_brevity_texto_largo_sin_punto_corte_duro_con_puntos_suspensivos": 1,
+    "test_fit_respuesta_texto_corto_se_devuelve_sin_modificar": 1,
+    "test_fit_respuesta_texto_largo_corta_en_ultimo_fin_de_oracion": 3,
+    "test_fit_respuesta_sin_corte_valido_devuelve_none": 1,
 })
 
 
@@ -333,7 +342,7 @@ def test_ca42_contexto_atado_a_chat_id_store_y_gate_fail_closed_conservados():
     assert sum(M_CA42_STORE[1].values()) == 13
 
 
-def test_enforce_brevity_conservado_sin_perder_aserciones():
+def test_fit_respuesta_conservado_sin_perder_aserciones():
     archivo, manifiesto = M_BREV
     assert len(manifiesto) == 3 and sum(manifiesto.values()) == 5
     assert _verificar_manifiesto(archivo, manifiesto) == []

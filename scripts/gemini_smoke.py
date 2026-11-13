@@ -6,7 +6,13 @@ NO es un test de pytest, NO se importa desde `src` y NO entra a la imagen (el
 propia, desde la raíz del repo:
 
     GEMINI_LIVE_KEY=<key de pruebas> GEMINI_LIVE_CONFIRM=yes \\
-        python scripts/gemini_smoke.py [--explain-reps 5] [--rewrite-samples 10] [--rewrite-reps 3]
+        python scripts/gemini_smoke.py [--explain-reps 5] [--rewrite-samples 10] [--rewrite-reps 3] \\
+            [--show-text [--show-text-max 6]] [--thinking {minimal,low}]
+
+`--show-text` (apagado por defecto; SDD Iter-2 CS-28 C1-C9) imprime el texto de
+las explicaciones del modelo (nunca del rewrite) SOLO tras `_safe_display` (lista
+blanca de categorías Unicode, tope de caracteres y de líneas) y nunca imprime un
+texto que el filtro de salida rechaza. No escribe archivos.
 
 Corre el camino REAL de las explicaciones (handler `xp:` -> `_fetch_explanation`)
 y del rewrite (`rewrite_parts`) con contextos 100% SINTÉTICOS con canarios
@@ -32,6 +38,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import sys
 import time
 from os import environ
@@ -43,6 +50,10 @@ import httpx
 
 CALL_LIMIT = 150
 UNAVAILABLE_RC = 2
+SHOW_TEXT_DEFAULT = 6
+SHOW_TEXT_MAX = 30
+SHOW_TEXT_CHARS = 2500
+THINKING_CHOICES = ("minimal", "low")
 
 # Tokens de razón fijos de las guardas (nunca contienen valores).
 GUARD_OK = "GUARD_OK"
@@ -164,6 +175,13 @@ def _p95(values: list[int]) -> Optional[int]:
     return ordered[max(math.ceil(0.95 * len(ordered)) - 1, 0)]
 
 
+def _p50(values: list[int]) -> Optional[int]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(math.ceil(0.5 * len(ordered)) - 1, 0)]
+
+
 def _verdict(ok: bool) -> str:
     return "PASA" if ok else "FALLA"
 
@@ -245,8 +263,9 @@ def _avanzado_context(ai_explain, chat_id: int):
     )
 
 
-# CA-S1: 8 preguntas representativas. `pio` de la spec = Piotroski (`pig`).
-_EXPLAIN_QUESTIONS = ("mod", "ben", "ren", "ver", "gra", "dcf", "rsk", "pig")
+# CA-S1: 10 preguntas representativas (QB-8: se agregan `vf` y `alz`). `pio` de
+# la spec = Piotroski (`pig`).
+_EXPLAIN_QUESTIONS = ("mod", "ben", "ren", "ver", "gra", "dcf", "rsk", "pig", "vf", "alz")
 _EN_STOPWORDS = frozenset({"the", "and", "is", "of", "with", "this", "that", "are", "for"})
 
 
@@ -260,6 +279,59 @@ def _looks_non_spanish(text: str) -> bool:
 def _looks_like_echo(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith("{") or '"pregunta"' in text or '"datos"' in text
+
+
+# Métricas de redacción (SDD Iter-2, 17.8): regex PROPIAS sobre el texto crudo del
+# modelo, sin importar el normalizador ni las etiquetas del código de producción:
+# así el MISMO script mide el baseline (prompts viejos) y el nuevo.
+_ETIQUETAS_RE = (
+    re.compile(r"^💡 En simple[ \t]*$", re.MULTILINE),
+    re.compile(r"^🔎 (?:Qué es cada pieza|Qué dicen los datos)[ \t]*$", re.MULTILINE),
+    re.compile(r"^🧭 (?:Qué significa el resultado|Cómo leerlo)[ \t]*$", re.MULTILINE),
+)
+_MARKDOWN_RE = re.compile(r"\*\*|__|`|^[ \t]*#{1,6}[ \t]|^[ \t]*[*\-][ \t]", re.MULTILINE)
+_SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+
+
+def _etiquetas_conformes(text: str) -> bool:
+    return all(rx.search(text) for rx in _ETIQUETAS_RE)
+
+
+def _tiene_markdown(text: str) -> bool:
+    return _MARKDOWN_RE.search(text) is not None
+
+
+def _tiene_snake_case(text: str) -> bool:
+    return _SNAKE_CASE_RE.search(text) is not None
+
+
+def _direccion_contradice(text: str, posicion: Optional[str]) -> bool:
+    """Alarma heurística de dirección en `vf`/`ver` (SDD Iter-2, 17.8): el
+    texto dice "por debajo" con `posicion_vs_precio == "por encima"` (o al
+    revés) y no menciona la dirección correcta. No es un veredicto: la
+    revisión manual con `--show-text` sigue siendo la que decide."""
+    if posicion not in ("por encima", "por debajo"):
+        return False
+    otra = "por debajo" if posicion == "por encima" else "por encima"
+    bajo = text.lower()
+    return otra in bajo and posicion not in bajo
+
+
+def _razon_de_rechazo(ai_explain, tokens: set, datos_modelo: dict, text: str) -> str:
+    """Clasifica un rechazo con el MISMO orden que el pipeline de
+    `_fetch_explanation`: largo -> vacio -> numeros -> escala -> salida."""
+    if len(text) > ai_explain._MAX_RAW_CHARS:
+        return "largo"
+    normalizado = ai_explain._normalize_layout(text)
+    if normalizado == "":
+        return "vacio"
+    if not ai_explain._no_new_protected_tokens(tokens, normalizado):
+        return "guard_numeros"
+    if not ai_explain._escalas_consistentes(datos_modelo, normalizado):
+        return "guard_escala"
+    if ai_explain.gemini_client.violates_output_filter(normalizado):
+        return "filtro_salida"
+    return "otro"
 
 
 # --- Corrida -----------------------------------------------------------------
@@ -331,6 +403,31 @@ def _synthetic_summaries(summary, n: int) -> list[list[str]]:
 async def _run(
     explain_reps: int, rewrite_samples: int, rewrite_reps: int,
     env: Mapping[str, str], client_factory: Callable[[], httpx.AsyncClient],
+    show_text: bool = False, show_text_max: int = SHOW_TEXT_DEFAULT,
+    thinking: Optional[str] = None,
+) -> int:
+    # C8 (corrige E10): el logger `investbot` queda en WARNING pero sin handler,
+    # `logging.lastResort` imprimiría a stderr el `GEMINI_GUARD_REJECT ... respuesta=`.
+    # Un NullHandler con `propagate=False` lo evita; se restaura al salir.
+    inv_logger = logging.getLogger("investbot")
+    null_handler = logging.NullHandler()
+    propagate_antes = inv_logger.propagate
+    inv_logger.addHandler(null_handler)
+    inv_logger.propagate = False
+    try:
+        return await _run_impl(
+            explain_reps, rewrite_samples, rewrite_reps, env, client_factory,
+            show_text, show_text_max, thinking,
+        )
+    finally:
+        inv_logger.removeHandler(null_handler)
+        inv_logger.propagate = propagate_antes
+
+
+async def _run_impl(
+    explain_reps: int, rewrite_samples: int, rewrite_reps: int,
+    env: Mapping[str, str], client_factory: Callable[[], httpx.AsyncClient],
+    show_text: bool, show_text_max: int, thinking: Optional[str],
 ) -> int:
     for name in ("httpx", "httpcore", "investbot"):
         logging.getLogger(name).setLevel(logging.WARNING)
@@ -339,9 +436,10 @@ async def _run(
     from investbot import ai_explain, ai_explain_content, ai_rewrite, gemini_client, summary
 
     # Config EXPLÍCITA desde GEMINI_LIVE_KEY (env armado a mano, no el entorno completo).
-    config = gemini_client.load_config(
-        {gemini_client.ENV_API_KEY: env["GEMINI_LIVE_KEY"], gemini_client.ENV_REWRITE_ENABLED: "true"}
-    )
+    config_env = {gemini_client.ENV_API_KEY: env["GEMINI_LIVE_KEY"], gemini_client.ENV_REWRITE_ENABLED: "true"}
+    if thinking is not None:  # solo sobre ESTE mapping armado a mano; nada se toca en el proceso
+        config_env[gemini_client.ENV_THINKING_LEVEL] = thinking
+    config = gemini_client.load_config(config_env)
     if not config.enabled:
         print("ABORTADO: CONFIG_INVALIDA (GEMINI_LIVE_KEY no cumple el formato esperado)")
         return 3
@@ -358,6 +456,7 @@ async def _run(
     store = ai_explain.ExplanationContextStore()
     explain_rows: dict[str, dict[str, Any]] = {}
     exit_code = 0
+    shown_header = False
 
     async with client_factory() as raw_client:
         metered = _MeteredClient(raw_client, budget)
@@ -368,18 +467,18 @@ async def _run(
             spec = questions[code]
             ctx = av_ctx if code in ai_explain_content.QUESTIONS_AVANZADO else tl_ctx
             row = {"n": 0, "ok200": 0, "accepted": 0, "max_tokens": 0, "echo": 0, "non_es": 0,
-                   "truncated": 0, "reasons": {}, "ms": [], "finish": {}, "thoughts": [], "served": set()}
+                   "truncated": 0, "reasons": {}, "ms": [], "finish": {}, "thoughts": [], "served": set(),
+                   "stop_texts": 0, "guards_head": 0, "lens": [], "labels_ok": 0, "md": 0, "snake": 0,
+                   "shown": 0, "dir_alarm": 0}
             datos = ai_explain._build_explain_payload(ctx, code)
             if spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO:
                 cuenta = ai_explain._build_cuenta_line(ctx.kind, code, datos)
                 if cuenta is not None:
                     datos["cuenta"] = cuenta
-            import json as _json
-
-            tokens = {
-                ai_explain._normalize_numeric_token(t)
-                for t in ai_rewrite.protected_tokens(_json.dumps(datos, ensure_ascii=False, default=str))
-            }
+            # CS-25b/A3: mismo payload presentado y mismos tokens que el handler.
+            datos_modelo = ai_explain._datos_para_el_modelo(code, datos)
+            tokens = ai_explain._compute_datos_tokens(datos, datos_modelo)
+            posicion = datos_modelo.get("posicion_vs_precio")
             for _ in range(explain_reps):
                 before = len(metered.records)
                 final = await _explain_once(ai_explain, clients, store, ctx, code, spec, chat_id)
@@ -407,20 +506,52 @@ async def _run(
                     text = last["text"] or ""
                     row["echo"] += 1 if _looks_like_echo(text) else 0
                     row["non_es"] += 1 if _looks_non_spanish(text) else 0
-                    row["truncated"] += 1 if len(text) > ai_explain._MAX_EXPLANATION_CHARS else 0
+                    row["truncated"] += 1 if len(text) > ai_explain._MAX_RESPUESTA_CHARS else 0
                 else:
                     text = last["text"]
                     if last["status"] != 200:
                         why = f"http_{last['status']}"
                     elif text is None or last["finish"] != "STOP":
                         why = f"finish_{_fmt(last['finish'])}"
-                    elif not ai_explain._no_new_protected_tokens(tokens, text):
-                        why = "guard_numeros"
-                    elif gemini_client.violates_output_filter(text):
-                        why = "filtro_salida"
                     else:
-                        why = "otro"
+                        why = _razon_de_rechazo(ai_explain, tokens, datos_modelo, text)
                     row["reasons"][why] = row["reasons"].get(why, 0) + 1
+                # Métricas de redacción sobre el texto crudo (solo respuestas completas, STOP).
+                texto_modelo = last["text"] if (
+                    last["status"] == 200 and last["finish"] == "STOP" and isinstance(last["text"], str)
+                ) else None
+                bloqueado_por_filtro = False
+                ocultar_texto = False
+                if texto_modelo is not None:
+                    bloqueado_por_filtro = gemini_client.violates_output_filter(texto_modelo)
+                    # la razón de rechazo se decide sobre el texto NORMALIZADO: ocultar también por él
+                    ocultar_texto = bloqueado_por_filtro or gemini_client.violates_output_filter(
+                        ai_explain._normalize_layout(texto_modelo)
+                    )
+                    row["stop_texts"] += 1
+                    row["lens"].append(len(texto_modelo))
+                    # aceptación por los DOS guards de HEAD (comparable baseline/nuevo)
+                    row["guards_head"] += 1 if (
+                        ai_explain._no_new_protected_tokens(tokens, texto_modelo) and not bloqueado_por_filtro
+                    ) else 0
+                    row["labels_ok"] += 1 if _etiquetas_conformes(texto_modelo) else 0
+                    row["dir_alarm"] += 1 if _direccion_contradice(texto_modelo, posicion) else 0
+                    row["md"] += 1 if _tiene_markdown(texto_modelo) else 0
+                    row["snake"] += 1 if _tiene_snake_case(texto_modelo) else 0
+                # --show-text (C2-C5): solo explicaciones, solo STOP, siempre saneado, y
+                # NUNCA un texto que el filtro de salida rechaza (ni por otra razón).
+                if show_text and texto_modelo is not None and row["shown"] < show_text_max:
+                    if row["shown"] == 0 and not shown_header:
+                        print("=== Textos del modelo (--show-text; sintéticos, saneados) ===")
+                        shown_header = True
+                    row["shown"] += 1
+                    motivo = "ACEPTADO" if accepted else f"RECHAZADO:{why}"
+                    etiqueta = f"[{code} rep {row['n']} {motivo}]"
+                    if ocultar_texto:
+                        print(f"{etiqueta} (texto no mostrado: filtro_salida; chars={len(texto_modelo)})")
+                    else:
+                        print(etiqueta)
+                        print(ai_explain._safe_display(texto_modelo, max_chars=SHOW_TEXT_CHARS))
             explain_rows[code] = row
 
         # CA-S6: rewrite.
@@ -496,10 +627,28 @@ async def _run(
             f"truncadas={r['truncated']} p95ms={_fmt(_p95(r['ms']))} finish={r['finish']} "
             f"thoughts={r['thoughts'][:3]} servido={sorted(r['served'])} rechazos={r['reasons']}"
         )
+        print(
+            f"    [{code}] guards_head={r['guards_head']}/{r['stop_texts']} "
+            f"largo_p50={_fmt(_p50(r['lens']))} largo_p95={_fmt(_p95(r['lens']))} "
+            f"etiquetas_ok={r['labels_ok']}/{r['stop_texts']} markdown={r['md']} snake_case={r['snake']} "
+            f"direccion_alarma={r['dir_alarm']}"
+        )
+    stop_total = sum(r["stop_texts"] for r in explain_rows.values())
+    all_lens = [n for r in explain_rows.values() for n in r["lens"]]
+    all_thoughts = [n for r in explain_rows.values() for n in r["thoughts"]]
+    print(
+        f"  [explicaciones-total] guards_head={sum(r['guards_head'] for r in explain_rows.values())}/{stop_total} "
+        f"largo_p50={_fmt(_p50(all_lens))} largo_p95={_fmt(_p95(all_lens))} "
+        f"etiquetas_ok={sum(r['labels_ok'] for r in explain_rows.values())}/{stop_total} "
+        f"markdown={sum(r['md'] for r in explain_rows.values())} "
+        f"snake_case={sum(r['snake'] for r in explain_rows.values())} "
+        f"direccion_alarma={sum(r['dir_alarm'] for r in explain_rows.values())} "
+        f"tokens_pensamiento_total={sum(all_thoughts)}"
+    )
     s1_ok = bool(explain_rows) and all(r["ok200"] >= 1 for r in explain_rows.values())
     s3_ok &= total_trunc <= max(total_acc // 10, 0)
     p95 = _p95(all_ms)
-    print(f"CA-S1 (8 preguntas, HTTP 200, thinkingLevel aceptado): {_verdict(s1_ok)}")
+    print(f"CA-S1 (10 preguntas, HTTP 200, thinkingLevel aceptado): {_verdict(s1_ok)}")
     print(f"CA-S2 (aceptación del guard >= 90% por pregunta): {_verdict(s2_ok)}")
     print(f"CA-S3 (0 eco, 0 idioma ajeno, 0 MAX_TOKENS, <=1/10 truncadas={total_trunc}/{total_acc}): {_verdict(s3_ok)}")
     print(f"CA-S4 (key falsa -> status {neg_statuses}, explicación y rewrite en fallback): "
@@ -536,11 +685,16 @@ def _parse_args(argv: list[str]) -> Optional[argparse.Namespace]:
     parser.add_argument("--explain-reps", type=int, default=5)
     parser.add_argument("--rewrite-samples", type=int, default=10)
     parser.add_argument("--rewrite-reps", type=int, default=3)
+    parser.add_argument("--show-text", action="store_true", default=False)
+    parser.add_argument("--show-text-max", type=int, default=SHOW_TEXT_DEFAULT)
+    parser.add_argument("--thinking", choices=THINKING_CHOICES, default=None)
     try:
         args = parser.parse_args(argv)
     except (argparse.ArgumentError, SystemExit):
         return None
     if min(args.explain_reps, args.rewrite_samples, args.rewrite_reps) < 1:
+        return None
+    if not 1 <= args.show_text_max <= SHOW_TEXT_MAX:
         return None
     return args
 
@@ -561,7 +715,10 @@ def main(
         return 64
     try:
         return asyncio.run(
-            _run(args.explain_reps, args.rewrite_samples, args.rewrite_reps, env, client_factory)
+            _run(
+                args.explain_reps, args.rewrite_samples, args.rewrite_reps, env, client_factory,
+                show_text=args.show_text, show_text_max=args.show_text_max, thinking=args.thinking,
+            )
         )
     except Exception as exc:  # solo el tipo: nunca el texto (puede traer datos)
         print(f"ABORTADO: ERROR_INESPERADO ({type(exc).__name__})")
