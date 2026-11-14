@@ -212,6 +212,15 @@ Rollback rápido si algo falla: poner `GEMINI_REWRITE_ENABLED=false` y
 problema es solo la reescritura; vaciar `GEMINI_API_KEY` para volver al modo
 100% determinístico.
 
+### Capas de datos opcionales (EDGAR y Finnhub)
+
+`SEC_EDGAR_USER_AGENT` (formato `<app> <email>`, alias dedicado) activa SEC EDGAR
+para estados financieros y 8-K; `FINNHUB_API_KEY` activa Finnhub para peers y
+cotización/perfil. Ambas vacías = todo vía FMP. Rollback y validación previa
+(`scripts/compare_edgar_fmp.py`, imagen `investbot-bot:prev-8b74b58`,
+`docker compose -f docker-compose.prod.yml up -d --no-build --force-recreate`):
+ver la sección "Despliegue" del `README.md`.
+
 ### 4. Rotación de la key
 
 1. Crear la key nueva en AI Studio (mismo proyecto).

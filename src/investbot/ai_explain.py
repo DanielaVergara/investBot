@@ -205,6 +205,12 @@ class ExplanationContext:
     year_low: Optional[float] = None
     price_avg_50: Optional[float] = None
     price_avg_200: Optional[float] = None
+    # --- procedencia para el botón `inf` (F2b, SDD_fuentes_datos_gratuitas.md
+    # CA-23): SOLO la usa `_build_deterministic_content`; ningún payload a
+    # Gemini la lee (CS-25). Los defaults reproducen el texto de siempre.
+    source: str = "fmp"
+    fallback_codes: tuple = ()
+    market_provenance: Optional[dict] = None
     # --- payload específico de /avanzado (kind="avanzado") ---
     sector: Optional[str] = None
     industry: Optional[str] = None
@@ -2083,6 +2089,10 @@ def _build_deterministic_content(context: ExplanationContext, question_code: str
                 income_statement_fuente=context.income_statement_fuente,
                 balance_sheet_fuente=context.balance_sheet_fuente,
                 cash_flow_fuente=context.cash_flow_fuente,
+                source=context.source,
+                fallback_codes=context.fallback_codes,
+                ticker=context.ticker,
+                market_provenance=context.market_provenance,
             )
         )
         return f"{DETERMINISTIC_PREFIX}\n\n{block}"

@@ -415,15 +415,16 @@ def test_calculate_income_statement_ttm_menos_de_4_tres_elementos():
         "netIncome",
         "revenue",
         "costOfRevenue",
-        "interestExpense",
         "incomeTaxExpense",
         "incomeBeforeTax",
     ],
 )
 def test_calculate_income_statement_ttm_campo_faltante_es_atomico(campo):
-    """Diseño atómico (Decisión #9): si CUALQUIERA de los 6 campos falla en
-    1 de los 4 trimestres, el paquete completo se descarta — nunca se
-    mezclan fuentes campo por campo."""
+    """Diseño atómico (Decisión #9): si CUALQUIERA de los 5 campos requeridos
+    falla en 1 de los 4 trimestres, el paquete completo se descarta — nunca se
+    mezclan fuentes campo por campo. (`interestExpense` es la excepción
+    deliberada de SDD_fuentes_datos_gratuitas.md D-8/4.10 pt 4: es opcional y
+    su test vive en tests/test_fdg_f1b4_consumidores.py.)"""
     quarters = _four_quarters({0: {campo: None}})
     result = rules.calculate_income_statement_ttm(quarters)
     assert result.disponible is False

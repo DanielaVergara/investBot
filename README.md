@@ -82,8 +82,10 @@ hasta 3 llamadas extra solo en el peor caso (las 3 fallan a la vez):
 | Datos propios del ticker | **6** | **9** | `/quote`, `/profile`, `/income-statement` (trimestral, TTM + historial), `/balance-sheet-statement` (trimestral), `/cash-flow-statement` (trimestral, TTM + historial), `/key-metrics` |
 | Resolución nombre→ticker (solo si no mandaste el ticker exacto) | 0-1 | 0-1 | `/search` |
 | Peers para el modelo de Múltiplos | 3-5 | 3-5 | `/key-metrics` (anual) por peer — el "3-5" ahora es real: con Finnhub configurado y respondiendo, puede haber hasta 5 candidatos dinámicos (`MAX_PEERS_DINAMICOS`); sin Finnhub (o si no llega al mínimo de 3), son exactamente 3, los del respaldo fijo por sector. **Nota:** si de esos candidatos consultados menos de `MIN_PEERS_VALIDOS_PARA_MULTIPLOS` (2) devuelven un PER válido esta consulta, el modelo de Múltiplos se excluye directamente del promedio de Valor Justo Total (mismo tratamiento que el resto de exclusiones de datos insuficientes) — no se muestra un número calculado con una muestra de 1 solo peer, que podría no ser representativo del negocio (`SDD_calidad_peers_multiplos.md`). No agrega ninguna llamada adicional: el chequeo es sobre datos ya obtenidos. |
-| Contexto de mercado (VIX, no depende del ticker consultado) | 1 | 1 | `/quote (symbol=^VIX)` |
+| Contexto de mercado (VIX, no depende del ticker consultado) | 0 | 0 | El VIX **ya no viene de FMP** (ya no se usa `^VIX`): viene de FRED, proveedor aparte que no consume el cupo de FMP. Sin `FRED_API_KEY` el VIX queda N/D. |
 | **Total por consulta completa** | **10-13** | **13-16** | |
+
+*(Los totales de arriba son cotas conservadoras: ya no incluyen la llamada del VIX, y con EDGAR/Finnhub activos varias de las llamadas propias del ticker se sirven fuera de FMP, así que el consumo real de FMP es menor o igual.)*
 
 En el caso típico (las 3 fuentes trimestrales responden), el presupuesto de
 requests no cambia respecto a la versión anterior del bot: 10-13 por
@@ -149,6 +151,31 @@ proveedores completamente aparte** — ninguna de las 2 features nuevas
 consume el presupuesto de 250 req/día de FMP, mismo principio que FRED/
 Treasury.gov (ver secciones dedicadas más abajo).
 
+## Fuentes de datos actuales (resumen por capa)
+
+Cada dato se pide primero a una fuente gratuita y cae a la siguiente si falla;
+nunca se mezclan dos fuentes para un mismo bloque en la misma consulta.
+
+| Bloque | Fuente primaria | Respaldo |
+|---|---|---|
+| Estados financieros (trimestrales, TTM, balance, flujo) | **SEC EDGAR** (XBRL, requiere `SEC_EDGAR_USER_AGENT`) | FMP |
+| Cotización, perfil, beta, rango de 52 semanas | **Finnhub** (opt-in, requiere `FINNHUB_API_KEY`, uso personal según sus términos, header `X-Finnhub-Token`) | FMP |
+| VIX y bono a 20 años | **FRED** (`FRED_API_KEY`) | bono: Treasury.gov; VIX: N/D |
+| Sector | Tabla SIC → sector (código SIC que informa EDGAR) | sector de FMP |
+| Peers | Finnhub | lista fija por sector |
+| Eventos corporativos | SEC EDGAR (8-K) | se omite la sección |
+
+- **Procedencia por bloque:** el mensaje indica de qué fuente salió cada bloque
+  de datos de esa consulta.
+- **N/D en vez de ceros:** un dato que ninguna fuente pudo entregar se muestra
+  como N/D; nunca se inventa un 0.
+- **Log por consulta:** `fundamentals ticker=<T> source=<sec_edgar|fmp> fallback=<códigos o ->`.
+- **Límites conocidos:** las empresas fuera de EEUU (sin 10-K/10-Q en EDGAR) y
+  los bancos (taxonomía XBRL distinta) caen a FMP; los promedios móviles de
+  50/200 días quedan N/D.
+- **Kill-switch:** dejar `SEC_EDGAR_USER_AGENT` o `FINNHUB_API_KEY` vacías
+  desactiva esa capa (ver "Rollback" en Despliegue).
+
 ## Fuente de Y (tasa libre de riesgo, bono del tesoro EEUU 20 años)
 
 **No viene de FMP.** Fuente primaria: **FRED** (Federal Reserve Economic
@@ -208,9 +235,13 @@ relevante (`1.01`, `1.02`, `1.03`, `5.02`, `8.01`).
 
 **Rate limit: 10 req/seg por IP, sin límite diario.** Requiere el header
 `User-Agent` con contacto identificable (`SEC_EDGAR_USER_AGENT`, formato
-`"<nombre/app> <email de contacto>"`) — no es opcional, es un requisito de
-acceso justo de la SEC. Si `SEC_EDGAR_USER_AGENT` no está configurada, la
-feature completa se omite (nunca se manda una request sin el header).
+`"<app> <email>"`, sin barra ni paréntesis) — no es opcional, es un requisito
+de acceso justo de la SEC. Usá un alias de correo dedicado. Ejemplo literal
+(placeholder que el bot rechaza a propósito): `"InvestBot contacto@ejemplo.com"`.
+Si `SEC_EDGAR_USER_AGENT` no está configurada o es inválida (dominio de
+ejemplo, `tu-correo`, formato incorrecto), la feature completa se omite (nunca
+se manda una request sin header válido) y el arranque deja un `ERROR` sin el
+valor.
 
 **El bot NO resume el contenido legal del 8-K con NLP/LLM** — decisión
 explícita: un resumen incorrecto de un litigio o un cambio de gerencia es
@@ -338,9 +369,9 @@ no entra a la imagen Docker.
 
 ```
 Daniela (Telegram) <--long polling--> investbot-bot (Docker) --HTTPS--> FMP
-                                                          `----HTTPS--> FRED / Treasury.gov
-                                                          `----HTTPS--> Finnhub (opcional, peers dinámicos)
-                                                          `----HTTPS--> SEC EDGAR (opcional, eventos corporativos)
+                                                          `----HTTPS--> FRED (VIX, bono 20 años) / Treasury.gov
+                                                          `----HTTPS--> Finnhub (opcional, peers + cotización/perfil)
+                                                          `----HTTPS--> SEC EDGAR (opcional, estados financieros + eventos 8-K)
                                                           `----HTTPS--> Google Gemini (opcional, explicaciones y redacción)
                                                           `----lectura/escritura--> SQLite (volumen)
 ```
@@ -357,7 +388,7 @@ pip install -r requirements-dev.txt
 cp .env.example .env
 # completar TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_ID, FMP_API_KEY, FRED_API_KEY
 # FINNHUB_API_KEY y SEC_EDGAR_USER_AGENT son opcionales — sin ellas el bot
-# arranca igual, solo se omiten peers dinámicos / eventos corporativos.
+# arranca igual con FMP, solo se omiten peers dinámicos / EDGAR (estados financieros y eventos).
 
 python -m investbot.bot
 ```
@@ -404,6 +435,52 @@ docker compose -f docker-compose.prod.yml up -d --build
 - Límites de memoria (`mem_limit: 256m`) y CPU (`cpus: 0.5`) fijados en
   `docker-compose.prod.yml` para no afectar la disponibilidad de FoodMindAI
   en el mismo VPS.
+### Rollback
+
+La imagen previa quedó etiquetada como `investbot-bot:prev-8b74b58`. Para
+volver a ella (apuntá `image:` de `docker-compose.prod.yml` a ese tag si hace
+falta) y recrear sin reconstruir:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --no-build --force-recreate
+```
+
+**Kill-switch parcial (sin cambiar de imagen):** dejar vacía
+`SEC_EDGAR_USER_AGENT` apaga EDGAR (vuelve FMP para estados financieros y se
+omiten los 8-K); dejar vacía `FINNHUB_API_KEY` apaga Finnhub (vuelve FMP para
+cotización/perfil/beta y la lista fija de peers). Editá `.env` y corré el
+mismo `up -d --force-recreate`.
+
+### Validación antes de activar EDGAR: `scripts/compare_edgar_fmp.py`
+
+Compara EDGAR contra FMP (últimos 4 trimestres) para NVDA, ADBE y KO. Se corre
+a mano desde la raíz del repo, con las claves en variables de entorno (nunca en
+un archivo) y **no en CI ni dentro de un contenedor** (aborta):
+
+```bash
+SEC_EDGAR_USER_AGENT="<app> <alias@tu-dominio>" FMP_API_KEY=<tu key> \
+    COMPARE_CONFIRM=yes python scripts/compare_edgar_fmp.py
+```
+
+Consume ~15 de las 250 consultas diarias de FMP. Si sale con código 1 hay
+diferencias fuera de tolerancia: **NO activar EDGAR** (dejar
+`SEC_EDGAR_USER_AGENT` vacía) y llevar la evidencia a un spec patch.
+
+### Prueba en vivo tras desplegar
+
+Consultá desde Telegram estos 6 tickers: **NVDA, JPM, AAPL, MELI, CLPT, SPY**
+(industria normal, banco, caso con intereses sin dato, empresa fuera de EEUU,
+caso chico y ETF). En `docker logs investbot-bot` esperá, por consulta:
+
+```
+fundamentals ticker=<T> source=<sec_edgar|fmp> fallback=<códigos o ->
+```
+
+(`JPM`, `MELI` y `SPY` deberían salir con `source=fmp` por los límites
+conocidos.) Después mirá `docker stats --no-stream investbot-bot`: la memoria
+debe quedar por debajo de ~200 MiB (el `mem_limit` de `docker-compose.prod.yml`
+es 256m).
+
 - Antes de arrancar el contenedor, hay que crear el bot en @BotFather y
   obtener el token — ver `contexto/referencia/SETUP_TELEGRAM_BOT.md`.
 
@@ -425,7 +502,7 @@ docker compose -f docker-compose.prod.yml up -d --build
   (repo público), solo el valor real en el `.env` local. Los loggers de
   `httpx`/`httpcore`/`telegram` se fijan a `WARNING` en producción — nunca
   `DEBUG`, porque el token de Telegram viaja en el path de la URL y las API
-  keys de FMP/FRED/Finnhub como query param; un log en `DEBUG` los filtraría
+  keys de FMP/FRED como query param (Finnhub va por header `X-Finnhub-Token`); un log en `DEBUG` los filtraría
   en texto plano.
 - **Manejo de errores:** ninguna excepción cruda de `httpx` (que puede
   incluir la URL completa con la API key) se propaga hacia los logs ni hacia

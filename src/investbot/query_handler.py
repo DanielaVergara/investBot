@@ -15,7 +15,8 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import httpx
@@ -30,8 +31,11 @@ from investbot import (
     db,
     finnhub_client,
     fmp_client,
+    fmp_provider,
+    fundamentals,
     gemini_client,
     market_context,
+    market_data,
     peers,
     risk_fit,
     rules,
@@ -57,6 +61,12 @@ LOADING_MSG = "🔍 Analizando {ticker}, dame un toque..."
 # (`_ask_ventana`). Estos 2 valores son el mismo par que la "Pregunta F" de
 # la ronda 1 ya barajaba (12 = 3 años, 20 = 5 años).
 VENTANA_TRIMESTRES_CORTO = 12
+
+# Deadline GLOBAL de la fase de peers (QA, F2b): el presupuesto de 30 s de
+# `FundamentalsService` es por llamada; con hasta 5 peers en serie esta cota
+# acumulada evita que la consulta se alargue sin límite. Superada, los peers
+# restantes van directo al `key-metrics` de FMP (sin descargar `companyfacts`).
+PEERS_DEADLINE_SECONDS = 15.0
 VENTANA_TRIMESTRES_LARGO = 20
 
 # --- Flujo interactivo de botones inline esc:/vent: (SDD_eps_ttm_real.md,
@@ -128,8 +138,8 @@ class Clients:
     fmp_http: httpx.AsyncClient
     fred_http: httpx.AsyncClient
     treasury_gov_http: httpx.AsyncClient
-    fmp_api_key: str
-    fred_api_key: Optional[str]
+    fmp_api_key: str = field(repr=False)
+    fred_api_key: Optional[str] = field(repr=False)
     # NUEVO (SDD_peers_dinamicos_y_eventos_corporativos.md) — con default
     # `None` explícito: un campo de dataclass sin `= valor` es
     # posicional/keyword obligatorio aunque su tipo sea `Optional[...]`, y
@@ -137,9 +147,9 @@ class Clients:
     # `Clients(...)` en tests que no conocen estos 2 proveedores nuevos
     # (criterio obligatorio de `qa`, sección 1.1 de la spec).
     finnhub_http: Optional[httpx.AsyncClient] = None
-    finnhub_api_key: Optional[str] = None
+    finnhub_api_key: Optional[str] = field(default=None, repr=False)
     sec_edgar_http: Optional[httpx.AsyncClient] = None
-    sec_edgar_user_agent: Optional[str] = None
+    sec_edgar_user_agent: Optional[str] = field(default=None, repr=False)
     # NUEVO (SDD_migracion_gemini.md) — mismo criterio que finnhub_http/
     # sec_edgar_http de arriba: default `None` explícito para no romper los
     # call-sites existentes de `Clients(...)` en tests. `gemini_config.enabled`
@@ -148,6 +158,14 @@ class Clients:
     # (`ai_rewrite.rewrite_parts` es un no-op inmediato sin él).
     gemini_http: Optional[httpx.AsyncClient] = None
     gemini_config: Optional[gemini_client.GeminiConfig] = None
+    # F1b-0 (SDD_fuentes_datos_gratuitas.md 4.2): `None` = cadena solo-FMP.
+    fundamentals: Optional[fundamentals.FundamentalsService] = None
+    # F2b (SDD_fuentes_datos_gratuitas.md 4.1/3.8): cotización, perfil, beta,
+    # 52 semanas y VIX desde Finnhub/FRED con respaldo FMP por bloque. `None`
+    # (sin FINNHUB_API_KEY válida) = comportamiento solo-FMP de siempre.
+    market_data: Optional[market_data.MarketDataService] = None
+    # Reloj monótono inyectable (tests) del deadline global de la fase de peers.
+    now: Callable[[], float] = time.monotonic
 
 
 def _annual_series(statements: list[dict], field: str) -> list[float]:
@@ -155,6 +173,65 @@ def _annual_series(statements: list[dict], field: str) -> list[float]:
     Se invierte a orden cronológico (más antiguo → más reciente) para CAGR/pilares."""
     values = [s.get(field) for s in statements if s.get(field) is not None]
     return list(reversed(values))
+
+
+async def sec_context(clients: "Clients", ticker: str, memo: dict) -> tuple[Optional[str], Optional[dict]]:
+    """`(cik10, submissions)` de SEC EDGAR para `ticker`, una sola vez por
+    consulta (`memo`). Mismos pasos y mismo mejor-esfuerzo que antes inline:
+    sin User-Agent válido, sin CIK o con la SEC caída -> `(None, None)`/`(cik, None)`
+    y cero ruido. La usan el 8-K y, con la capa de mercado, el sector SIC."""
+    if "ctx" not in memo:
+        cik10: Optional[str] = None
+        submissions: Optional[dict] = None
+        if clients.sec_edgar_user_agent:
+            cik10 = await sec_edgar_client.get_cik_for_ticker(
+                clients.sec_edgar_http, clients.sec_edgar_user_agent, ticker
+            )
+            if cik10:
+                submissions = await sec_edgar_client.get_submissions(
+                    clients.sec_edgar_http, clients.sec_edgar_user_agent, cik10
+                )
+        memo["ctx"] = (cik10, submissions)
+    return memo["ctx"]
+
+
+async def _peer_earnings_yield(
+    clients: "Clients", peer: str, budget: Optional[finnhub_client.QueryBudget]
+) -> Optional[dict]:
+    """CA-29: `{"earningsYield": netIncome TTM / marketCap}` de un peer, con el
+    TTM de EDGAR (solo proveedor `sec_edgar`: no gasta llamadas de FMP) y la
+    capitalización de Finnhub `profile2`. `None` ante cualquier dato faltante
+    (sin cobertura de la SEC, sin TTM, `marketCap` `None` o no positiva): el
+    llamador cae al `key-metrics` de FMP, y `peers.py` lo cuenta `sin_dato`. Una
+    utilidad TTM <= 0 devuelve un `earningsYield` <= 0 (`peers.py` lo marca
+    `earnings_yield_no_positivo`)."""
+    service = clients.fundamentals
+    if service is None or clients.finnhub_http is None:
+        return None
+    try:
+        result = await service.get(
+            peer,
+            quarters=VENTANA_TRIMESTRES_CORTO,
+            skip_own_metrics=True,
+            only=frozenset({"sec_edgar"}),
+        )
+    except Exception:  # noqa: BLE001 -- best-effort por peer: nunca rompe el análisis
+        return None
+    if result is None or result.source != "sec_edgar":
+        return None
+    ttm = rules.calculate_income_statement_ttm(result.income_q)
+    if not ttm.disponible or ttm.net_income_ttm is None:
+        return None
+    try:
+        reply = await finnhub_client.get_profile2(
+            clients.finnhub_http, clients.finnhub_api_key, peer, budget=budget
+        )
+    except finnhub_client.FinnhubError:
+        return None
+    cap = (reply.data or {}).get("marketCap")
+    if not cap:  # `get_profile2` solo entrega `None` o un número positivo finito
+        return None
+    return {"earningsYield": ttm.net_income_ttm / cap}
 
 
 async def fetch_and_analyze_parts(
@@ -199,76 +276,64 @@ async def fetch_and_analyze_parts(
     solo cuando `_run_analysis` ya confirmó `gemini_config.enabled` — regla
     de no-regresión D3: sin Gemini habilitado, nunca se acorta el mensaje.
     """
-    quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
-    profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
-
-    # --- income-statement: trimestral primario, fallback anual condicional
-    # (Decisión #8/#10) — diseño atómico (rules.calculate_income_statement_ttm):
-    # si el paquete de 4 trimestres no es 100% válido, se cae al camino 100%
-    # anual de siempre, nunca se mezclan campos de fuentes distintas.
-    try:
-        quarterly_income = await fmp_client.get_income_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker,
-            period="quarter", limit=ventana_trimestres,
+    # F2b (SDD_fuentes_datos_gratuitas.md 3.8/4.1): con `clients.market_data`
+    # (FINNHUB_API_KEY válida) cotización, perfil, beta, 52 semanas y VIX salen
+    # de Finnhub/FRED con respaldo FMP por bloque y procedencia por bloque; sin
+    # él, las 2 llamadas de siempre a FMP (mismo texto, mismo orden, mismo error).
+    sec_memo: dict = {}
+    market_snapshot: Optional[market_data.MarketSnapshot] = None
+    market_budget: Optional[finnhub_client.QueryBudget] = None
+    if clients.market_data is not None:
+        market_budget = clients.market_data.new_budget()
+        market_snapshot = await clients.market_data.fetch(
+            ticker,
+            budget=market_budget,
+            fmp_fallbacks=market_data.build_fmp_fallbacks(
+                lambda symbol: fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, symbol),
+                lambda symbol: fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, symbol),
+            ),
         )
-    except fmp_client.FMPError:
-        quarterly_income = []
-
-    income_ttm = rules.calculate_income_statement_ttm(quarterly_income)
-    if income_ttm.disponible:
-        income_statements = quarterly_income
-        income_statements_fuente = rules.DATOS_FUENTE_TRIMESTRAL
+        # `sector`/`industry` desde la SEC (tabla SIC) solo si FMP no los dio: la
+        # consulta a `submissions` (caché 1 h) se hace una vez y la reusa el 8-K.
+        _, submissions = await sec_context(clients, ticker, sec_memo)
+        composed = market_data.compose(
+            market_snapshot,
+            sic=(submissions or {}).get("sic"),
+            sic_description=(submissions or {}).get("sicDescription"),
+        )
+        quote, profile = composed.quote, composed.profile
     else:
-        income_statements = await fmp_client.get_income_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker
-        )
-        income_statements_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
+        quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
+        profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
 
-    # --- cash-flow-statement: mismo patrón (Decisión #14). La fuente
-    # trimestral se acepta solo si alcanza para un FCF TTM real (>=4
-    # trimestres crudos válidos) — `rules.calculate_fcf_ttm` es la misma
-    # guarda que ya usa el resto de esta spec para "todo o nada por endpoint".
-    try:
-        quarterly_cash_flow = await fmp_client.get_cash_flow_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker,
-            period="quarter", limit=ventana_trimestres,
-        )
-    except fmp_client.FMPError:
-        quarterly_cash_flow = []
+    # Estados financieros + key-metrics propios vía la cadena de proveedores
+    # (SDD_fuentes_datos_gratuitas.md 4.2, F1b-0): sin `clients.fundamentals`
+    # se arma una cadena solo-FMP equivalente al bloque inline anterior
+    # (mismas llamadas, mismo orden, mismo manejo de errores). El abort-check
+    # de abajo se mantiene aquí; `skip_own_metrics` evita pedir key-metrics
+    # cuando quote/profile vienen vacíos, igual que antes.
+    fundamentals_service = clients.fundamentals or fundamentals.FundamentalsService(
+        [fmp_provider.FmpProvider(clients.fmp_http, clients.fmp_api_key)]
+    )
+    fundamentals_result = await fundamentals_service.get(
+        ticker, quarters=ventana_trimestres,
+        skip_own_metrics=not quote or not profile,
+    )
+    income_statements = fundamentals_result.income_statements
+    income_statements_fuente = fundamentals_result.income_fuente
+    cash_flows = fundamentals_result.cash_flows
+    cash_flow_fuente = fundamentals_result.cash_fuente
+    balance_sheets = fundamentals_result.balance_sheets
+    balance_fuente = fundamentals_result.balance_fuente
+    own_metrics = fundamentals_result.own_metrics
 
-    fcf_historial_trimestral = [
-        (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
-        for s in reversed(quarterly_cash_flow)
-    ]
+    income_ttm = rules.calculate_income_statement_ttm(fundamentals_result.income_q)
+    # M-1: con fuente SEC un faltante de OCF/CapEx nunca se convierte en 0.
+    strict_fcf = fundamentals_result.source == "sec_edgar"
+    fcf_historial_trimestral = rules.build_fcf_historial(
+        fundamentals_result.cash_q, strict=strict_fcf
+    )
     fcf_ttm = rules.calculate_fcf_ttm(fcf_historial_trimestral)
-    if fcf_ttm is not None:
-        cash_flows = quarterly_cash_flow
-        cash_flow_fuente = rules.DATOS_FUENTE_TRIMESTRAL
-    else:
-        cash_flows = await fmp_client.get_cash_flow_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker
-        )
-        cash_flow_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
-
-    # --- balance-sheet-statement: snapshot del trimestre más reciente
-    # (Decisión #16) — `limit=1`, no `ventana_trimestres`: no alimenta
-    # ninguna serie de crecimiento ni CAGR, solo liquidez + total_debt del
-    # WACC, igual que hoy solo se usaba `balance_sheets[0]`.
-    try:
-        quarterly_balance = await fmp_client.get_balance_sheet_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker, period="quarter", limit=1
-        )
-    except fmp_client.FMPError:
-        quarterly_balance = []
-
-    if quarterly_balance:
-        balance_sheets = quarterly_balance
-        balance_fuente = rules.DATOS_FUENTE_TRIMESTRAL
-    else:
-        balance_sheets = await fmp_client.get_balance_sheet_statement(
-            clients.fmp_http, clients.fmp_api_key, ticker
-        )
-        balance_fuente = rules.DATOS_FUENTE_ANUAL_FALLBACK
 
     # Abort-check preservado en espíritu (Decisión #8): si tanto la
     # trimestral como el fallback anual de un endpoint fallan/vienen vacíos,
@@ -277,23 +342,16 @@ async def fetch_and_analyze_parts(
     if not quote or not profile or not income_statements or not balance_sheets or not cash_flows:
         return [f"No pude obtener suficientes datos de {ticker} para analizarlo ahora mismo."]
 
-    # Rentabilidad/deuda/dividendos del ticker propio (Decisión #1) —
-    # best-effort, nunca bloquea el resto del análisis.
-    try:
-        own_metrics_list = await fmp_client.get_key_metrics(
-            clients.fmp_http, clients.fmp_api_key, ticker, limit=1
-        )
-        own_metrics = own_metrics_list[0] if own_metrics_list else None
-    except fmp_client.FMPError:
-        own_metrics = None
-
     # VIX (Decisión #7) — best-effort, nunca bloquea el resto del análisis.
-    try:
-        vix_quote = await fmp_client.get_quote(
-            clients.fmp_http, clients.fmp_api_key, market_context.VIX_SYMBOL
-        )
-    except fmp_client.FMPError:
-        vix_quote = None
+    if market_snapshot is not None:
+        vix_quote = composed.vix_quote  # FRED `VIXCLS` (CA-26): jamás FMP
+    else:
+        try:
+            vix_quote = await fmp_client.get_quote(
+                clients.fmp_http, clients.fmp_api_key, market_context.VIX_SYMBOL
+            )
+        except fmp_client.FMPError:
+            vix_quote = None
 
     company_name = profile.get("companyName", ticker)
     sector = profile.get("sector", "")
@@ -339,7 +397,10 @@ async def fetch_and_analyze_parts(
             eps_ttm = latest_income.get("eps")
         revenue = latest_income.get("revenue")
         cost_of_revenue = latest_income.get("costOfRevenue")
-        wacc_interest_expense = latest_income.get("interestExpense") or 0.0
+        # 4.10 pt 2 (D-20): un `interestExpense` ausente (`None`) es N/D, no 0:
+        # con deuda > 0 el WACC queda `None` (`wacc_no_calculable`). Un 0
+        # reportado explícitamente sigue siendo 0 válido.
+        wacc_interest_expense = latest_income.get("interestExpense")
         wacc_income_tax_expense = latest_income.get("incomeTaxExpense") or 0.0
         wacc_income_before_tax = latest_income.get("incomeBeforeTax") or 0.0
         eps_historial = _annual_series(income_statements, "eps") or _annual_series(
@@ -354,21 +415,22 @@ async def fetch_and_analyze_parts(
         fcf_base = fcf_ttm
         periodos_por_anio_fcf = 4
     else:
-        fcf_historial = [
-            (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
-            for s in reversed(cash_flows)
-        ]
+        fcf_historial = rules.build_fcf_historial(cash_flows, strict=strict_fcf)
         fcf_base = None
         periodos_por_anio_fcf = 1
 
     gross_margin = rules.calculate_gross_margin(revenue, cost_of_revenue)
     liquidity = rules.calculate_liquidity_ratio(current_assets, current_liabilities)
     per_result = rules.calculate_per(precio_actual, eps_ttm)
-    ps = rules.calculate_ps(market_cap, revenue)
+    # Con la capa de mercado la capitalización puede ser N/D (moneda no USD o
+    # incoherente con precio x acciones, CS-27): P/S queda N/D, nunca un crash.
+    ps = rules.calculate_ps(market_cap, revenue) if market_cap is not None else None
 
     # Peers (Decisión #9, PER derivado de key-metrics anual — key-metrics-ttm
     # es un endpoint de pago en el plan gratuito actual de FMP, ver peers.py)
-    async def _get_metrics_for_peer(peer_ticker: str) -> Optional[dict]:
+    peers_ey_bot: set[str] = set()  # peers cuyo earningsYield calculó el bot (CA-29)
+
+    async def _get_fmp_metrics_for_peer(peer_ticker: str) -> Optional[dict]:
         try:
             data = await fmp_client.get_key_metrics(
                 clients.fmp_http, clients.fmp_api_key, peer_ticker, limit=1
@@ -376,6 +438,21 @@ async def fetch_and_analyze_parts(
         except fmp_client.FMPError:
             return None
         return data[0] if data else None
+
+    async def _get_metrics_for_peer(peer_ticker: str) -> Optional[dict]:
+        if market_snapshot is None:
+            return await _get_fmp_metrics_for_peer(peer_ticker)
+        # CA-29: `earningsYield = netIncome TTM (EDGAR) / marketCap (Finnhub)`;
+        # si no se puede armar, el respaldo es el `key-metrics` de FMP de siempre.
+        own = (
+            await _peer_earnings_yield(clients, peer_ticker, market_budget)
+            if clients.now() - peers_started <= PEERS_DEADLINE_SECONDS
+            else None  # deadline global superado: directo a FMP, sin descargar companyfacts
+        )
+        if own is not None:
+            peers_ey_bot.add(peer_ticker)
+            return own
+        return await _get_fmp_metrics_for_peer(peer_ticker)
 
     # Peers dinámicos vía Finnhub (Parte 1, SDD_peers_dinamicos_y_eventos_
     # corporativos.md) — best-effort: si `clients.finnhub_api_key` no está
@@ -386,10 +463,16 @@ async def fetch_and_analyze_parts(
             return await finnhub_client.get_peers(
                 clients.finnhub_http, clients.finnhub_api_key, peer_ticker_query,
                 grouping="subIndustry",
+                # F2b: con la capa de mercado, peers comparte el kill-switch,
+                # el límite de tasa y el presupuesto de Finnhub (401/402/403/429
+                # abren el breaker; sigue siendo no fatal: `[]` -> lista fija).
+                guarded=market_snapshot is not None,
+                budget=market_budget,
             )
         except finnhub_client.FinnhubError:
             return []
 
+    peers_started = clients.now()
     peer_result = await peers.get_peer_pe_average(
         get_peer_metrics_fn=_get_metrics_for_peer,
         sector=sector,
@@ -409,10 +492,18 @@ async def fetch_and_analyze_parts(
     except treasury_client.TreasuryError as exc:
         logger.warning("No se pudo obtener Y — %s", exc)
 
+    # 4.10 pt 2 (D-20): la deuda total es `None` si falta CUALQUIERA de sus dos
+    # componentes (nunca se asume 0); un componente reportado como 0 es válido.
+    short_term_debt = latest_balance.get("shortTermDebt")
+    long_term_debt = latest_balance.get("longTermDebt")
+    wacc_total_debt = (
+        short_term_debt + long_term_debt
+        if short_term_debt is not None and long_term_debt is not None
+        else None
+    )
     wacc_inputs = {
         "interest_expense": wacc_interest_expense,
-        "total_debt": (latest_balance.get("shortTermDebt") or 0.0)
-        + (latest_balance.get("longTermDebt") or 0.0),
+        "total_debt": wacc_total_debt,
         "income_tax_expense": wacc_income_tax_expense,
         "income_before_tax": wacc_income_before_tax,
         "beta": beta,
@@ -488,16 +579,7 @@ async def fetch_and_analyze_parts(
     # `sec_edgar_user_agent` no está configurada, cero llamadas de red.
     corporate_events_list: list[dict] = []
     if clients.sec_edgar_user_agent:
-        cik10 = await sec_edgar_client.get_cik_for_ticker(
-            clients.sec_edgar_http, clients.sec_edgar_user_agent, ticker
-        )
-        submissions = (
-            await sec_edgar_client.get_submissions(
-                clients.sec_edgar_http, clients.sec_edgar_user_agent, cik10
-            )
-            if cik10
-            else None
-        )
+        cik10, submissions = await sec_context(clients, ticker, sec_memo)
         events = corporate_events.extract_relevant_8k_events(submissions, cik10)
         corporate_events_list = [
             {"filing_date": e.filing_date, "labels": e.labels, "filing_url": e.filing_url}
@@ -558,6 +640,11 @@ async def fetch_and_analyze_parts(
         "dividend_yield": extras_result.dividend_yield,
         "payout_ratio": extras_result.payout_ratio,
     }
+    market_provenance = (
+        {**composed.provenance, "peers_ey_bot": bool(peers_ey_bot)}
+        if market_snapshot is not None
+        else None
+    )
     vix_result = market_context.extract_vix_context(vix_quote)
     vix_dict = {"valor": vix_result.valor, "disponible": vix_result.disponible}
 
@@ -609,6 +696,11 @@ async def fetch_and_analyze_parts(
             year_low=quote.get("yearLow"),
             price_avg_50=quote.get("priceAvg50"),
             price_avg_200=quote.get("priceAvg200"),
+            # Procedencia para el botón `inf` (F2b): enums cerrados ya validados;
+            # no viajan a Gemini (los payloads se arman por lista cerrada).
+            source=fundamentals_result.source,
+            fallback_codes=fundamentals_result.fallback_codes,
+            market_provenance=market_provenance,
         )
 
     if use_short_summary:
@@ -645,6 +737,22 @@ async def fetch_and_analyze_parts(
         balance_sheet_fuente=balance_fuente,
         income_statement_fuente=income_statements_fuente,
         cash_flow_fuente=cash_flow_fuente,
+        # Procedencia (CA-23, 4.10 pt 6): enum cerrado + códigos de respaldo.
+        # Los avisos de deuda/intereses ausentes se derivan de `None` + `source`
+        # dentro de `summary` (nada nuevo en `FundamentalsResult`).
+        source=fundamentals_result.source,
+        fallback_codes=fundamentals_result.fallback_codes,
+        deuda_ausente=wacc_total_debt is None,
+        deuda_ausente_fmp=(
+            fundamentals_result.source != "sec_edgar" and wacc_total_debt is None
+        ),
+        intereses_ausentes=(
+            wacc_interest_expense is None
+            and wacc_total_debt is not None
+            and wacc_total_debt > 0
+        ),
+        beta_por_defecto=not profile.get("beta"),
+        market_provenance=market_provenance,
     )
 
 
@@ -1137,6 +1245,9 @@ def build_query_handlers(
                     year_low=explain_context_sink["year_low"],
                     price_avg_50=explain_context_sink["price_avg_50"],
                     price_avg_200=explain_context_sink["price_avg_200"],
+                    source=explain_context_sink.get("source", "fmp"),
+                    fallback_codes=explain_context_sink.get("fallback_codes", ()),
+                    market_provenance=explain_context_sink.get("market_provenance"),
                 )
                 context_id = explanation_store.put(explanation_context)
                 keyboard = ai_explain.build_keyboard("texto_libre", context_id)

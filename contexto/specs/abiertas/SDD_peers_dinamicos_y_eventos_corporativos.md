@@ -398,7 +398,7 @@ El spec de la Parte 1 queda completo y listo para `security` sin gating adiciona
 Daniela resolvió 2 de las 3 preguntas bloqueantes que dejó abiertas la versión anterior de esta spec (la tercera, 2.2, ya había quedado marcada como no bloqueante — ver abajo). Quedan **cerradas**, no se reabren:
 
 - **2.1 — cantidad/ventana de eventos corporativos:** **5 eventos / últimos 180 días** — la recomendación del `architect`, confirmada.
-- **2.3 — `SEC_EDGAR_USER_AGENT`:** **`"InvestBot ydva1998@gmail.com"`**, provisto por Daniela — pero **ese valor real NO va en `.env.example`** (corrección post-`security`, ver nota abajo). Solo va en el `.env` local del VPS.
+- **2.3 — `SEC_EDGAR_USER_AGENT`:** **`"InvestBot contacto@ejemplo.com"`**, provisto por Daniela — pero **ese valor real NO va en `.env.example`** (corrección post-`security`, ver nota abajo). Solo va en el `.env` local del VPS.
 - **2.2 — redacción de la etiqueta de Item 8.01:** no bloqueante desde el planteo original — queda la redacción ya propuesta por el `architect` (con la aclaración de incertidumbre), sin necesidad de confirmación aparte de Daniela.
 
 **Corrección post-resolución (hallazgo bloqueante de `security`, 2026-07-29):** el repo de GitHub de este proyecto es **público** y `.env.example` está trackeado en git. `security` marcó como bloqueante dejar el email real de Daniela en `.env.example` (exposición permanente e indexable en un repo público). Daniela aceptó la corrección: `SEC_EDGAR_USER_AGENT` queda **vacío** en `.env.example` (con el formato requerido documentado en un comentario), igual que el resto de las variables del archivo — el valor real se completa únicamente en el `.env` local (gitignored, `chmod 600`). Ver Decisión #4 para el detalle. Esto no cambia nada del comportamiento en producción ni de ninguna otra decisión de la Parte 2.
@@ -417,7 +417,7 @@ En su lugar, **SEC EDGAR** — la fuente oficial y legal de EEUU para toda empre
 
 **Verifiqué en `tests/fixtures/adobe/profile.json` y en `fmp_client.py::get_profile` que FMP NO devuelve un campo `cik`** — no hay atajo, hace falta el mapeo propio vía `company_tickers.json`.
 
-**Rate limit: 10 req/seg por IP, sin límite diario** — muy por encima de cualquier uso de un bot personal de un solo usuario. **Requiere header `User-Agent` con contacto identificable** — no es opcional, es un requisito de acceso justo de la SEC (bloquea/limita IPs que mandan un User-Agent genérico o vacío); necesitaba un valor real de Daniela (Pregunta 2.3, resuelta: `"InvestBot ydva1998@gmail.com"`).
+**Rate limit: 10 req/seg por IP, sin límite diario** — muy por encima de cualquier uso de un bot personal de un solo usuario. **Requiere header `User-Agent` con contacto identificable** — no es opcional, es un requisito de acceso justo de la SEC (bloquea/limita IPs que mandan un User-Agent genérico o vacío); necesitaba un valor real de Daniela (Pregunta 2.3, resuelta: `"InvestBot contacto@ejemplo.com"`).
 
 **Decisión explícita y justificada (pedida por Daniela, no dada por sentada): NO se resume el contenido del 8-K con NLP/LLM.** El contenido completo de un 8-K es un documento legal — a veces un párrafo, a veces varias páginas con anexos — y resumirlo automáticamente agregaría: (a) complejidad nueva fuera del alcance actual del bot (no hay ningún componente de NLP/LLM en todo el proyecto hoy), (b) riesgo real de alucinación sobre texto legal (un resumen incorrecto de un litigio o un cambio de gerencia es peor que no mostrar nada), (c) un costo de mantenimiento (parsers de HTML/XBRL de filings reales, que varían mucho de forma entre empresas). **Lo realista y lo que se implementa:** fecha + tipo de evento (Item) + link directo al filing para que Daniela lo lea ella misma si le interesa. Trade-off aceptado explícitamente: el bot informa "pasó algo, andá a mirarlo" en vez de "esto es lo que pasó" — es menos cómodo, pero no arriesga inventar contenido sobre un documento legal real.
 
@@ -710,7 +710,7 @@ if clients.sec_edgar_user_agent:
 
 ### 4. `.env.example` — nueva env var, **requerida para activar esta feature específica** (el bot entero sigue arrancando sin ella)
 
-Pregunta 2.3, **RESUELTA**: Daniela proveyó el contacto real a usar (`"InvestBot ydva1998@gmail.com"`) — **corregido tras hallazgo bloqueante de `security`** (ver nota abajo): ese valor real **NO** va en `.env.example`.
+Pregunta 2.3, **RESUELTA**: Daniela proveyó el contacto real a usar (`"InvestBot contacto@ejemplo.com"`) — **corregido tras hallazgo bloqueante de `security`** (ver nota abajo): ese valor real **NO** va en `.env.example`.
 
 ```
 # User-Agent OBLIGATORIO para llamar a SEC EDGAR (Feature 2: eventos
@@ -722,7 +722,7 @@ Pregunta 2.3, **RESUELTA**: Daniela proveyó el contacto real a usar (`"InvestBo
 SEC_EDGAR_USER_AGENT=
 ```
 
-**Corrección de `security` (hallazgo bloqueante, aplicado):** el repo de GitHub de este proyecto es **público** y `.env.example` está trackeado en git — dejar el email real de Daniela ahí lo expondría de forma permanente en un repo público (indexable, imposible de despublicar retroactivamente), sin importar que el propio valor no sea "secreto" desde el punto de vista de la política de acceso de la SEC. `SEC_EDGAR_USER_AGENT` queda **vacío** en `.env.example`, con solo el formato requerido documentado en el comentario — exactamente el mismo patrón que ya siguen **todas** las demás variables del archivo (`TELEGRAM_BOT_TOKEN`, `FMP_API_KEY`, `FRED_API_KEY`, `FINNHUB_API_KEY`), sin excepción. El valor real (`"InvestBot ydva1998@gmail.com"`) lo completa Daniela **solo en su `.env` local del VPS** (gitignored, `chmod 600`, mismo patrón ya establecido para el resto de las variables). La SEC sigue recibiendo el header igual una vez que Daniela complete su `.env` real — este cambio es puramente sobre qué queda commiteado en git, no sobre el comportamiento en producción.
+**Corrección de `security` (hallazgo bloqueante, aplicado):** el repo de GitHub de este proyecto es **público** y `.env.example` está trackeado en git — dejar el email real de Daniela ahí lo expondría de forma permanente en un repo público (indexable, imposible de despublicar retroactivamente), sin importar que el propio valor no sea "secreto" desde el punto de vista de la política de acceso de la SEC. `SEC_EDGAR_USER_AGENT` queda **vacío** en `.env.example`, con solo el formato requerido documentado en el comentario — exactamente el mismo patrón que ya siguen **todas** las demás variables del archivo (`TELEGRAM_BOT_TOKEN`, `FMP_API_KEY`, `FRED_API_KEY`, `FINNHUB_API_KEY`), sin excepción. El valor real (`"InvestBot contacto@ejemplo.com"`) lo completa Daniela **solo en su `.env` local del VPS** (gitignored, `chmod 600`, mismo patrón ya establecido para el resto de las variables). La SEC sigue recibiendo el header igual una vez que Daniela complete su `.env` real — este cambio es puramente sobre qué queda commiteado en git, no sobre el comportamiento en producción.
 
 ### 5. `summary.py` — nueva sección, omitida si no hay eventos
 
@@ -795,7 +795,7 @@ transparency_lines.append(
 **Ninguna bloqueante.** Las 2 preguntas bloqueantes que dejó esta parte fueron resueltas explícitamente por Daniela — ver "Resolución de las preguntas bloqueantes" al principio de esta Parte 2:
 
 - **2.1 (cantidad/ventana de eventos):** `max_events=5`, `since_days=180` — fijados, ver Decisión #2.
-- **2.3 (`SEC_EDGAR_USER_AGENT`):** valor real `"InvestBot ydva1998@gmail.com"` fijado, pero **solo para el `.env` local de Daniela** — `.env.example` queda vacío (corrección de `security`, hallazgo bloqueante ya aplicado, ver Decisión #4).
+- **2.3 (`SEC_EDGAR_USER_AGENT`):** valor real `"InvestBot contacto@ejemplo.com"` fijado, pero **solo para el `.env` local de Daniela** — `.env.example` queda vacío (corrección de `security`, hallazgo bloqueante ya aplicado, ver Decisión #4).
 
 **2.2 (redacción de la etiqueta de Item 8.01) queda como no bloqueante**, tal como se dejó planteada desde el origen: la redacción propuesta por el `architect` (con la aclaración explícita de incertidumbre — "puede incluir litigios/demandas... no siempre") se usa tal cual, sin necesidad de una confirmación aparte de Daniela. Si más adelante, al ver el resultado real, Daniela prefiere ajustar el texto, es una corrección menor post-implementación (no requiere spec patch).
 
@@ -872,7 +872,7 @@ El spec de la Parte 2 queda completo, con el hallazgo bloqueante de `security` s
 | 1.3 | Tope de peers dinámicos a consultar contra FMP | Resuelta por Daniela | `MAX_PEERS_DINAMICOS = 5` |
 | 2.1 | Cantidad máxima y ventana de tiempo de eventos corporativos | Resuelta por Daniela | `max_events=5`, `since_days=180` |
 | 2.2 | Redacción de la etiqueta de Item 8.01 | No bloqueante desde el origen | Redacción ya fijada en la Decisión #2 de la Parte 2, sin cambios |
-| 2.3 | Valor real de `SEC_EDGAR_USER_AGENT` | Resuelta por Daniela | `"InvestBot ydva1998@gmail.com"` — **solo en el `.env` local**, `.env.example` queda vacío (corrección de `security`, ver abajo) |
+| 2.3 | Valor real de `SEC_EDGAR_USER_AGENT` | Resuelta por Daniela | `"InvestBot contacto@ejemplo.com"` — **solo en el `.env` local**, `.env.example` queda vacío (corrección de `security`, ver abajo) |
 
 **El spec queda completo — `implementer` puede entrar a Ralph Loop en cuanto `qa` complete su paso del pipeline (Scope Freeze), sin ninguna pregunta pendiente de Daniela y sin ningún hallazgo de `security` sin resolver.**
 
@@ -882,7 +882,7 @@ El spec de la Parte 2 queda completo, con el hallazgo bloqueante de `security` s
 
 `security` revisó esta spec y encontró **1 hallazgo bloqueante puntual**, ya resuelto:
 
-- **Hallazgo:** el repo de GitHub de este proyecto es **público** (confirmado vía API de GitHub) y `.env.example` está trackeado en git. La Decisión #4 original de la Parte 2 dejaba el valor real de `SEC_EDGAR_USER_AGENT` (`"InvestBot ydva1998@gmail.com"`, el email personal de Daniela) escrito directamente en `.env.example` — eso lo hubiera expuesto de forma permanente en un repo público, indexable, imposible de despublicar retroactivamente aunque se corrigiera después.
+- **Hallazgo:** el repo de GitHub de este proyecto es **público** (confirmado vía API de GitHub) y `.env.example` está trackeado en git. La Decisión #4 original de la Parte 2 dejaba el valor real de `SEC_EDGAR_USER_AGENT` (`"InvestBot contacto@ejemplo.com"`, el email personal de Daniela) escrito directamente en `.env.example` — eso lo hubiera expuesto de forma permanente en un repo público, indexable, imposible de despublicar retroactivamente aunque se corrigiera después.
 - **Resolución:** Daniela aceptó la recomendación de `security`. `SEC_EDGAR_USER_AGENT` queda **vacío** en `.env.example`, con el formato requerido documentado en un comentario — mismo patrón que ya siguen, sin excepción, todas las demás variables del archivo (`TELEGRAM_BOT_TOKEN`, `FMP_API_KEY`, `FRED_API_KEY`, `FINNHUB_API_KEY`). El valor real lo completa Daniela únicamente en su `.env` local del VPS (gitignored, `chmod 600`). Ver Decisión #4 de la Parte 2 (ya actualizada) para el detalle completo.
 - **Sin impacto en ningún otro punto de la spec** — la SEC sigue recibiendo el header `User-Agent` exactamente igual una vez que Daniela complete su `.env` real; el cambio es puramente sobre qué queda commiteado en git, no sobre el comportamiento del bot en producción. No se reabre ninguna otra decisión de la Parte 1 ni de la Parte 2.
 
@@ -905,7 +905,7 @@ Ver "Criterios de aceptación — Parte 1" y "Criterios de aceptación — Parte
 - **Ambos siguen el mismo patrón de seguridad ya auditado en `fmp_client.py`/`treasury_client.py`**: cliente inyectado, `params=`/headers explícitos (nunca f-string con datos de usuario en la URL), excepciones traducidas a un error propio sanitizado (nunca URL ni credenciales en el mensaje/log), solo se loguea endpoint/status.
 - **Ambas features tienen fallback/omisión automática y silenciosa si la fuente no está configurada o falla** — Finnhub cae a la lista fija ya existente; SEC EDGAR omite la sección completa. Ninguna de las 2 puede crashear el análisis ni bloquear el resto de la respuesta.
 - **Finnhub**: `finnhub_api_key` es un secreto (va como query param `token=`) — mismo tratamiento que `FMP_API_KEY`/`FRED_API_KEY` (solo en `.env`, `chmod 600`, nunca en git, nunca en logs).
-- **SEC EDGAR**: `SEC_EDGAR_USER_AGENT` **queda vacío en `.env.example`** (corrección de `security`, hallazgo bloqueante ya resuelto — el repo es público, `.env.example` está trackeado en git). El comentario documenta solo el formato requerido por la SEC; el valor real (`"InvestBot ydva1998@gmail.com"`) va únicamente en el `.env` local del VPS de Daniela, mismo tratamiento que el resto de las variables del archivo — sin excepción, aunque el valor en sí no sea confidencial para la SEC.
+- **SEC EDGAR**: `SEC_EDGAR_USER_AGENT` **queda vacío en `.env.example`** (corrección de `security`, hallazgo bloqueante ya resuelto — el repo es público, `.env.example` está trackeado en git). El comentario documenta solo el formato requerido por la SEC; el valor real (`"InvestBot contacto@ejemplo.com"`) va únicamente en el `.env` local del VPS de Daniela, mismo tratamiento que el resto de las variables del archivo — sin excepción, aunque el valor en sí no sea confidencial para la SEC.
 - **Ninguna fórmula de valoración existente cambia** en ninguna de las 2 partes — ambas son aditivas/informativas, mismo principio que toda spec anterior de este proyecto.
 - **Umbrales/topes fijados por Daniela** (`grouping="subIndustry"`, mínimo 3, tope 5 peers dinámicos, 5 eventos/180 días) — no son configurables ni ajustables por `implementer` por conveniencia; un cambio futuro requiere spec patch.
 - **No queda ninguna pregunta bloqueante ni ningún hallazgo de `security` sin resolver** — `qa` puede agregar criterios de cobertura de punta a punta, e `implementer` puede arrancar Ralph Loop en cuanto el pipeline llegue a Scope Freeze.

@@ -96,10 +96,15 @@ _INCOME_STATEMENT_TTM_CAMPOS = (
     "netIncome",
     "revenue",
     "costOfRevenue",
-    "interestExpense",
     "incomeTaxExpense",
     "incomeBeforeTax",
 )
+
+# SDD_fuentes_datos_gratuitas.md 4.10 pt 4 / D-8 (cambio de contrato consciente):
+# `interestExpense` es OPCIONAL dentro del paquete TTM. Si falta en cualquiera de
+# los 4 trimestres, `interest_expense_ttm` queda `None` (N/D) y el resto del
+# paquete sigue disponible; nunca se rellena con 0 (daria Kd = 0 en el WACC).
+_INTERES_CAMPO = "interestExpense"
 
 
 def calculate_income_statement_ttm(
@@ -118,6 +123,7 @@ def calculate_income_statement_ttm(
     }
     if any(v is None for v in sumas.values()):
         return IncomeStatementTtmResult(disponible=False)
+    interes_ttm = sum_ttm_field(quarterly_statements, _INTERES_CAMPO)
 
     shares = quarterly_statements[0].get("weightedAverageShsOutDil") or quarterly_statements[
         0
@@ -130,11 +136,36 @@ def calculate_income_statement_ttm(
         net_income_ttm=sumas["netIncome"],
         revenue_ttm=sumas["revenue"],
         cost_of_revenue_ttm=sumas["costOfRevenue"],
-        interest_expense_ttm=sumas["interestExpense"],
+        interest_expense_ttm=interes_ttm,
         income_tax_expense_ttm=sumas["incomeTaxExpense"],
         income_before_tax_ttm=sumas["incomeBeforeTax"],
         shares_outstanding_reciente=shares,
     )
+
+
+def build_fcf_historial(cash_rows: list[dict], *, strict: bool) -> list[float]:
+    """Serie de FCF por período (`operatingCashFlow - abs(capitalExpenditure)`),
+    ordenada de más antiguo a más reciente, a partir de `cash_rows` (el más
+    reciente primero).
+
+    `strict=False` reproduce EXACTAMENTE el comportamiento histórico (FMP):
+    un campo ausente cuenta como 0. `strict=True` (fuente SEC, M-1): un
+    faltante NUNCA es 0; la serie se corta en la primera fila (desde la más
+    reciente) con `operatingCashFlow` o `capitalExpenditure` en `None`, y solo
+    se devuelven las filas completas más recientes. Con menos de 4 períodos,
+    `calculate_fcf_ttm` devuelve `None` y el llamador cae al respaldo anual."""
+    if not strict:
+        return [
+            (s.get("operatingCashFlow") or 0) - abs(s.get("capitalExpenditure") or 0)
+            for s in reversed(cash_rows)
+        ]
+    completas: list[float] = []
+    for s in cash_rows:
+        ocf, capex = s.get("operatingCashFlow"), s.get("capitalExpenditure")
+        if ocf is None or capex is None:
+            break
+        completas.append(ocf - abs(capex))
+    return list(reversed(completas))
 
 
 def calculate_fcf_ttm(fcf_historial: list[float]) -> Optional[float]:
@@ -156,8 +187,11 @@ def calculate_eps(net_income: float, shares_outstanding: float) -> Optional[floa
 
 
 def calculate_gross_margin(revenue: float, cost_of_revenue: float) -> Optional[float]:
-    """Margen Bruto = (Ventas - Costo de Ventas) / Ventas."""
-    if revenue is None or revenue == 0:
+    """Margen Bruto = (Ventas - Costo de Ventas) / Ventas.
+
+    Un costo de ventas ausente (`None`, p. ej. EDGAR sin el concepto) es N/D:
+    nunca se trata como 0 (daria un margen bruto del 100% inventado)."""
+    if revenue is None or revenue == 0 or cost_of_revenue is None:
         return None
     return (revenue - cost_of_revenue) / revenue
 
@@ -177,7 +211,14 @@ def calculate_liquidity_ratio(
     la división. Se retorna `ratio_liquidez=None` y el flag
     `liquidez_sin_pasivos_circulantes=True` — empresa sin deuda de corto
     plazo, señal positiva de negocio, no un error.
+
+    Entradas ausentes (`None`, 4.10 pt 5 de `SDD_fuentes_datos_gratuitas.md`):
+    el ratio es N/D (`ratio_liquidez=None`) y NO se afirma "sin pasivos
+    circulantes" (`liquidez_sin_pasivos_circulantes=False`): el pilar de deuda
+    controlada queda en falso, sin crash y sin cero inventado.
     """
+    if current_assets is None or current_liabilities is None:
+        return LiquidityResult(ratio_liquidez=None, liquidez_sin_pasivos_circulantes=False)
     if current_liabilities == 0:
         return LiquidityResult(ratio_liquidez=None, liquidez_sin_pasivos_circulantes=True)
     return LiquidityResult(

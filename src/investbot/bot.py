@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 import httpx
@@ -20,13 +21,48 @@ from investbot import (
     advanced_command,
     ai_explain,
     db,
+    edgar_provider,
+    fmp_provider,
+    fundamentals,
     gemini_client,
+    market_data,
     onboarding,
     query_handler,
+    sec_edgar_client,
     security,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# CS-19 (a): mismo criterio que `gemini_client._KEY_RE` -- solo ASCII visible
+# (sin CR/LF ni espacios), longitud acotada, sin comillas/barra invertida.
+_FINNHUB_KEY_RE = re.compile(r"[\x21-\x7E]{16,256}", re.ASCII)
+_FINNHUB_KEY_FORBIDDEN = frozenset("\"'`\\")
+
+# CS-23: User-Agent de la SEC `<app> <email>`; sin barra ni paréntesis.
+_SEC_UA_RE = re.compile(
+    r"[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)* [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    re.ASCII,
+)
+_SEC_UA_PLACEHOLDER_DOMAIN_SUFFIXES = ("example.com", "example.org", "ejemplo.com", "localhost")
+
+
+def _valid_finnhub_key(key: str) -> bool:
+    return _FINNHUB_KEY_RE.fullmatch(key) is not None and not (
+        _FINNHUB_KEY_FORBIDDEN & set(key)
+    )
+
+
+def _valid_sec_user_agent(ua: str) -> bool:
+    """Validación estricta del UA de la SEC. SOLO se aplica en `main()`
+    (CS-23): `Clients`, `query_handler` y `build_application` no validan."""
+    if _SEC_UA_RE.fullmatch(ua) is None:
+        return False
+    if "tu-correo" in ua.lower():
+        return False
+    domain = ua.rsplit("@", 1)[1].lower()
+    return not domain.endswith(_SEC_UA_PLACEHOLDER_DOMAIN_SUFFIXES)
 
 
 def configure_logging() -> None:
@@ -112,7 +148,31 @@ def build_application(
     fred_http = httpx.AsyncClient()
     treasury_gov_http = httpx.AsyncClient()
     finnhub_http = httpx.AsyncClient()
-    sec_edgar_http = httpx.AsyncClient()
+    sec_edgar_http = sec_edgar_client.build_sec_http_client()
+    # F1b-3 (SDD_fuentes_datos_gratuitas.md 4.2): cadena EDGAR -> FMP, solo con
+    # un User-Agent válido (ya validado en `main()`). Sin él `fundamentals`
+    # queda en `None` y `query_handler` arma la cadena solo-FMP de siempre.
+    # EDGAR comparte el cliente `sec_edgar_http` con el 8-K.
+    fundamentals_service = None
+    if sec_edgar_user_agent:
+        fundamentals_service = fundamentals.FundamentalsService(
+            [
+                edgar_provider.EdgarProvider(sec_edgar_http, sec_edgar_user_agent),
+                fmp_provider.FmpProvider(fmp_http, fmp_api_key),
+            ]
+        )
+    # F2b (SDD_fuentes_datos_gratuitas.md 4.1, 13.4): cotización/perfil/beta/52
+    # semanas de Finnhub y VIX de FRED con respaldo FMP por bloque, opt-in por
+    # `FINNHUB_API_KEY` (ya validada en `main()`): sin key válida `market_data`
+    # queda en `None` y el flujo es el solo-FMP de siempre. Sin persistencia.
+    market_service = None
+    if finnhub_api_key:
+        market_service = market_data.MarketDataService(
+            finnhub_http=finnhub_http,
+            finnhub_api_key=finnhub_api_key,
+            fred_http=fred_http,
+            fred_api_key=fred_api_key,
+        )
     clients = query_handler.Clients(
         fmp_http=fmp_http,
         fred_http=fred_http,
@@ -125,6 +185,8 @@ def build_application(
         sec_edgar_user_agent=sec_edgar_user_agent,
         gemini_http=gemini_http,
         gemini_config=gemini_config,
+        fundamentals=fundamentals_service,
+        market_data=market_service,
     )
     rate_limiter = security.InMemoryRateLimiter(max_requests=10, window_seconds=60.0)
 
@@ -184,6 +246,17 @@ def main() -> None:
     # corporativos), nunca un crash.
     finnhub_api_key = os.environ.get("FINNHUB_API_KEY")
     sec_edgar_user_agent = os.environ.get("SEC_EDGAR_USER_AGENT")
+    # Valores presentes pero inválidos: la feature queda deshabilitada y se
+    # deja un ERROR SIN el valor (nunca se loguea la key ni el UA).
+    if finnhub_api_key and not _valid_finnhub_key(finnhub_api_key):
+        logger.error("Finnhub deshabilitado: FINNHUB_API_KEY con formato inválido.")
+        finnhub_api_key = None
+    if sec_edgar_user_agent and not _valid_sec_user_agent(sec_edgar_user_agent):
+        logger.error(
+            "SEC EDGAR deshabilitado: SEC_EDGAR_USER_AGENT inválido "
+            "(formato esperado: '<app> <email>', sin barra ni dominio de ejemplo)."
+        )
+        sec_edgar_user_agent = None
     db_path = os.environ.get("INVESTBOT_DB_PATH", "/data/investbot.db")
 
     # SDD_migracion_gemini.md (CS-21) — se carga DESPUÉS de validar allowlist,

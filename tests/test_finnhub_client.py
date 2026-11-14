@@ -116,7 +116,8 @@ async def test_get_peers_usa_params_no_fstring():
     def handler(request: httpx.Request) -> httpx.Response:
         captured["symbol"] = request.url.params.get("symbol")
         captured["grouping"] = request.url.params.get("grouping")
-        captured["token"] = request.url.params.get("token")
+        captured["token_en_query"] = request.url.params.get("token")
+        captured["header_token"] = request.headers.get("X-Finnhub-Token")
         captured["path"] = request.url.path
         return httpx.Response(200, json=["MSFT"])
 
@@ -124,7 +125,9 @@ async def test_get_peers_usa_params_no_fstring():
     await finnhub_client.get_peers(client, "test-key", "ADBE")
     assert captured["symbol"] == "ADBE"
     assert captured["grouping"] == "subIndustry"
-    assert captured["token"] == "test-key"
+    # CS-19 (b): el token viaja por header, nunca en la query.
+    assert captured["header_token"] == "test-key"
+    assert captured["token_en_query"] is None
     assert captured["path"] == "/api/v1/stock/peers"
 
 

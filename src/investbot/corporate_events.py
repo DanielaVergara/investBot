@@ -9,6 +9,7 @@ extrae fecha + Item + URL pública del documento.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
@@ -40,8 +41,22 @@ class CorporateEvent:
     filing_url: str
 
 
+_ACCESSION_RE = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}")
+_PRIMARY_DOC_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
+
+
 def _build_filing_url(cik10: str, accession_number: str, primary_document: str) -> Optional[str]:
     if not cik10 or not accession_number or not primary_document:
+        return None
+    # CS-29: los datos de red no se interpolan sin validar (el link va dentro
+    # de un Markdown); si el formato no es el de la SEC, no hay link.
+    if (
+        not isinstance(accession_number, str)
+        or not isinstance(primary_document, str)
+        or _ACCESSION_RE.fullmatch(accession_number) is None
+        or _PRIMARY_DOC_RE.fullmatch(primary_document) is None
+        or ".." in primary_document
+    ):
         return None
     try:
         cik_sin_ceros = str(int(cik10))
@@ -52,6 +67,17 @@ def _build_filing_url(cik10: str, accession_number: str, primary_document: str) 
         f"https://www.sec.gov/Archives/edgar/data/{cik_sin_ceros}/"
         f"{accession_sin_guiones}/{primary_document}"
     )
+
+
+def _can_keep_without_link(cik10: str, accession_number: object, primary_document: object) -> bool:
+    """CS-29: campos presentes pero con formato inválido -> el evento (fecha y
+    tipo, que no dependen del link) se conserva SIN link. Campos ausentes o CIK
+    no numérico mantienen el comportamiento previo (el evento se descarta)."""
+    try:
+        int(cik10)
+    except (TypeError, ValueError):
+        return False
+    return bool(accession_number) and bool(primary_document)
 
 
 def extract_relevant_8k_events(
@@ -99,7 +125,9 @@ def extract_relevant_8k_events(
 
         url = _build_filing_url(cik10, accessions[i], docs[i])
         if url is None:
-            continue
+            if not _can_keep_without_link(cik10, accessions[i], docs[i]):
+                continue
+            url = ""
 
         events.append(
             CorporateEvent(

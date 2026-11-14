@@ -32,7 +32,16 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import CommandHandler, ContextTypes
 
-from investbot import ai_explain, ai_rewrite, fmp_client, market_context, query_handler, rules
+from investbot import (
+    ai_explain,
+    ai_rewrite,
+    fmp_client,
+    market_context,
+    market_data,
+    query_handler,
+    rules,
+    summary,
+)
 from investbot.advanced_scoring import (
     calculate_altman_z,
     calculate_altman_z_prime_prime,
@@ -103,6 +112,37 @@ def _is_etf_or_fund(profile: dict) -> bool:
     return False
 
 
+SOURCE_FMP = "fmp"
+SOURCE_EDGAR = "sec_edgar"
+
+
+async def _edgar_annual_statements(clients, ticker: str) -> Optional[tuple[list, list, list]]:
+    """Los 3 estados anuales (`[:2]`, 4.10 pt 7) desde `clients.fundamentals`
+    solo si EDGAR sirvió el paquete. `None` en cualquier otro caso (sin servicio,
+    sin cobertura, fallo, o un estado anual vacío): el llamador sigue con FMP
+    exactamente como antes. Nunca propaga una excepción: un fallo de EDGAR no
+    debe romper `/avanzado`, que tiene su propio camino por FMP."""
+    service = getattr(clients, "fundamentals", None)
+    if service is None:
+        return None
+    try:
+        result = await service.get(
+            ticker,
+            quarters=query_handler.VENTANA_TRIMESTRES_LARGO,
+            skip_own_metrics=True,
+            only=frozenset({"sec_edgar"}),
+        )
+    except Exception:  # noqa: BLE001 -- best-effort: cae a FMP, nunca rompe el comando
+        logger.warning("EDGAR no disponible para /avanzado; se usa FMP", exc_info=False)
+        return None
+    if result is None or result.source != SOURCE_EDGAR:
+        return None
+    income, balance, cash = result.income_a[:2], result.balance_a[:2], result.cash_a[:2]
+    if not income or not balance or not cash:
+        return None
+    return income, balance, cash
+
+
 def _num_or_none(value: object) -> Optional[float]:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
@@ -133,6 +173,8 @@ def _build_message(
     cash_flows: list[dict],
     explain_context_sink: Optional[dict] = None,
     short: bool = False,
+    source: str = SOURCE_FMP,
+    market_provenance: Optional[dict] = None,
 ) -> str:
     """Arma el único mensaje de Telegram (Decisión de diseño #5), texto
     plano — nunca `parse_mode="Markdown"` (hallazgo 4 de `security`: el
@@ -150,7 +192,15 @@ def _build_message(
     `short` (`SDD_menu_por_capas_explicaciones.md`, Decisión de diseño #9):
     default `False` (comportamiento idéntico al de siempre — desglose
     completo de los 5 modelos). `True` solo cuando el llamador ya confirmó
-    que Gemini está habilitado — regla de no-regresión D3."""
+    que Gemini está habilitado — regla de no-regresión D3.
+
+    `source` (SDD_fuentes_datos_gratuitas.md, CA-21/CA-23): `"fmp"` (default,
+    texto de siempre) o `"sec_edgar"`; solo cambia la línea "Fuente de los
+    datos". Ningún cálculo depende de él.
+
+    `market_provenance` (F2b, `{"sources": ..., "codes": ...}`): solo con la
+    capa de mercado activa; agrega una línea con la fuente real de cotización,
+    perfil y beta (texto fijo). `None` = mensaje de siempre."""
     income_reciente = income_statements[0]
     income_anterior = income_statements[1] if len(income_statements) > 1 else {}
     balance_reciente = balance_sheets[0]
@@ -320,10 +370,20 @@ def _build_message(
     )
 
     fecha_periodo = income_reciente.get("date") or "fecha no disponible"
-    lineas.append(
-        f"Fuente de los datos: FMP (plan gratuito), balance/income/cash-flow "
-        f"más recientes disponibles, período fiscal {fecha_periodo}"
-    )
+    if source == SOURCE_EDGAR:
+        lineas.append(
+            f"Fuente de los datos: SEC EDGAR (reportes 10-K), balance/income/cash-flow "
+            f"más recientes disponibles, período fiscal {fecha_periodo}"
+        )
+    else:
+        lineas.append(
+            f"Fuente de los datos: FMP (plan gratuito), balance/income/cash-flow "
+            f"más recientes disponibles, período fiscal {fecha_periodo}"
+        )
+
+    linea_mercado = summary.build_market_source_line(market_provenance)
+    if linea_mercado:
+        lineas.append(linea_mercado)
 
     if explain_context_sink is not None:
         # SDD_explicaciones_interactivas_ollama.md, Decisión de diseño #3,
@@ -428,7 +488,33 @@ def build_advanced_command_handler(
         gemini_enabled = bool(clients.gemini_config and clients.gemini_config.enabled)
 
         try:
-            profile = await fmp_client.get_profile(clients.fmp_http, clients.fmp_api_key, ticker)
+            market_provenance = None
+            if clients.market_data is not None:
+                # F2b: perfil, cotización, beta y 52 semanas de Finnhub con
+                # respaldo FMP por bloque (mismos helpers que el texto libre).
+                snapshot = await clients.market_data.fetch(
+                    ticker,
+                    fmp_fallbacks=market_data.build_fmp_fallbacks(
+                        lambda symbol: fmp_client.get_quote(
+                            clients.fmp_http, clients.fmp_api_key, symbol
+                        ),
+                        lambda symbol: fmp_client.get_profile(
+                            clients.fmp_http, clients.fmp_api_key, symbol
+                        ),
+                    ),
+                )
+                _, submissions = await query_handler.sec_context(clients, ticker, {})
+                composed = market_data.compose(
+                    snapshot,
+                    sic=(submissions or {}).get("sic"),
+                    sic_description=(submissions or {}).get("sicDescription"),
+                )
+                profile, quote = composed.profile, composed.quote
+                market_provenance = composed.provenance
+            else:
+                profile = await fmp_client.get_profile(
+                    clients.fmp_http, clients.fmp_api_key, ticker
+                )
             if not profile:
                 await update.message.reply_text(NOT_FOUND_MSG)
                 return
@@ -437,16 +523,27 @@ def build_advanced_command_handler(
                 await update.message.reply_text(NOT_APPLICABLE_MSG)
                 return
 
-            quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
-            income_statements = await fmp_client.get_income_statement(
-                clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
-            )
-            balance_sheets = await fmp_client.get_balance_sheet_statement(
-                clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
-            )
-            cash_flows = await fmp_client.get_cash_flow_statement(
-                clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
-            )
+            if clients.market_data is None:
+                quote = await fmp_client.get_quote(clients.fmp_http, clients.fmp_api_key, ticker)
+            # 4.10 pt 7 / CA-21: los 3 estados anuales (`limit=2`) salen de la SEC
+            # cuando EDGAR cubre la empresa; si no (JPM, ETF con 404, circuito
+            # abierto...) siguen las 3 llamadas de siempre a FMP, sin gastar
+            # llamadas de FMP de más (`only` no consulta el proveedor de FMP).
+            edgar_statements = await _edgar_annual_statements(clients, ticker)
+            if edgar_statements is not None:
+                income_statements, balance_sheets, cash_flows = edgar_statements
+                fuente_datos = SOURCE_EDGAR
+            else:
+                fuente_datos = SOURCE_FMP
+                income_statements = await fmp_client.get_income_statement(
+                    clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
+                )
+                balance_sheets = await fmp_client.get_balance_sheet_statement(
+                    clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
+                )
+                cash_flows = await fmp_client.get_cash_flow_statement(
+                    clients.fmp_http, clients.fmp_api_key, ticker, period="annual", limit=2
+                )
 
             # Red de seguridad del paso 4 (Decisión de diseño #2): un
             # símbolo raro/cripto sin flag de ETF/fondo en `/profile` pero
@@ -465,6 +562,8 @@ def build_advanced_command_handler(
                 cash_flows=cash_flows,
                 explain_context_sink=explain_context_sink,
                 short=gemini_enabled,
+                source=fuente_datos,
+                market_provenance=market_provenance,
             )
         except fmp_client.FMPError as exc:
             await update.message.reply_text(str(exc))

@@ -17,6 +17,8 @@ escenarios quedan sin `valor_justo_total`).
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Optional
 
 from investbot import peers, rules
@@ -47,6 +49,219 @@ def _escape_markdown_legacy(texto: str) -> str:
     for char in _MARKDOWN_LEGACY_ESPECIALES:
         texto = texto.replace(char, f"\\{char}")
     return texto
+
+# --- Procedencia de los datos (SDD_fuentes_datos_gratuitas.md, CS-11, CS-13, CA-23) ---
+#
+# Todo texto de procedencia es FIJO: se elige por el enum cerrado `source`
+# ("fmp" | "sec_edgar") y por los `fallback_codes` (enum cerrado, 15.3 fila 20),
+# nunca se interpola contenido de red. El único valor variable es el ticker, que
+# ya pasó la regex estricta de la cadena (aquí se revalida y, si no cuadra, se
+# muestra "?"). Con `source="fmp"` (el default) todo el texto es el de siempre.
+SOURCE_FMP = "fmp"
+SOURCE_EDGAR = "sec_edgar"
+
+_TICKER_SEGURO_RE = re.compile(r"[A-Za-z0-9.\-]{1,10}", re.ASCII)
+
+# CS-11: tope de caracteres de un nombre de tercero (entityName/name de la SEC o Finnhub).
+MAX_NOMBRE_TERCERO = 100
+
+_SEPARADORES_A_ESPACIO = frozenset({"Cc", "Zl", "Zp"})
+_CONTROL_A_ELIMINAR = frozenset({"Cf", "Cs", "Co", "Cn"})
+
+
+def sanitize_third_party_name(nombre: object, limite: int = MAX_NOMBRE_TERCERO) -> str:
+    """CS-11 / T-CS-11: nombre de empresa de terceros (FMP, `entityName` de la
+    SEC, `name` de Finnhub) listo para interpolar en un mensaje con
+    `parse_mode="Markdown"`: (1) un valor que no es `str` es vacío; (2) los
+    caracteres de control (saltos de línea, tabulaciones, NUL, marcas de
+    dirección, etc.) se reemplazan por un espacio o se eliminan, para que el
+    nombre no pueda partir ni falsear líneas del mensaje; (3) se acota a
+    `limite` caracteres ANTES de escapar (así el escape nunca queda cortado a
+    mitad de `\\*`); (4) se escapa el Markdown legado. Un nombre normal (sin
+    control y de hasta 100 caracteres) sale idéntico a `_escape_markdown_legacy`."""
+    if not isinstance(nombre, str):
+        return ""
+    limpio = []
+    for char in nombre:
+        categoria = unicodedata.category(char)
+        if categoria in _SEPARADORES_A_ESPACIO:
+            limpio.append(" ")
+        elif categoria not in _CONTROL_A_ELIMINAR:
+            limpio.append(char)
+    return _escape_markdown_legacy("".join(limpio)[:limite])
+
+
+def _nombre_para_titulo(company_name: object, ticker: str) -> str:
+    """Nombre sanitizado para el titulo; si queda vacio o solo espacios, el ticker."""
+    nombre = sanitize_third_party_name(company_name)
+    return nombre if nombre.strip() else ticker
+
+
+def _ticker_visible(ticker: object) -> str:
+    return ticker if isinstance(ticker, str) and _TICKER_SEGURO_RE.fullmatch(ticker) else "?"
+
+
+# Etiqueta de la fuente de los estados financieros según el enum `source`.
+_FUENTE_ESTADOS_LABEL = {SOURCE_FMP: "FMP", SOURCE_EDGAR: "la SEC EDGAR"}
+
+# Códigos de respaldo cuyo motivo es "la SEC no cubre esta empresa" (4.6); el
+# resto (fallos transitorios, bloqueo, datos incoherentes...) usa la plantilla
+# de "no pude consultar ahora".
+_CODIGOS_SIN_COBERTURA = frozenset(
+    {"sin_cik", "sin_facts", "no_us_gaap", "sin_usd", "datos_insuficientes", "desactualizado"}
+)
+
+_NOTA_RESPALDO_SIN_COBERTURA = (
+    "No encontré reportes de {ticker} en la SEC (empresa fuera de EEUU, sin 10-K "
+    "reciente o tipo de empresa no soportado); usé FMP como respaldo."
+)
+_NOTA_RESPALDO_TEMPORAL = (
+    "No pude consultar los reportes de {ticker} en la SEC en esta consulta; "
+    "usé FMP como respaldo."
+)
+_NOTA_CACHE_ANTIGUO = (
+    "La SEC no respondió ahora; los reportes de {ticker} vienen de una copia "
+    "guardada hace hasta 7 días."
+)
+# 15.5 (texto fijo, solo con fuente SEC y dato `None`; línea protegida para Gemini: CS-25).
+AVISO_DEUDA_AUSENTE = (
+    "No pude determinar la deuda financiera de {ticker} con los reportes de la "
+    "SEC; el costo de capital, la relación deuda/patrimonio y la Magic Formula "
+    "quedan como no disponibles (no asumo deuda cero)."
+)
+# Con fuente FMP y deuda `None` el DCF desaparece: se declara (texto fijo, línea protegida).
+AVISO_DEUDA_AUSENTE_FMP = (
+    "No pude determinar la deuda financiera de {ticker} con los datos de FMP; el "
+    "costo de capital queda como no disponible (no asumo deuda cero)."
+)
+AVISO_INTERESES_AUSENTES = (
+    "{ticker} no reporta gasto por intereses en la SEC; el costo de la deuda y "
+    "el DCF quedan no disponibles."
+)
+# P-3 / R-8: las definiciones de EDGAR difieren de las de FMP (3.5).
+NOTA_DEFINICIONES_EDGAR = (
+    "Con datos de la SEC el EBIT es la utilidad operativa y la deuda total no "
+    "incluye arrendamientos operativos; por eso Deuda Neta/EBITDA puede diferir "
+    "levemente de FMP."
+)
+NOTA_BETA_POR_DEFECTO = (
+    "FMP no informó la beta de esta empresa: usé beta 1.0 (igual al mercado) "
+    "como supuesto neutro, no es un dato de la empresa."
+)
+
+# Una línea de procedencia por bloque (CS-13). Solo cuando los estados salen de
+# la SEC; con FMP cada bloque ya dice "FMP" en su propio texto de siempre.
+_FUENTE_BLOQUE_EDGAR = {
+    "valoracion": (
+        "_Fuente de este bloque: estados financieros de la SEC EDGAR; precio y "
+        "comparables de FMP o Finnhub; tasa Y según las notas de transparencia._"
+    ),
+    "pilares": "_Fuente de este bloque: estados financieros de la SEC EDGAR; precio de FMP._",
+    "mercado": (
+        "_Fuente de este bloque: cotización y VIX de FMP; comparables según las "
+        "notas de transparencia._"
+    ),
+}
+
+
+# --- Procedencia de los datos de mercado (F2b, SDD_fuentes_datos_gratuitas.md
+# 3.8/4.1/13.3 CS-27): "el mensaje declara la fuente de cada bloque". Todo es
+# texto FIJO elegido por el enum cerrado de fuentes de `market_data`
+# (finnhub | fmp | fred | None) y de sus códigos; nunca contenido de red. Solo se
+# usa cuando el llamador pasa `market_provenance` (capa de mercado activa); sin
+# él, todos los textos de arriba son los de siempre.
+_FUENTE_MERCADO_LABEL = {"finnhub": "Finnhub", "fmp": "FMP", "fred": "CBOE vía FRED"}
+_ND_LABEL = "no disponible"
+_CODIGOS_FINNHUB_BLOQUEADO = frozenset({"finnhub_rechazado", "circuito_abierto"})
+NOTA_BETA_POR_DEFECTO_MERCADO = (
+    "No hay beta disponible para esta empresa en las fuentes consultadas "
+    "(Finnhub y FMP): usé beta 1.0 (igual al mercado) como supuesto neutro, no "
+    "es un dato de la empresa."
+)
+AVISO_FINNHUB_RESPALDO = (
+    "Finnhub no estuvo disponible para parte de los datos de mercado en esta "
+    "consulta; usé FMP como respaldo."
+)
+AVISO_FINNHUB_BLOQUEADO = (
+    "Finnhub rechazó la consulta o quedó en pausa por un límite de uso; usé FMP "
+    "como respaldo mientras tanto."
+)
+AVISO_MERCADO_ND = (
+    "Algunos datos de mercado no estaban disponibles en Finnhub ni en FMP en "
+    "esta consulta y se muestran como no disponibles."
+)
+
+
+def _fuentes_mercado(market_provenance: Optional[dict]) -> Optional[dict[str, str]]:
+    """Etiqueta fija por bloque (`quote`/`profile`/`metrics`/`vix`) o `None` si
+    no hay capa de mercado. Una fuente fuera del enum cuenta como no disponible."""
+    if not market_provenance:
+        return None
+    fuentes = market_provenance.get("sources") or {}
+    return {
+        bloque: _FUENTE_MERCADO_LABEL.get(fuentes.get(bloque), _ND_LABEL)
+        for bloque in ("quote", "profile", "metrics", "vix")
+    }
+
+
+def _lineas_mercado(market_provenance: dict) -> list[str]:
+    """Línea de fuentes por bloque + avisos de respaldo / N/D (texto fijo)."""
+    etiquetas = _fuentes_mercado(market_provenance)
+    lineas = [
+        f"_Datos de mercado — cotización: {etiquetas['quote']}; perfil: "
+        f"{etiquetas['profile']}; beta y rango de 52 semanas: {etiquetas['metrics']}; "
+        f"VIX: {etiquetas['vix']}._"
+    ]
+    fuentes = market_provenance.get("sources") or {}
+    codigos = set(market_provenance.get("codes") or ())
+    bloques = ("quote", "profile", "metrics")
+    if any(fuentes.get(b) == "fmp" for b in bloques):
+        aviso = AVISO_FINNHUB_BLOQUEADO if codigos & _CODIGOS_FINNHUB_BLOQUEADO else AVISO_FINNHUB_RESPALDO
+        lineas.append(f"_{aviso}_")
+    if any(fuentes.get(b) is None for b in bloques):
+        lineas.append(f"_{AVISO_MERCADO_ND}_")
+    return lineas
+
+
+def build_market_source_line(market_provenance: Optional[dict]) -> Optional[str]:
+    """Línea de texto plano con la fuente de cada bloque de mercado (`/avanzado`,
+    que no usa Markdown). `None` sin capa de mercado."""
+    etiquetas = _fuentes_mercado(market_provenance)
+    if etiquetas is None:
+        return None
+    return (
+        f"Fuente de datos de mercado: cotización {etiquetas['quote']} · perfil "
+        f"{etiquetas['profile']} · beta y rango de 52 semanas {etiquetas['metrics']}"
+    )
+
+
+def _linea_bloque(bloque: str, *, edgar: bool, market_provenance: Optional[dict]) -> Optional[str]:
+    """Línea "Fuente de este bloque" (CS-13): la de siempre con fuente SEC y sin
+    capa de mercado; con capa de mercado, una línea que cita la fuente real de
+    la cotización y del VIX (con SEC o FMP en los estados)."""
+    etiquetas = _fuentes_mercado(market_provenance)
+    if etiquetas is None:
+        return _FUENTE_BLOQUE_EDGAR[bloque] if edgar else None
+    estados = "la SEC EDGAR" if edgar else "FMP"
+    if bloque == "valoracion":
+        return (
+            f"_Fuente de este bloque: estados financieros de {estados}; precio de "
+            f"{etiquetas['quote']}; comparables y tasa Y según las notas de transparencia._"
+        )
+    if bloque == "pilares":
+        return f"_Fuente de este bloque: estados financieros de {estados}; precio de {etiquetas['quote']}._"
+    return (
+        f"_Fuente de este bloque: cotización de {etiquetas['quote']}; VIX: "
+        f"{etiquetas['vix']}; comparables según las notas de transparencia._"
+    )
+
+
+def _con_linea(seccion: Optional[str], linea: Optional[str]) -> Optional[str]:
+    """`seccion` + una línea final (sin tocar la sección si no hay línea o no existe)."""
+    if seccion is None or not linea:
+        return seccion
+    return f"{seccion}\n{linea}"
+
 
 MODELO_LABELS = {
     "multiplos": "el modelo de Múltiplos",
@@ -164,7 +379,10 @@ def _agrupar_peers_por_motivo(peers_no_usados: dict[str, str]) -> dict[str, list
 
 
 def _build_peer_pe_breakdown_line(
-    peers_pe: dict[str, float], peers_no_usados: dict[str, str]
+    peers_pe: dict[str, float],
+    peers_no_usados: dict[str, str],
+    *,
+    ey_calculado_por_el_bot: bool = False,
 ) -> Optional[str]:
     """Detalle de PER individual por peer + motivo específico por peer que no
     aportó dato + procedencia explícita del cálculo. `None` si no hay
@@ -194,9 +412,17 @@ def _build_peer_pe_breakdown_line(
         clausulas.append(f"{_join_con_y(nombres_escapados)} {texto_motivo}")
 
     texto = " — ".join(clausulas) + "."
+    # F2b (CA-29): con la capa de mercado, el earningsYield de un peer puede ser
+    # un cálculo del bot (utilidad TTM de la SEC / capitalización de Finnhub).
+    origen_ey = (
+        "earningsYield de cada peer es un dato de FMP o un cálculo del bot "
+        "(utilidad TTM de la SEC / capitalización de Finnhub), el PER no"
+        if ey_calculado_por_el_bot
+        else "earningsYield sí es un dato de FMP, el PER no"
+    )
     return (
         f"  _{texto} (PER individual calculado por el bot como "
-        "1 / earningsYield — earningsYield sí es un dato de FMP, el PER no)._"
+        f"1 / earningsYield — {origen_ey})._"
     )
 
 
@@ -390,6 +616,8 @@ def build_market_context_section(
     momentum: dict,
     peer_comparison: dict,
     vix: Optional[dict] = None,
+    vix_fuente: Optional[str] = None,
+    peers_ey_calculado: bool = False,
 ) -> str:
     """Sección "Contexto de mercado" (Spec Patch Iter-3, sección 6): momentum
     de precio + comparación explícita con peers. Se ubica entre "Pilares de
@@ -457,7 +685,9 @@ def build_market_context_section(
             f"máximo {_fmt_ratio(per_max)})."
         )
 
-    peer_breakdown_line = _build_peer_pe_breakdown_line(peers_pe, peers_no_usados)
+    peer_breakdown_line = _build_peer_pe_breakdown_line(
+        peers_pe, peers_no_usados, ey_calculado_por_el_bot=peers_ey_calculado
+    )
     if peer_breakdown_line:
         bloque_peers.append(peer_breakdown_line)
 
@@ -470,7 +700,12 @@ def build_market_context_section(
             "general), no del ticker que consultaste. NO es lo mismo "
             "que un índice compuesto de sentimiento tipo \"Fear & "
             "Greed\" (ese combina varias señales distintas; el VIX "
-            "solo mide volatilidad). Dato de FMP (símbolo ^VIX)._"
+            "solo mide volatilidad). "
+            + (
+                "Dato: CBOE vía FRED (serie VIXCLS)._"
+                if vix_fuente == "fred"
+                else "Dato de FMP (símbolo ^VIX)._"
+            )
         )
 
     nota_final = [
@@ -496,7 +731,10 @@ def build_corporate_events_section(events: Optional[list[dict]]) -> Optional[str
     lines = ["*Eventos corporativos recientes (SEC EDGAR):*"]
     for ev in events:
         etiquetas = " + ".join(ev["labels"])
-        lines.append(f"- {ev['filing_date']}: {etiquetas} — [ver el filing]({ev['filing_url']})")
+        if ev["filing_url"]:
+            lines.append(f"- {ev['filing_date']}: {etiquetas} — [ver el filing]({ev['filing_url']})")
+        else:  # CS-29: sin link si el accession/documento no tenía formato SEC
+            lines.append(f"- {ev['filing_date']}: {etiquetas}")
     lines.append(
         "  _Fuente: SEC EDGAR (oficial, gratis, sin API key) — formularios "
         "8-K que la empresa está obligada a presentar por ley ante eventos "
@@ -528,9 +766,21 @@ def build_pillars_section(pillars: dict) -> str:
     return "\n".join(lines)
 
 
-def build_risk_fit_section(risk_fit: dict) -> str:
+def build_risk_fit_section(
+    risk_fit: dict,
+    *,
+    beta_por_defecto: bool = False,
+    market_provenance: Optional[dict] = None,
+) -> str:
+    """`beta_por_defecto` (CA-24, P-8): `True` cuando la beta de la empresa no
+    vino y el análisis usó 1.0; el mensaje lo declara con una línea fija.
+    `market_provenance` (F2b): con la capa de mercado, la beta cita su fuente
+    real (Finnhub o FMP) y el aviso de beta por defecto nombra a ambas."""
+    etiquetas = _fuentes_mercado(market_provenance)
+    fuente_beta = "FMP" if etiquetas is None or etiquetas["metrics"] == _ND_LABEL else etiquetas["metrics"]
+    nota_beta = NOTA_BETA_POR_DEFECTO if etiquetas is None else NOTA_BETA_POR_DEFECTO_MERCADO
     encaje_txt = "SÍ encaja" if risk_fit["encaja"] else "NO encaja"
-    return (
+    seccion = (
         f"*Encaje con tu perfil de riesgo ({risk_fit['perfil']}):*\n"
         f"{encaje_txt} — "
         f"es {risk_fit['etiqueta_activo']} con beta de {risk_fit['beta']:.2f}.\n"
@@ -541,23 +791,37 @@ def build_risk_fit_section(risk_fit: dict) -> str:
         "_Beta mide qué tan volátil es esta acción comparada con el "
         "mercado en general: 1.0 = se mueve igual que el mercado; más de "
         "1.0 = se mueve más fuerte (para arriba y para abajo); menos de "
-        "1.0 = se mueve menos. Dato de FMP._"
+        f"1.0 = se mueve menos. Dato de {fuente_beta}._"
     )
+    return _con_linea(seccion, f"_{nota_beta}_" if beta_por_defecto else None)
 
 
 _EXTRAS_CAMPOS = ["roe", "debt_to_equity", "net_debt_to_ebitda", "dividend_yield", "payout_ratio"]
 
 
-def build_extras_section(extras: Optional[dict]) -> Optional[str]:
+def build_extras_section(extras: Optional[dict], *, source: str = SOURCE_FMP) -> Optional[str]:
     """Sección "Rentabilidad, deuda de largo plazo y dividendos" (Decisión
     #3). Se omite por completo (retorna `None`) si los 5 campos vienen
     `None` — mismo criterio de "degradar con gracia sin ruido" que el resto
     del proyecto. Si al menos un campo está disponible, se muestran solo
     las líneas de los campos presentes, sin placeholder "N/D" para los
     ausentes.
+
+    `source` (CA-23): con `"sec_edgar"` cada línea dice que es un cálculo del
+    bot con datos de la SEC en vez de "dato de FMP"; el default `"fmp"` conserva
+    el texto de siempre.
     """
     if not extras or all(extras.get(campo) is None for campo in _EXTRAS_CAMPOS):
         return None
+    edgar = source == SOURCE_EDGAR
+    # Fragmentos de procedencia por línea (mismo lugar, mismo formato; solo
+    # cambia la etiqueta de la fuente).
+    origen_roe = (
+        "cálculo del bot con datos de la SEC EDGAR"
+        if edgar
+        else "dato ya calculado por FMP, el bot no lo recalcula"
+    )
+    origen = "cálculo del bot con datos de la SEC EDGAR" if edgar else "dato de FMP"
 
     lines = ["*Rentabilidad, deuda de largo plazo y dividendos:*"]
 
@@ -566,7 +830,7 @@ def build_extras_section(extras: Optional[dict]) -> Optional[str]:
         lines.append(
             f"- ROE (Rentabilidad sobre el Patrimonio): {roe * 100:.1f}% "
             "_(fórmula: Ganancia Neta / Patrimonio de los Accionistas — "
-            "dato ya calculado por FMP, el bot no lo recalcula)_"
+            f"{origen_roe})_"
         )
         lines.append(
             f"  _Por cada $100 que pusieron los dueños, la empresa ganó "
@@ -577,7 +841,7 @@ def build_extras_section(extras: Optional[dict]) -> Optional[str]:
     if debt_to_equity is not None:
         lines.append(
             f"- Deuda/Patrimonio (Debt-to-Equity): {debt_to_equity:.2f} "
-            "_(fórmula: Deuda Total / Patrimonio de los Accionistas — dato de FMP)_"
+            f"_(fórmula: Deuda Total / Patrimonio de los Accionistas — {origen})_"
         )
         lines.append(
             "  _Cuánta deuda tiene la empresa comparada con lo que es de los dueños._"
@@ -586,7 +850,7 @@ def build_extras_section(extras: Optional[dict]) -> Optional[str]:
     net_debt_to_ebitda = extras.get("net_debt_to_ebitda")
     if net_debt_to_ebitda is not None:
         lines.append(
-            f"- Deuda Neta / EBITDA: {net_debt_to_ebitda:.2f}x _(dato de FMP)_"
+            f"- Deuda Neta / EBITDA: {net_debt_to_ebitda:.2f}x _({origen})_"
         )
         lines.append(
             "  _Cuántos años de ganancia operativa le tomaría pagar toda su deuda._"
@@ -594,7 +858,7 @@ def build_extras_section(extras: Optional[dict]) -> Optional[str]:
 
     dividend_yield = extras.get("dividend_yield")
     if dividend_yield is not None:
-        lines.append(f"- Dividend Yield: {dividend_yield * 100:.2f}% _(dato de FMP)_")
+        lines.append(f"- Dividend Yield: {dividend_yield * 100:.2f}% _({origen})_")
         if dividend_yield == 0:
             lines.append(
                 "  _Esta empresa no reparte dividendos actualmente — reinvierte todo._"
@@ -608,7 +872,7 @@ def build_extras_section(extras: Optional[dict]) -> Optional[str]:
 
     payout_ratio = extras.get("payout_ratio")
     if payout_ratio is not None:
-        lines.append(f"- Payout Ratio: {payout_ratio * 100:.1f}% _(dato de FMP)_")
+        lines.append(f"- Payout Ratio: {payout_ratio * 100:.1f}% _({origen})_")
         lines.append(
             "  _% de la ganancia que reparte como dividendo — el resto lo "
             "reinvierte en el negocio._"
@@ -823,6 +1087,13 @@ def build_transparency_section(
     income_statement_fuente: Optional[str],
     balance_sheet_fuente: Optional[str],
     cash_flow_fuente: Optional[str],
+    source: str = SOURCE_FMP,
+    fallback_codes: tuple = (),
+    ticker: Optional[str] = None,
+    deuda_ausente: bool = False,
+    intereses_ausentes: bool = False,
+    deuda_ausente_fmp: bool = False,
+    market_provenance: Optional[dict] = None,
 ) -> str:
     """Sección "Notas de transparencia" (Decisión de diseño #9 de
     `SDD_menu_por_capas_explicaciones.md`: hoisteada a función propia para
@@ -832,13 +1103,59 @@ def build_transparency_section(
 
     `peers_note` ya viene resuelto (el llamador decide si usa el que le
     pasaron o calcula el default con `_build_peers_note`) — esta función no
-    conoce `peer_comparison`, solo el string final."""
+    conoce `peer_comparison`, solo el string final.
+
+    Procedencia (CA-23, CS-13, 4.6, 15.5): `source`/`fallback_codes` son los
+    enums cerrados de `FundamentalsResult`; con los defaults (`"fmp"`, sin
+    códigos, sin avisos) la sección es byte-idéntica a la de siempre. Los avisos
+    de deuda/intereses ausentes (`deuda_ausente`/`intereses_ausentes`, derivados
+    por el llamador de un `None`) solo se muestran con fuente SEC: con FMP un
+    dato ausente conserva su tratamiento de siempre. Todos los textos son fijos
+    (plantillas con el ticker ya validado) y cada línea contiene tokens que
+    `ai_rewrite._classify_lines` protege (CS-25): Gemini nunca las reescribe."""
+    edgar = source == SOURCE_EDGAR
+    ticker_txt = _ticker_visible(ticker)
+    if market_provenance:
+        # F2b: los estados y los datos de mercado citan cada uno su fuente real.
+        primera = (
+            "_Estados financieros (ingresos, deuda, flujo de caja) obtenidos de la "
+            + ("SEC EDGAR._" if edgar else "Financial Modeling Prep (FMP)._")
+        )
+    elif edgar:
+        primera = (
+            "_Estados financieros (ingresos, deuda, flujo de caja) obtenidos de la "
+            "SEC EDGAR; cotización, perfil y VIX de Financial Modeling Prep (FMP)._"
+        )
+    else:
+        primera = (
+            "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
+            "obtenidos de Financial Modeling Prep (FMP)._"
+        )
     transparency_lines = [
         "*Notas de transparencia:*",
-        "_Datos financieros (ingresos, deuda, flujo de caja, cotización, etc.) "
-        "obtenidos de Financial Modeling Prep (FMP)._",
-        f"_Nota de transparencia: {peers_note}_",
+        primera,
     ]
+    if market_provenance:
+        transparency_lines.extend(_lineas_mercado(market_provenance))
+    if fallback_codes:
+        if not edgar:
+            plantilla = (
+                _NOTA_RESPALDO_SIN_COBERTURA
+                if fallback_codes[0] in _CODIGOS_SIN_COBERTURA
+                else _NOTA_RESPALDO_TEMPORAL
+            )
+            transparency_lines.append(f"_{plantilla.format(ticker=ticker_txt)}_")
+        elif "cache_antiguo" in fallback_codes:
+            transparency_lines.append(f"_{_NOTA_CACHE_ANTIGUO.format(ticker=ticker_txt)}_")
+    if edgar:
+        transparency_lines.append(f"_{NOTA_DEFINICIONES_EDGAR}_")
+        if deuda_ausente:
+            transparency_lines.append(f"_{AVISO_DEUDA_AUSENTE.format(ticker=ticker_txt)}_")
+        elif intereses_ausentes:
+            transparency_lines.append(f"_{AVISO_INTERESES_AUSENTES.format(ticker=ticker_txt)}_")
+    elif deuda_ausente_fmp:
+        transparency_lines.append(f"_{AVISO_DEUDA_AUSENTE_FMP.format(ticker=ticker_txt)}_")
+    transparency_lines.append(f"_Nota de transparencia: {peers_note}_")
     if treasury_source:
         transparency_lines.append(
             f"_Y (tasa libre de riesgo) obtenida de: {treasury_source}._"
@@ -902,7 +1219,7 @@ def build_summary_parts_short(
     solo se muestra bajo demanda."""
     # company_name viene sin sanitizar de FMP (profile.get("companyName")) —
     # escapado obligatorio, ver _escape_markdown_legacy.
-    titulo = f"*{_escape_markdown_legacy(company_name)} ({ticker})*"
+    titulo = f"*{_nombre_para_titulo(company_name, ticker)} ({ticker})*"
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
     teaser_line = build_valor_justo_teaser_line(scenarios, escenario_elegido, precio_actual)
     invite = "👇 Elegí qué querés que te explique."
@@ -930,6 +1247,13 @@ def build_summary_parts(
     balance_sheet_fuente: Optional[str] = None,
     income_statement_fuente: Optional[str] = None,
     cash_flow_fuente: Optional[str] = None,
+    source: str = SOURCE_FMP,
+    fallback_codes: tuple = (),
+    deuda_ausente: bool = False,
+    intereses_ausentes: bool = False,
+    deuda_ausente_fmp: bool = False,
+    beta_por_defecto: bool = False,
+    market_provenance: Optional[dict] = None,
 ) -> list[str]:
     """Arma la respuesta completa, estilo "explícamelo como si fuera tonto",
     y devuelve la lista de secciones sin unir (ya filtrada de `None`) — es
@@ -945,18 +1269,26 @@ def build_summary_parts(
     Contexto de mercado (incluye VIX) → Encaje de riesgo (incluye
     explicaciones dummy) → Notas de transparencia (incluye WACC expandido +
     disclaimer general).
+
+    Procedencia (SDD_fuentes_datos_gratuitas.md, CA-23, CS-13): `source`,
+    `fallback_codes`, `deuda_ausente`, `intereses_ausentes` y
+    `beta_por_defecto` son keyword-only con defaults que reproducen el
+    comportamiento anterior (QM-7: `source="fmp"`, sin avisos).
+    `market_provenance` (F2b, `{"sources": {bloque: fuente}, "codes": (...)}`)
+    solo lo pasa `query_handler` con la capa de mercado activa; `None` = textos
+    de siempre.
     """
-    # company_name viene sin sanitizar de FMP (profile.get("companyName")) —
-    # escapado obligatorio, ver _escape_markdown_legacy.
-    titulo = f"*{_escape_markdown_legacy(company_name)} ({ticker})*"
+    # company_name es dato de terceros (FMP, o `entityName` de la SEC) —
+    # sanitizado y acotado a 100 caracteres (CS-11), ver sanitize_third_party_name.
+    titulo = f"*{_nombre_para_titulo(company_name, ticker)} ({ticker})*"
     veredicto_section = build_veredicto_section(pillars=pillars, risk_fit=risk_fit)
 
     intro = build_intro_section()
 
     ratios_lines = [
         "*Ratios clave:*",
-        "_(calculados por el bot a partir de datos de FMP — no son campos "
-        "directos de la API)_",
+        f"_(calculados por el bot a partir de datos de {_FUENTE_ESTADOS_LABEL[source]} — "
+        "no son campos directos de la API)_",
     ]
     if ratios.get("ratio_liquidez") is not None:
         ratios_lines.append(
@@ -985,20 +1317,34 @@ def build_summary_parts(
             " _(fórmula: Capitalización de Mercado / Ventas Totales)_"
         )
 
-    extras_section = build_extras_section(extras)
+    extras_section = build_extras_section(extras, source=source)
 
-    valuation_section = build_valuation_scenarios_section(
-        scenarios, precio_actual, n_peers_validos, escenario_elegido=escenario_elegido
+    edgar = source == SOURCE_EDGAR
+    valuation_section = _con_linea(
+        build_valuation_scenarios_section(
+            scenarios, precio_actual, n_peers_validos, escenario_elegido=escenario_elegido
+        ),
+        _linea_bloque("valoracion", edgar=edgar, market_provenance=market_provenance),
     )
-    pillars_section = build_pillars_section(pillars)
-    market_context_section = build_market_context_section(
-        precio_actual=precio_actual,
-        momentum=momentum,
-        peer_comparison=peer_comparison,
-        vix=vix,
+    pillars_section = _con_linea(
+        build_pillars_section(pillars),
+        _linea_bloque("pilares", edgar=edgar, market_provenance=market_provenance),
+    )
+    market_context_section = _con_linea(
+        build_market_context_section(
+            precio_actual=precio_actual,
+            momentum=momentum,
+            peer_comparison=peer_comparison,
+            vix=vix,
+            vix_fuente=(market_provenance or {}).get("sources", {}).get("vix"),
+            peers_ey_calculado=bool((market_provenance or {}).get("peers_ey_bot")),
+        ),
+        _linea_bloque("mercado", edgar=edgar, market_provenance=market_provenance),
     )
     corporate_events_section = build_corporate_events_section(corporate_events)
-    risk_section = build_risk_fit_section(risk_fit)
+    risk_section = build_risk_fit_section(
+        risk_fit, beta_por_defecto=beta_por_defecto, market_provenance=market_provenance
+    )
 
     peers_note_final = peers_note if peers_note is not None else _build_peers_note(
         peer_comparison.get("fuente_peers")
@@ -1009,6 +1355,13 @@ def build_summary_parts(
         income_statement_fuente=income_statement_fuente,
         balance_sheet_fuente=balance_sheet_fuente,
         cash_flow_fuente=cash_flow_fuente,
+        source=source,
+        fallback_codes=fallback_codes,
+        ticker=ticker,
+        deuda_ausente=deuda_ausente,
+        intereses_ausentes=intereses_ausentes,
+        deuda_ausente_fmp=deuda_ausente_fmp,
+        market_provenance=market_provenance,
     )
 
     parts = [
@@ -1048,6 +1401,13 @@ def build_summary(
     balance_sheet_fuente: Optional[str] = None,
     income_statement_fuente: Optional[str] = None,
     cash_flow_fuente: Optional[str] = None,
+    source: str = SOURCE_FMP,
+    fallback_codes: tuple = (),
+    deuda_ausente: bool = False,
+    intereses_ausentes: bool = False,
+    deuda_ausente_fmp: bool = False,
+    beta_por_defecto: bool = False,
+    market_provenance: Optional[dict] = None,
 ) -> str:
     """Wrapper de una línea sobre `build_summary_parts` (Decisión 16.1) —
     puramente aditivo: todo lo que hoy llama `build_summary(...)` sigue
@@ -1073,5 +1433,12 @@ def build_summary(
             balance_sheet_fuente=balance_sheet_fuente,
             income_statement_fuente=income_statement_fuente,
             cash_flow_fuente=cash_flow_fuente,
+            source=source,
+            fallback_codes=fallback_codes,
+            deuda_ausente=deuda_ausente,
+            intereses_ausentes=intereses_ausentes,
+            deuda_ausente_fmp=deuda_ausente_fmp,
+            beta_por_defecto=beta_por_defecto,
+            market_provenance=market_provenance,
         )
     )

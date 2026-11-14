@@ -32,10 +32,13 @@ spec no fija unidades explícitas):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
 MARKET_RISK_PREMIUM = 0.055  # 5.5% — constante documentada, Decisión de diseño #10
+# CS-28 (SDD_fuentes_datos_gratuitas.md): tope del costo de deuda antes de impuestos.
+KD_PRETAX_MAXIMO = 0.30
 GRAHAM_HISTORICAL_YIELD = 4.4  # constante de la fórmula original de Graham
 TERMINAL_GROWTH_RATE = 0.025  # 2.5% — supuesto explícito de largo plazo (perpetuidad)
 DCF_PROJECTION_YEARS = 5
@@ -202,7 +205,10 @@ def calculate_wacc(
     """
     if market_cap is None or market_cap <= 0:
         return None
-    total_debt = total_debt or 0.0
+    if total_debt is None:
+        # Deuda desconocida (4.10 pt 3, D-20): N/D, nunca "sin deuda". Con
+        # `or 0.0` el WACC colapsaria a Ke con una deuda inventada.
+        return None
     if total_debt < 0:
         return None
 
@@ -216,6 +222,11 @@ def calculate_wacc(
         # Sin deuda: WACC colapsa a Ke (no hay componente de deuda que ponderar).
         return ke
 
+    if interest_expense is None:
+        # Con deuda > 0 e intereses ausentes (AAPL en EDGAR) no hay costo de
+        # deuda: Kd = 0 daria un WACC artificialmente bajo y un DCF inflado.
+        return None
+
     if income_before_tax is None or income_before_tax <= 0:
         # Tasa impositiva efectiva indefinida con utilidad antes de impuestos <= 0.
         # Se usa Kd pre-impuesto como aproximación conservadora en vez de crashear.
@@ -224,6 +235,10 @@ def calculate_wacc(
         tax_rate = income_tax_expense / income_before_tax
 
     kd_pretax = interest_expense / total_debt
+    if not math.isfinite(kd_pretax) or kd_pretax > KD_PRETAX_MAXIMO:
+        # CS-28: un costo de deuda absurdo (dato corrupto o intereses de otra
+        # base) no se promedia: WACC N/D (`wacc_no_calculable`). No cambia fórmulas.
+        return None
     kd_aftertax = kd_pretax * (1 - tax_rate)
 
     e_weight = market_cap / v
