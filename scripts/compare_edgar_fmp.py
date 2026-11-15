@@ -15,8 +15,8 @@ Para cada ticker (por defecto NVDA, ADBE y KO) imprime las diferencias de los
   * `revenue`, `netIncome`, `operatingCashFlow`, `capitalExpenditure`, `totalAssets`,
     `totalCurrentAssets`, `totalCurrentLiabilities`, `cashAndCashEquivalents`:
     exacto, o <= 0,5% si FMP reexpresó;
-  * `epsDiluted`: +/- 0,01; acciones diluidas: <= 0,1% (<= 0,05% en un Q4 derivado,
-    que el script no distingue: se informa con el tope de 0,1%);
+  * `epsDiluted`: +/- 0,01; acciones diluidas: <= 0,2% (el redondeo de FMP a
+    múltiplos de 0,5 M llega a ~0,13%; ver sección 18 de la spec);
   * TTM de `netIncome`: <= 0,5%; EPS TTM, P/S y PER: <= 1%;
   * `ebit`, `totalDebt`, `propertyPlantEquipmentNet`: diferencia ESPERADA y
     documentada (3.5): se informa y no se rechaza; `interestExpense` de EDGAR en
@@ -67,7 +67,7 @@ EXACT_FIELDS: dict[str, dict[str, float]] = {
     },
 }
 EPS_ABS_TOLERANCE = 0.01
-SHARES_REL_TOLERANCE = 0.001
+SHARES_REL_TOLERANCE = 0.002
 TTM_NET_INCOME_REL_TOLERANCE = 0.005
 RATIO_REL_TOLERANCE = 0.01  # EPS TTM, P/S, PER
 

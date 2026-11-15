@@ -22,7 +22,11 @@ import unicodedata
 from typing import Optional
 
 from investbot import peers, rules
-from investbot.valuation import MIN_PEERS_VALIDOS_PARA_MULTIPLOS, classify_scenario
+from investbot.valuation import (
+    DETALLES_VALIDOS,
+    MIN_PEERS_VALIDOS_PARA_MULTIPLOS,
+    classify_scenario,
+)
 
 # Caracteres especiales del modo "Markdown" legado de Telegram (no el más
 # nuevo "MarkdownV2", que tiene una lista mucho más larga) — documentados por
@@ -302,6 +306,76 @@ MOTIVO_LABELS = {
     ),
 }
 
+# SDD_motivos_nd_y_empresas_en_perdidas.md (15.5). `MOTIVO_LABELS` queda intacto
+# (CA-ND-5): los textos nuevos viven en estos dicts. Fragmentos en minuscula,
+# sin punto final, sin cifras ni `*`, `_`, backtick, corchetes (el compositor
+# agrega el "." al armar la linea).
+MOTIVO_LABELS_EXTRA = {
+    "eps_cagr_no_calculable": "no se pudo calcular el crecimiento histórico de la ganancia con los datos disponibles",
+    "fcf_cagr_no_calculable": "no se pudo calcular el crecimiento histórico del flujo de caja libre con los datos disponibles",
+}
+
+DETALLE_LABELS = {
+    "eps_no_disponible": "no pude obtener la ganancia por acción (EPS) de la empresa",
+    "wacc_capitalizacion_no_disponible": "no pude obtener el valor de mercado de la empresa, necesario para estimar el costo de capital (WACC)",
+    "wacc_deuda_no_disponible": "no pude obtener la deuda total de la empresa, necesaria para estimar el costo de capital (WACC)",
+    "wacc_deuda_invalida": "el dato de deuda total de la empresa es inválido (negativo), así que no se puede estimar el costo de capital (WACC)",
+    "wacc_intereses_no_disponibles": "la empresa tiene deuda pero no pude obtener cuánto paga de intereses, necesario para estimar el costo de capital (WACC)",
+    "wacc_costo_deuda_fuera_de_rango": "el costo de la deuda que sale de los datos está fuera de lo razonable (puede ser un dato erróneo o una deuda muy cara), así que no se usa para estimar el costo de capital (WACC)",
+    "wacc_tasa_bono_no_disponible": "no pude obtener la tasa del bono del tesoro (FRED/Treasury.gov), necesaria para estimar el costo de capital (WACC)",
+}
+
+MOTIVO_GENERICO = "no pude identificar el motivo exacto con los datos de esta consulta"
+
+MODELO_LABELS_RESUMEN = {
+    "multiplos": "Múltiplos",
+    "graham": "Graham",
+    "dcf": "DCF",
+}
+
+
+def motivo_texto(motivo, detalle=None) -> Optional[str]:
+    """Texto del motivo de exclusion de un modelo: el del `detalle` (si es una
+    clave valida de `DETALLES_VALIDOS`), si no el de `MOTIVO_LABELS` /
+    `MOTIVO_LABELS_EXTRA`; `None` si no se conoce. Nunca lanza ni devuelve el
+    valor crudo: `isinstance` antes de usar como clave (un `detalle` tipo lista
+    daria `TypeError: unhashable`)."""
+    if isinstance(detalle, str) and detalle in DETALLES_VALIDOS and detalle in DETALLE_LABELS:
+        return DETALLE_LABELS[detalle]
+    if isinstance(motivo, str):
+        return MOTIVO_LABELS.get(motivo) or MOTIVO_LABELS_EXTRA.get(motivo)
+    return None
+
+
+def build_motivos_resumen(excluidos) -> Optional[str]:
+    """Resumen de una linea de por que no se calcularon los modelos:
+    `Múltiplos y Graham: <t1>; DCF: <t2>` (sin punto final). Orden fijo
+    multiplos -> graham -> dcf; agrupa por texto resuelto; un modelo repetido
+    usa su primera entrada; salta entradas no-dict y modelos fuera de
+    `MODELO_LABELS_RESUMEN`. `None` si no hay nada (nunca la cadena "None")."""
+    if not isinstance(excluidos, list):
+        return None
+    por_modelo: dict[str, Optional[str]] = {}
+    for item in excluidos:
+        if not isinstance(item, dict):
+            continue
+        modelo = item.get("modelo")
+        if not isinstance(modelo, str) or modelo not in MODELO_LABELS_RESUMEN or modelo in por_modelo:
+            continue
+        por_modelo[modelo] = motivo_texto(item.get("motivo"), item.get("detalle"))
+    grupos: dict[str, list[str]] = {}
+    for modelo, nombre in MODELO_LABELS_RESUMEN.items():
+        texto = por_modelo.get(modelo)
+        if texto is not None:
+            grupos.setdefault(texto, []).append(nombre)
+    if not grupos:
+        return None
+    return "; ".join(
+        f"{', '.join(nombres[:-1]) + ' y ' + nombres[-1] if len(nombres) > 1 else nombres[0]}: {texto}"
+        for texto, nombres in grupos.items()
+    )
+
+
 MOTIVO_NO_COMPARABLE_LABELS = {
     "eps_no_positivo": "tu PER no aplica por EPS negativo o cero — mirá el P/S como referencia.",
     "sin_peers_validos": "no hay comparables con PER válido en tu set de peers para comparar.",
@@ -481,7 +555,13 @@ def build_valuation_scenarios_section(
     conservador = scenarios["conservador"]
     optimista = scenarios["optimista"]
     excluidos_base = scenarios.get("modelos_excluidos_base") or []
-    excluidos_base_modelos = {item["modelo"] for item in excluidos_base}
+    if not isinstance(excluidos_base, list):
+        excluidos_base = []  # dato corrupto: se trata como "sin excluidos"
+    excluidos_base_modelos = {
+        item["modelo"]
+        for item in excluidos_base
+        if isinstance(item, dict) and isinstance(item.get("modelo"), str)
+    }
 
     encabezado = " | ".join(
         _escenario_header(k, escenario_elegido) for k in _ESCENARIOS_ORDEN
@@ -528,8 +608,15 @@ def build_valuation_scenarios_section(
     lines.extend(graham_g_cap_avisos)
 
     for item in excluidos_base:
-        modelo_label = MODELO_LABELS.get(item["modelo"], item["modelo"])
-        if item["motivo"] == "peers_validos_insuficientes":
+        if not isinstance(item, dict):
+            continue
+        modelo = item.get("modelo")
+        modelo_label = (
+            MODELO_LABELS.get(modelo, "uno de los modelos")
+            if isinstance(modelo, str)
+            else "uno de los modelos"
+        )
+        if item.get("motivo") == "peers_validos_insuficientes":
             # SDD_calidad_peers_multiplos.md, Decisión #4 — mensaje dinámico
             # que preserva el detalle cuantitativo que antes se mostraba como
             # nota al pie de la fila con valores (ahora la fila ni se
@@ -539,7 +626,11 @@ def build_valuation_scenarios_section(
                 f"(mínimo {MIN_PEERS_VALIDOS_PARA_MULTIPLOS}, hubo {n_peers_validos})"
             )
         else:
-            motivo_label = MOTIVO_LABELS.get(item["motivo"], item["motivo"])
+            # SDD_motivos_nd (S-3): un motivo/detalle desconocido o corrupto
+            # nunca se interpola crudo (rompe el Markdown legacy).
+            motivo_label = (
+                motivo_texto(item.get("motivo"), item.get("detalle")) or MOTIVO_GENERICO
+            )
         lines.append(f"- {modelo_label} no se pudo calcular: {motivo_label}.")
 
     total_pes = pesimista.get("valor_justo_total")
@@ -1187,10 +1278,21 @@ def build_valor_justo_teaser_line(
     total = escenario.get("valor_justo_total")
     titulo = _ESCENARIO_TITULOS.get(escenario_elegido, escenario_elegido or "elegido")
     if total is None:
-        return (
+        linea = (
             f"Valor Justo Total ({titulo}): no calculable con los datos "
             f"disponibles esta consulta — tu precio actual: {_fmt_money(precio_actual)}."
         )
+        # SDD_motivos_nd (P-5, Q-4, 14.8): el "por qué" se agrega en la MISMA
+        # linea, solo si hay motivos conocidos en
+        # `scenarios[escenario_elegido]['modelos_excluidos']`. Todo lo nuevo va
+        # protegido: ausente / no-lista / corrupto => linea identica a HEAD.
+        try:
+            resumen = build_motivos_resumen(escenario.get("modelos_excluidos"))
+            if resumen:
+                linea += f" Por qué: {resumen}."
+        except Exception:  # noqa: BLE001 -- defensivo: nunca romper el primer mensaje
+            pass
+        return linea
     return (
         f"Valor Justo Total ({titulo}): {_fmt_money(total)} — tu precio "
         f"actual: {_fmt_money(precio_actual)}."

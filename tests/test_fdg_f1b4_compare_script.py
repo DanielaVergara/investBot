@@ -225,6 +225,33 @@ def test_fdg_ca33_clasificadores_y_emparejado_de_fechas(script):
     assert {v for _, v, _, _ in ttm} == {"SIN_DATO"}
 
 
+def _veredicto_acciones(script, edgar, fmp):
+    filas = script.compare_statement(
+        "income",
+        [{"date": "2026-08-28", "weightedAverageShsOutDil": edgar}],
+        [{"date": "2026-08-28", "weightedAverageShsOutDil": fmp}],
+    )
+    return next(v for _, campo, v, _, _ in filas if campo == "weightedAverageShsOutDil")
+
+
+def test_fdg_s18_tolerancia_de_acciones_diluidas_es_0_2_por_ciento(script):
+    assert script.SHARES_REL_TOLERANCE == 0.002
+    # bordes exactos: 0,2% pasa (en ambos sentidos), por encima es FUERA
+    assert _veredicto_acciones(script, 1002, 1000) == "OK"
+    assert _veredicto_acciones(script, 998, 1000) == "OK"
+    assert _veredicto_acciones(script, 1000, 1000) == "OK"
+    assert _veredicto_acciones(script, 1002.1, 1000) == "FUERA"
+    assert _veredicto_acciones(script, 997.9, 1000) == "FUERA"
+    # 0,3% sigue FUERA
+    assert _veredicto_acciones(script, 1003, 1000) == "FUERA"
+
+
+def test_fdg_s18_datos_reales_de_adbe_con_redondeo_de_fmp_quedan_dentro(script):
+    assert _veredicto_acciones(script, 395_500_000, 395_000_000) == "OK"  # 0,127%
+    assert _veredicto_acciones(script, 402_500_000, 402_000_000) == "OK"  # 0,124%
+    assert _veredicto_acciones(script, 396_200_000, 395_000_000) == "FUERA"  # 0,30%
+
+
 # --- AST / estructura -----------------------------------------------------------------------------------------
 
 def test_fdg_ca33_estructura_sin_emails_ni_redirecciones_ni_escritura_ni_ssl_apagado():

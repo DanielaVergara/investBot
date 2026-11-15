@@ -4251,15 +4251,25 @@ async def test_mensaje_paso_a_paso_vf_3_no_calculables_omite_cuenta_pero_muestra
     store = ai_explain.ExplanationContextStore()
     cid = store.put(ctx)
     respuesta = "No fue posible estimar un valor justo con los modelos disponibles para este ticker."
-    client = _client_with_handler(_ok_handler(respuesta))
+    gemini_requests = []
+
+    def handler(request):
+        gemini_requests.append(request)
+        return httpx.Response(200, json=gemini_response(respuesta))
+
+    client = _client_with_handler(handler)
     clients = _make_clients(http_client=client, gemini_config=_enabled_config())
     callback = _build_callback(clients, FakeRateLimiter(), store)
 
     update, query, context = _fake_callback_update(f"xp:{cid}:p:vf")
     await callback(update, context)
 
-    context.bot.edit_message_text.assert_awaited_once()
-    _, kwargs = context.bot.edit_message_text.call_args
+    # SDD_motivos_nd (opción A): con el total N/D el handler responde con un
+    # mensaje determinístico (un `send_message`), sin llamar a Gemini.
+    assert gemini_requests == []
+    context.bot.send_message.assert_awaited_once()
+    context.bot.edit_message_text.assert_not_awaited()
+    _, kwargs = context.bot.send_message.call_args
     texto = kwargs["text"]
     assert "🧮 Cuenta" not in texto
     assert "🔍 Desglose" in texto

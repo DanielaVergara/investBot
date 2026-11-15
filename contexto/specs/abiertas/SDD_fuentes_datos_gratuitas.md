@@ -895,3 +895,11 @@ El rango de 14.5/15.9 (3.100–3.250 para F1; 3.200–3.370 con F2) quedó obsol
 
 ## 17.4 Mover la spec a `cerradas/`
 No ahora. Solo cuando: (a) F1a-2 esté verde con fixtures reales; (b) la prueba en vivo cumpla 15.11 punto 7; (c) esta sección 17 esté registrada. Al cerrar, mover F3 a una spec aparte.
+
+---
+
+# Sección 18 — Spec Patch Iter-2 (menor): tolerancia de acciones diluidas en la comparación en vivo (2026-11-14)
+
+**Evidencia (corrida real de `scripts/compare_edgar_fmp.py NVDA ADBE KO` en el VPS, datos reales de la SEC y de FMP):** el parser reprodujo EXACTO contra FMP todos los `revenue`, `netIncome`, `epsDiluted`, `operatingCashFlow`, `capitalExpenditure` (incluidas las filas derivadas por YTD y el Q4) y los saldos de balance de los últimos 4 trimestres de NVDA, ADBE y KO; el TTM de `netIncome` coincidió exacto (NVDA 192.879 M, ADBE 7.284 M, KO 14.629 M, iguales a los oráculos calculados a mano en 14.7); EPS TTM, P/S y PER dentro de ≤ 0,13% (tolerancia 1%); las diferencias de `ebit`, `totalDebt` y `propertyPlantEquipmentNet` son las ESPERADAS de 3.5. Quedaron 2 diferencias FUERA, ambas del mismo campo: `weightedAverageShsOutDil` de ADBE (2026-08-28: EDGAR 395,5 M vs FMP 395,0 M = 0,127%; 2026-05-29: EDGAR 402,5 M vs FMP 402,0 M = 0,124%) contra la tolerancia vigente de ≤ 0,1%. En esos valores FMP aparece redondeado a múltiplos de 0,5 M y EDGAR trae el valor exacto reportado; el efecto en EPS TTM (0,13%) y PER (0,12%) queda dentro de la tolerancia de 1%. No es un defecto del parser.
+**Cambio vigente (reemplaza la tolerancia de acciones de 14.8):** acciones diluidas `weightedAverageShsOutDil` ≤ **0,2%** (antes ≤ 0,1%, ≤ 0,05% en Q4 derivado, que el script no distingue). El resto de las tolerancias de 14.8 NO cambia. Es un spec patch con evidencia, no un ajuste silencioso. El criterio CA-3 (test sobre fixtures: acciones ±0,05%) NO cambia: aplica a la comparación contra el fixture sintético/capturado, no a la corrida en vivo contra el redondeo de FMP.
+**Efecto sobre el gate:** con esta tolerancia, la corrida de NVDA, ADBE y KO termina con código 0 (todas las diferencias dentro de tolerancia o esperadas); EDGAR queda habilitado para activarse en producción respecto de este gate. F1a-2 (fixtures reales commiteados) sigue siendo backlog de validación.

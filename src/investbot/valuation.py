@@ -179,6 +179,83 @@ def calculate_graham_fair_value(
     return eps_ttm * multiplicador * GRAHAM_HISTORICAL_YIELD / y_pct
 
 
+DETALLES_VALIDOS = frozenset(
+    {
+        "eps_no_disponible",
+        "wacc_capitalizacion_no_disponible",
+        "wacc_deuda_no_disponible",
+        "wacc_deuda_invalida",
+        "wacc_intereses_no_disponibles",
+        "wacc_costo_deuda_fuera_de_rango",
+        "wacc_tasa_bono_no_disponible",
+    }
+)
+"""Sub-causas cerradas (SDD_motivos_nd) del campo aditivo
+`ModeloExcluido.detalle`: solo para `wacc_no_calculable` y EPS ausente."""
+
+
+def _wacc_con_detalle(
+    *,
+    interest_expense: float,
+    total_debt: float,
+    income_tax_expense: float,
+    income_before_tax: float,
+    beta: float,
+    y: float,
+    market_cap: float,
+    market_risk_premium: float = MARKET_RISK_PREMIUM,
+) -> tuple[Optional[float], Optional[str]]:
+    """Cuerpo de `calculate_wacc` con la sub-causa del `None` (SDD_motivos_nd).
+
+    Devuelve `(wacc, detalle)`. `detalle` es `None` cuando hay valor y, cuando
+    no lo hay, una clave de `DETALLES_VALIDOS`. Mismas ramas, mismo orden de
+    evaluación y mismas excepciones que antes del refactor (incluido
+    `income_tax_expense / income_before_tax` ANTES del chequeo de Kd).
+    """
+    if market_cap is None or market_cap <= 0:
+        return None, "wacc_capitalizacion_no_disponible"
+    if total_debt is None:
+        # Deuda desconocida (4.10 pt 3, D-20): N/D, nunca "sin deuda". Con
+        # `or 0.0` el WACC colapsaria a Ke con una deuda inventada.
+        return None, "wacc_deuda_no_disponible"
+    if total_debt < 0:
+        return None, "wacc_deuda_invalida"
+
+    v = market_cap + total_debt
+    if v <= 0:  # pragma: no cover - inalcanzable (market_cap>0 y total_debt>=0 ya garantizados arriba)
+        return None, "wacc_capitalizacion_no_disponible"
+
+    ke = y + beta * market_risk_premium
+
+    if total_debt == 0:
+        # Sin deuda: WACC colapsa a Ke (no hay componente de deuda que ponderar).
+        return ke, None
+
+    if interest_expense is None:
+        # Con deuda > 0 e intereses ausentes (AAPL en EDGAR) no hay costo de
+        # deuda: Kd = 0 daria un WACC artificialmente bajo y un DCF inflado.
+        return None, "wacc_intereses_no_disponibles"
+
+    if income_before_tax is None or income_before_tax <= 0:
+        # Tasa impositiva efectiva indefinida con utilidad antes de impuestos <= 0.
+        # Se usa Kd pre-impuesto como aproximación conservadora en vez de crashear.
+        tax_rate = 0.0
+    else:
+        tax_rate = income_tax_expense / income_before_tax
+
+    kd_pretax = interest_expense / total_debt
+    if not math.isfinite(kd_pretax) or kd_pretax > KD_PRETAX_MAXIMO:
+        # CS-28: un costo de deuda absurdo (dato corrupto o intereses de otra
+        # base) no se promedia: WACC N/D (`wacc_no_calculable`). No cambia fórmulas.
+        return None, "wacc_costo_deuda_fuera_de_rango"
+    kd_aftertax = kd_pretax * (1 - tax_rate)
+
+    e_weight = market_cap / v
+    d_weight = total_debt / v
+
+    return e_weight * ke + d_weight * kd_aftertax, None
+
+
 def calculate_wacc(
     *,
     interest_expense: float,
@@ -203,48 +280,16 @@ def calculate_wacc(
     `income_before_tax <= 0`, que haría la tasa impositiva efectiva
     indefinida).
     """
-    if market_cap is None or market_cap <= 0:
-        return None
-    if total_debt is None:
-        # Deuda desconocida (4.10 pt 3, D-20): N/D, nunca "sin deuda". Con
-        # `or 0.0` el WACC colapsaria a Ke con una deuda inventada.
-        return None
-    if total_debt < 0:
-        return None
-
-    v = market_cap + total_debt
-    if v <= 0:  # pragma: no cover - inalcanzable (market_cap>0 y total_debt>=0 ya garantizados arriba)
-        return None
-
-    ke = y + beta * market_risk_premium
-
-    if total_debt == 0:
-        # Sin deuda: WACC colapsa a Ke (no hay componente de deuda que ponderar).
-        return ke
-
-    if interest_expense is None:
-        # Con deuda > 0 e intereses ausentes (AAPL en EDGAR) no hay costo de
-        # deuda: Kd = 0 daria un WACC artificialmente bajo y un DCF inflado.
-        return None
-
-    if income_before_tax is None or income_before_tax <= 0:
-        # Tasa impositiva efectiva indefinida con utilidad antes de impuestos <= 0.
-        # Se usa Kd pre-impuesto como aproximación conservadora en vez de crashear.
-        tax_rate = 0.0
-    else:
-        tax_rate = income_tax_expense / income_before_tax
-
-    kd_pretax = interest_expense / total_debt
-    if not math.isfinite(kd_pretax) or kd_pretax > KD_PRETAX_MAXIMO:
-        # CS-28: un costo de deuda absurdo (dato corrupto o intereses de otra
-        # base) no se promedia: WACC N/D (`wacc_no_calculable`). No cambia fórmulas.
-        return None
-    kd_aftertax = kd_pretax * (1 - tax_rate)
-
-    e_weight = market_cap / v
-    d_weight = total_debt / v
-
-    return e_weight * ke + d_weight * kd_aftertax
+    return _wacc_con_detalle(
+        interest_expense=interest_expense,
+        total_debt=total_debt,
+        income_tax_expense=income_tax_expense,
+        income_before_tax=income_before_tax,
+        beta=beta,
+        y=y,
+        market_cap=market_cap,
+        market_risk_premium=market_risk_premium,
+    )[0]
 
 
 @dataclass(frozen=True)
@@ -369,6 +414,31 @@ def calculate_dcf_fair_value(
 class ModeloExcluido:
     modelo: str
     motivo: str
+    # SDD_motivos_nd: sub-causa cerrada (`DETALLES_VALIDOS`); aditivo, `None`
+    # por defecto (no cambia `motivo`).
+    detalle: Optional[str] = None
+
+
+def _excluido_dict(m: "ModeloExcluido") -> dict:
+    """`as_dict` de un excluido: `detalle` SOLO si no es `None` (los dicts de
+    siempre quedan byte a byte iguales)."""
+    d = {"modelo": m.modelo, "motivo": m.motivo}
+    if m.detalle is not None:
+        d["detalle"] = m.detalle
+    return d
+
+
+def _detalle_eps(eps_ttm: Optional[float]) -> Optional[str]:
+    """`eps_no_disponible` solo si el EPS falta (None); EPS <= 0 es dato real."""
+    return "eps_no_disponible" if eps_ttm is None else None
+
+
+def _wacc_para_dcf(y: Optional[float], wacc_inputs: dict) -> tuple[Optional[float], Optional[str]]:
+    """WACC del DCF con su sub-causa. `y is None` tiene precedencia sobre todo
+    (no se invoca el cálculo, igual que antes)."""
+    if y is None:
+        return None, "wacc_tasa_bono_no_disponible"
+    return _wacc_con_detalle(y=y or 0.0, **wacc_inputs)
 
 
 @dataclass
@@ -401,7 +471,7 @@ class ValuationResult:
             "valor_justo_dcf": self.valor_justo_dcf,
             "valor_justo_total": self.valor_justo_total,
             "modelos_excluidos": [
-                {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos
+                _excluido_dict(m) for m in self.modelos_excluidos
             ],
             "graham_g_original": self.graham_g_original,     # NUEVO
             "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
@@ -465,7 +535,7 @@ def compute_valuation(
     # --- Múltiplos ---
     if eps_no_positivo:
         result.modelos_excluidos.append(
-            ModeloExcluido("multiplos", "eps_ttm_no_positivo")
+            ModeloExcluido("multiplos", "eps_ttm_no_positivo", _detalle_eps(eps_ttm))
         )
     elif n_peers_validos is not None and n_peers_validos < MIN_PEERS_VALIDOS_PARA_MULTIPLOS:
         result.modelos_excluidos.append(
@@ -482,7 +552,9 @@ def compute_valuation(
 
     # --- Graham EPS Model ---
     if eps_no_positivo:
-        result.modelos_excluidos.append(ModeloExcluido("graham", "eps_ttm_no_positivo"))
+        result.modelos_excluidos.append(
+            ModeloExcluido("graham", "eps_ttm_no_positivo", _detalle_eps(eps_ttm))
+        )
     else:
         n_años_eps = (len(eps_historial) - 1) / periodos_por_anio_eps if eps_historial else 0
         eps_antiguo = eps_historial[0] if eps_historial else None
@@ -517,9 +589,11 @@ def compute_valuation(
         motivo = _motivo_cagr_invalido(fcf_reciente, fcf_antiguo, n_años_fcf, "fcf")
         result.modelos_excluidos.append(ModeloExcluido("dcf", motivo))
     else:
-        wacc = calculate_wacc(y=y or 0.0, **wacc_inputs) if y is not None else None
+        wacc, wacc_detalle = _wacc_para_dcf(y, wacc_inputs)
         if wacc is None:
-            result.modelos_excluidos.append(ModeloExcluido("dcf", "wacc_no_calculable"))
+            result.modelos_excluidos.append(
+                ModeloExcluido("dcf", "wacc_no_calculable", wacc_detalle)
+            )
         else:
             dcf = calculate_dcf_fair_value(
                 fcf_historial=fcf_historial,
@@ -594,7 +668,7 @@ class ScenarioValuationResult:
             "valor_justo_dcf": self.valor_justo_dcf,
             "valor_justo_total": self.valor_justo_total,
             "modelos_excluidos": [
-                {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos
+                _excluido_dict(m) for m in self.modelos_excluidos
             ],
             "graham_g_original": self.graham_g_original,     # NUEVO
             "graham_g_aplicado": self.graham_g_aplicado,     # NUEVO
@@ -621,7 +695,7 @@ class ValuationScenarios:
             "conservador": self.conservador.as_dict(),
             "optimista": self.optimista.as_dict(),
             "modelos_excluidos_base": [
-                {"modelo": m.modelo, "motivo": m.motivo} for m in self.modelos_excluidos_base
+                _excluido_dict(m) for m in self.modelos_excluidos_base
             ],
         }
 
@@ -682,7 +756,9 @@ def compute_valuation_scenarios(
 
     # --- Nivel 1: Múltiplos ---
     if eps_no_positivo:
-        nivel1_multiplos = ModeloExcluido("multiplos", "eps_ttm_no_positivo")
+        nivel1_multiplos = ModeloExcluido(
+            "multiplos", "eps_ttm_no_positivo", _detalle_eps(eps_ttm)
+        )
     elif peer_average.per_promedio is None:
         nivel1_multiplos = ModeloExcluido("multiplos", "per_peers_no_disponible")
     elif len(peer_average.peers_usados) < MIN_PEERS_VALIDOS_PARA_MULTIPLOS:
@@ -701,7 +777,9 @@ def compute_valuation_scenarios(
     g_eps = calculate_cagr(eps_reciente, eps_antiguo, n_años_eps)
 
     if eps_no_positivo:
-        nivel1_graham = ModeloExcluido("graham", "eps_ttm_no_positivo")
+        nivel1_graham = ModeloExcluido(
+            "graham", "eps_ttm_no_positivo", _detalle_eps(eps_ttm)
+        )
     elif g_eps is None:
         motivo = _motivo_cagr_invalido(eps_reciente, eps_antiguo, n_años_eps, "eps")
         nivel1_graham = ModeloExcluido("graham", motivo)
@@ -716,13 +794,13 @@ def compute_valuation_scenarios(
     fcf_antiguo = fcf_historial[0] if fcf_historial else None
     fcf_reciente = fcf_historial[-1] if fcf_historial else None
     g_fcf = calculate_cagr(fcf_reciente, fcf_antiguo, n_años_fcf)
-    wacc_conservador = calculate_wacc(y=y or 0.0, **wacc_inputs) if y is not None else None
+    wacc_conservador, wacc_detalle = _wacc_para_dcf(y, wacc_inputs)
 
     if g_fcf is None:
         motivo = _motivo_cagr_invalido(fcf_reciente, fcf_antiguo, n_años_fcf, "fcf")
         nivel1_dcf = ModeloExcluido("dcf", motivo)
     elif wacc_conservador is None:
-        nivel1_dcf = ModeloExcluido("dcf", "wacc_no_calculable")
+        nivel1_dcf = ModeloExcluido("dcf", "wacc_no_calculable", wacc_detalle)
     else:
         nivel1_dcf = None
     dcf_valido = nivel1_dcf is None

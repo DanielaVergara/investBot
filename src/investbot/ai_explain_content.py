@@ -1016,3 +1016,53 @@ def category_of(kind: str, code: str) -> Optional[str]:
     código de categoría correspondiente en caso contrario."""
     index = _CATEGORY_OF_TEXTO_LIBRE if kind == "texto_libre" else _CATEGORY_OF_AVANZADO
     return index.get(code)
+
+
+# --- SDD_motivos_nd_y_empresas_en_perdidas.md (15.5) -- mensaje determinístico
+# cuando el valor consultado es N/D en el escenario elegido. Tablas puras, SIN
+# lógica: NO se agregan a `SECTION_LABELS` (ese enum alimenta `_ALL_LABELS` y el
+# normalizador de Gemini; este mensaje no pasa por Gemini). Textos sin
+# `*`, `_`, backtick, `[`, `]` ni dígitos. `ND_SIN_MOTIVO` duplica como texto
+# `summary.MOTIVO_GENERICO` (un test fija la igualdad, M-20); sin punto final
+# (el compositor agrega el ".").
+
+ND_TITULO: dict[str, str] = {
+    "vf": "No se pudo calcular el Valor Justo Total",
+    "ver": "No hay veredicto de barata o cara",
+    "gra": "Graham no pudo calcular un valor",
+    "dcf": "DCF no pudo calcular un valor",
+    "mul": "Múltiplos no pudo calcular un valor",
+}
+
+ND_AVISO: dict[str, str] = {
+    "vf": (
+        "Con los datos de hoy, ninguno de los modelos del bot (Múltiplos, Graham y DCF) "
+        "pudo dar un valor para esta empresa, así que no hay un Valor Justo para explicar. "
+        "Eso no quiere decir que la empresa sea buena o mala: solo que estos modelos "
+        "necesitan datos que hoy faltan o no aplican. Abajo ves qué le falta a cada uno."
+    ),
+    "ver": (
+        "El veredicto compara el precio de hoy con el Valor Justo Total, y ese valor no se "
+        "pudo calcular con ningún modelo. Sin esa referencia el bot no puede decirte si está "
+        "barata o cara. Eso no dice nada sobre la empresa: solo que falta con qué comparar."
+    ),
+    "gra": (
+        "El modelo de Graham no dio un valor para este escenario, así que no hay un resultado "
+        "para explicar. Eso no quiere decir que la empresa sea buena o mala: solo que este "
+        "modelo no aplica o le faltan datos."
+    ),
+    "dcf": (
+        "El modelo DCF (flujo de caja descontado) no dio un valor para este escenario, así que "
+        "no hay un resultado para explicar. Eso no quiere decir que la empresa sea buena o "
+        "mala: solo que este modelo no aplica o le faltan datos."
+    ),
+    "mul": (
+        "El modelo de Múltiplos no dio un valor para este escenario, así que no hay un "
+        "resultado para explicar. Eso no quiere decir que la empresa sea buena o mala: solo "
+        "que este modelo no aplica o le faltan datos."
+    ),
+}
+
+ND_ENCABEZADO_POR_QUE = "🔎 Por qué:"
+
+ND_SIN_MOTIVO = "no pude identificar el motivo exacto con los datos de esta consulta"

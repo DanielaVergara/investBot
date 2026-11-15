@@ -390,7 +390,7 @@ def _validated_perfil(perfil) -> str:
 # (Bug 2 de producción, extendido — Decisión de diseño #11) -----------------
 
 _TOTAL_MODELOS_AVANZADO = 5
-_MODELO_VF = "Graham (EPS) + DCF (flujo de caja descontado)"
+_MODELO_VF = "Múltiplos + Graham (EPS) + DCF (flujo de caja descontado)"
 _MODELO_PIL = "los 4 pilares de calidad fundamental"
 _MODELO_VER = f"{_MODELO_VF} + {_MODELO_PIL}"
 _MODELO_PIO = "Piotroski F-Score"
@@ -875,7 +875,18 @@ def _build_ver_dato_content(context: ExplanationContext, question_code: str) -> 
     dato_line = _build_dato_line(context.kind, question_code, datos)
     formula = ai_explain_content.formulas(context.kind).get(question_code)
     fuente = ai_explain_content.fuentes(context.kind).get(question_code)
-    partes = [DETERMINISTIC_PREFIX, f"📌 Dato: {dato_line}"]
+    # SDD_motivos_nd (CA-ND-15/CS-ND-18): si el valor consultado es N/D y hay
+    # motivo conocido, línea `Por qué: …` tras `📌 Dato:`. Hostil -> se omite.
+    por_que = None
+    try:
+        if _nd_aplica(context, question_code):
+            por_que = _build_nd_por_que(context, question_code)
+    except Exception:  # noqa: BLE001 -- datos hostiles: idéntico a HEAD
+        por_que = None
+    dato_bloque = f"📌 Dato: {dato_line}"
+    if por_que:
+        dato_bloque += f"\nPor qué: {por_que}."
+    partes = [DETERMINISTIC_PREFIX, dato_bloque]
     formula_fuente_lines = []
     if formula:
         formula_fuente_lines.append(f"📐 Fórmula: {formula}")
@@ -1377,7 +1388,57 @@ def _valor_desglose_vf_de_datos(letra: str, datos_vf: dict) -> Optional[str]:
     return _money(v) if v is not None else None
 
 
-def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optional[str]:
+# SDD_motivos_nd_y_empresas_en_perdidas.md (15.3-c) -- sub-modelo de `vf` ->
+# clave `modelo` de `modelos_excluidos` (valuation.py).
+_VF_MODELO_EXCLUIDO_KEY = {"mul": "multiplos", "gra": "graham", "dcf": "dcf"}
+
+
+def _escenario_elegido(context: "ExplanationContext") -> Optional[dict]:
+    """Escenario elegido (`scenarios[escenario_elegido]`) o `None` si no hay
+    un dict utilizable. Helper puro, SIN I/O, NUNCA lanza ante datos hostiles
+    (`scenarios` no dict, `escenario_elegido` None o no hashable, escenario
+    no dict): en esos casos devuelve `None`. Nunca asume 'conservador'."""
+    scenarios = context.scenarios
+    if not isinstance(scenarios, dict):
+        return None
+    try:
+        esc = scenarios.get(context.escenario_elegido)
+    except TypeError:  # escenario_elegido no hashable
+        return None
+    return esc if isinstance(esc, dict) else None
+
+
+def _motivo_modelo(esc: Optional[dict], modelo_key: str) -> Optional[str]:
+    """Texto del motivo (`summary.motivo_texto`) de la PRIMERA entrada del
+    modelo `modelo_key` en `esc['modelos_excluidos']`; `None` si `esc` no es
+    dict, la lista falta o no es lista, no hay entrada o el motivo no se
+    conoce. Lee SOLO del escenario elegido (nunca `modelos_excluidos_base`,
+    nunca `datos`/payloads: CS-26). Nunca lanza, nunca devuelve el valor crudo."""
+    if not isinstance(esc, dict):
+        return None
+    excluidos = esc.get("modelos_excluidos")
+    if not isinstance(excluidos, list):
+        return None
+    for item in excluidos:
+        if isinstance(item, dict) and item.get("modelo") == modelo_key:
+            return summary.motivo_texto(item.get("motivo"), item.get("detalle"))
+    return None
+
+
+def _motivo_vf_sin_valor(esc: Optional[dict], letra: str, code: str, datos_vf: dict) -> Optional[str]:
+    """Motivo de un sub-modelo de `vf` SOLO si su valor es N/D en `datos_vf`
+    (con valor presente NUNCA hay Motivo). Cualquier excepción -> sin motivo."""
+    try:
+        if _valor_desglose_vf_de_datos(letra, datos_vf) is not None:
+            return None
+        return _motivo_modelo(esc, _VF_MODELO_EXCLUIDO_KEY[code])
+    except Exception:  # noqa: BLE001 -- datos hostiles: el bloque queda como el de HEAD
+        return None
+
+
+def _build_desglose_vf_partes(
+    context: "ExplanationContext", datos_vf: dict,
+) -> tuple[Optional[str], bool]:
     """Caso especial de "vf" (SDD_desglose_valor_justo_total.md [Iter-2]): a
     diferencia del resto de las preguntas con Desglose (Altman/Piotroski/
     Magic Formula), acá cada término necesita su propia cuenta resuelta
@@ -1390,11 +1451,24 @@ def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optiona
     NUNCA se mezcla con `datos_del_contexto` (el que ve Gemini para "vf") --
     se descarta apenas se usa para armar el texto del Desglose, que se
     inserta DESPUÉS de la respuesta de Gemini, igual que el resto del
-    mecanismo."""
+    mecanismo.
+
+    SDD_motivos_nd (15.3-c): por sub-modelo con valor N/D y motivo conocido
+    (leído de `context.scenarios[escenario_elegido]['modelos_excluidos']`) se
+    agrega ` Motivo: {texto}.` al final de la línea genérica, o
+    `\n  Motivo: {texto}.` tras la Cuenta. Si el bloque con motivos supera
+    `_MAX_DESGLOSE_CHARS` se reconstruye SIN motivos (idéntico a HEAD) y
+    recién entonces se aplica `_enforce_desglose_length` (nunca se oculta un
+    bloque que HEAD mostraría). Devuelve `(bloque, con_motivos)`:
+    `con_motivos` es True solo si al menos una línea llevó Motivo y el bloque
+    no se degradó."""
     terminos = ai_explain_content.desglose("texto_libre", "vf")
     if not terminos:
-        return None
-    lineas = []
+        return None, False
+    esc = _escenario_elegido(context)
+    lineas_base = []
+    lineas_motivo = []
+    hay_motivo = False
     for t in terminos:
         code = _VF_SUB_MODELO_CODE[t.letra]
         try:
@@ -1402,16 +1476,132 @@ def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optiona
             cuenta_sub = _VF_SUB_MODELO_CUENTA[code](datos_sub)
         except Exception:  # noqa: BLE001 -- misma red de seguridad que _build_cuenta_line
             cuenta_sub = None
+        motivo = _motivo_vf_sin_valor(esc, t.letra, code, datos_vf)
+        sufijo = ""
         if cuenta_sub is None:
-            lineas.append(f"• {t.nombre} — no calculable con los datos disponibles.")
-            continue
-        valor = _valor_desglose_vf_de_datos(t.letra, datos_vf)
-        prefijo_valor = f" ({valor})" if valor else ""
-        lineas.append(
-            f"• {t.nombre}{prefijo_valor} — {t.que_mide}.\n  Cuenta: {cuenta_sub}"
-        )
-    bloque = "🔍 Desglose:\n" + "\n".join(lineas)
-    return _enforce_desglose_length(bloque)
+            linea = f"• {t.nombre} — no calculable con los datos disponibles."
+            if motivo:
+                sufijo = f" Motivo: {motivo}."
+        else:
+            valor = _valor_desglose_vf_de_datos(t.letra, datos_vf)
+            prefijo_valor = f" ({valor})" if valor else ""
+            linea = f"• {t.nombre}{prefijo_valor} — {t.que_mide}.\n  Cuenta: {cuenta_sub}"
+            if motivo:
+                sufijo = f"\n  Motivo: {motivo}."
+        lineas_base.append(linea)
+        lineas_motivo.append(linea + sufijo)
+        hay_motivo = hay_motivo or bool(sufijo)
+    if hay_motivo:
+        con_motivos = "🔍 Desglose:\n" + "\n".join(lineas_motivo)
+        if len(con_motivos) <= _MAX_DESGLOSE_CHARS:
+            return con_motivos, True
+    bloque = "🔍 Desglose:\n" + "\n".join(lineas_base)
+    return _enforce_desglose_length(bloque), False
+
+
+def _build_desglose_vf(context: "ExplanationContext", datos_vf: dict) -> Optional[str]:
+    """Firma y valor de siempre: solo el bloque de `_build_desglose_vf_partes`."""
+    return _build_desglose_vf_partes(context, datos_vf)[0]
+
+
+# --- Mensaje N/D (SDD_motivos_nd_y_empresas_en_perdidas.md, F4a) -- helpers
+# PUROS, sin I/O y SIN cablear al handler (F4b). Los motivos se leen SOLO de
+# `context.scenarios` (CS-26: ni `datos_del_contexto` ni `_present_payload` ni
+# ningún payload a Gemini ven `modelos_excluidos`/`detalle`).
+
+# código de pregunta -> clave del valor consultado en el escenario elegido.
+_ND_CLAVE_POR_CODIGO = {
+    "vf": "valor_justo_total",
+    "ver": "valor_justo_total",
+    "gra": "valor_justo_graham",
+    "dcf": "valor_justo_dcf",
+    "mul": "valor_justo_multiplos",
+}
+# código de pregunta de un único modelo -> clave `modelo` de `modelos_excluidos`.
+_ND_MODELO_POR_CODIGO = {"gra": "graham", "dcf": "dcf", "mul": "multiplos"}
+
+
+def _nd_aplica(context: "ExplanationContext", code: str) -> bool:
+    """True solo si `code` está en {vf, ver, gra, dcf, mul}, el contexto es
+    `texto_libre`, la clave del valor consultado EXISTE en el escenario elegido
+    y es `None` (0 != None; escenarios parciales sin la clave -> False).
+    Helper puro: nunca lanza ante `scenarios`/`escenario_elegido` hostiles
+    (`_escenario_elegido` los absorbe) ni ante un `code` no hashable. Solo
+    podría lanzar si `context` no fuera un `ExplanationContext` (acceso a
+    atributo); el handler de F4b lo llama dentro del `try/except` de S-1."""
+    clave = _ND_CLAVE_POR_CODIGO.get(code) if isinstance(code, str) else None
+    if clave is None or context.kind != "texto_libre":
+        return False
+    esc = _escenario_elegido(context)
+    return esc is not None and clave in esc and esc[clave] is None
+
+
+def _build_nd_por_que(context: "ExplanationContext", code: str) -> Optional[str]:
+    """Texto (sin punto final) de por qué el valor consultado es N/D: `vf` y
+    `ver` -> `summary.build_motivos_resumen` de los excluidos del escenario
+    elegido; `gra`/`dcf`/`mul` -> motivo de su único modelo. `None` si no hay
+    motivo conocido (nunca la clave cruda). Nunca lanza ante datos hostiles."""
+    esc = _escenario_elegido(context)
+    if code in ("vf", "ver"):
+        return summary.build_motivos_resumen((esc or {}).get("modelos_excluidos"))
+    modelo = _ND_MODELO_POR_CODIGO.get(code)
+    if modelo is None:
+        return None
+    return _motivo_modelo(esc, modelo)
+
+
+def _build_nd_message(context: "ExplanationContext", code: str) -> Optional[str]:
+    """Mensaje determinístico cuando el valor consultado es N/D (opción A, sin
+    Gemini). Layout: `DETERMINISTIC_PREFIX`, `📌 Dato`, `⚠️ título` + aviso,
+    (vf: `🔍 Desglose` con motivos, o `🔎 Por qué`; resto: `🔎 Por qué`),
+    gráfico (solo gra/dcf/mul, si existe), `📐 Fórmula` y `📊 Fuente del dato`.
+    SIN parse_mode, SIN '🤖 Con ayuda de Gemini', SIN TRANSPARENCY_USED; no
+    interpola ticker ni company_name. Poda por `_len16 <= _TELEGRAM_LIMIT -
+    _MARGEN_TELEGRAM`: primero el gráfico, luego el Desglose (entonces `Por
+    qué` con el resumen), luego el `Por qué`; el aviso NUNCA se omite. Solo una
+    excepción devuelve `None` (el handler de F4b no cae a Gemini por eso)."""
+    try:
+        datos = _build_explain_payload(context, code)
+        dato_line = _build_dato_line(context.kind, code, datos)
+        formula = ai_explain_content.formulas(context.kind).get(code)
+        fuente = ai_explain_content.fuentes(context.kind).get(code)
+        aviso = f"⚠️ {ai_explain_content.ND_TITULO[code]}\n{ai_explain_content.ND_AVISO[code]}"
+        por_que = _build_nd_por_que(context, code) or ai_explain_content.ND_SIN_MOTIVO
+        por_que_linea = f"{ai_explain_content.ND_ENCABEZADO_POR_QUE} {por_que}."
+        desglose, con_motivos = (None, False)
+        if code == "vf":
+            desglose, con_motivos = _build_desglose_vf_partes(context, datos)
+        grafico = None
+        if code in _ND_MODELO_POR_CODIGO:
+            grafico = _GRAFICO_POR_PREGUNTA[code](datos)
+        formula_fuente = []
+        if formula:
+            formula_fuente.append(f"📐 Fórmula: {formula}")
+        if fuente:
+            formula_fuente.append(f"📊 Fuente del dato: {fuente}")
+
+        def armar(g: Optional[str], d: Optional[str], pq: Optional[str]) -> str:
+            partes = [DETERMINISTIC_PREFIX, f"📌 Dato: {dato_line}", aviso]
+            partes.extend(x for x in (d, pq, g) if x)
+            if formula_fuente:
+                partes.append("\n".join(formula_fuente))
+            return "\n\n".join(partes)
+
+        limite = _TELEGRAM_LIMIT - _MARGEN_TELEGRAM
+        # (gráfico, desglose, por qué) de más a menos contenido.
+        pq_base = None if (desglose and con_motivos) else por_que_linea
+        for g, d, pq in (
+            (grafico, desglose, pq_base),
+            (None, desglose, pq_base),
+            (None, None, por_que_linea),
+        ):
+            texto = armar(g, d, pq)
+            if _len16(texto) <= limite:
+                return texto
+        return armar(None, None, None)
+    except Exception as exc:  # noqa: BLE001 -- nunca sin respuesta: el handler decide
+        logger.warning("EXPLAIN_ND_MENSAJE_FALLO tipo=%s", type(exc).__name__)
+        return None
 
 
 def _cuenta_ver(datos: dict) -> Optional[str]:
@@ -2946,6 +3136,27 @@ async def _dispatch_leaf(
         texto = _build_ver_dato_content(stored, question_code)
         await bot.send_message(chat_id=chat_id, text=texto, reply_markup=reply_markup)
         return
+
+    if (spec.variant == ai_explain_content.VARIANT_DATO_Y_PASO_A_PASO
+            and paso_a_paso and stored.kind == "texto_libre"):
+        # SDD_motivos_nd (opción A, S-1): cuando el valor consultado es N/D NO se
+        # llama a Gemini ni se consume el balde; `stored` ya pasó por
+        # `_get_owned_context` (IDOR/expiración) y por la rama "Ver dato".
+        texto = None
+        try:
+            if _nd_aplica(stored, question_code):
+                texto = _build_nd_message(stored, question_code)
+        except Exception as exc:  # noqa: BLE001 -- datos hostiles: nunca sin respuesta
+            logger.warning("EXPLAIN_ND_FALLO code=%s tipo=%s",
+                           _sanitize_for_log(question_code), type(exc).__name__)
+            texto = None   # sin exc_info ni str(exc): no volcar datos al log
+        if texto is not None:
+            logger.info("EXPLAIN_ND_DETERMINISTICO code=%s", _sanitize_for_log(question_code))
+            try:
+                await bot.send_message(chat_id=chat_id, text=texto, reply_markup=reply_markup)
+            except TelegramError:
+                logger.warning("EXPLAIN_ND_ENTREGA_FALLIDA code=%s", _sanitize_for_log(question_code))
+            return   # NUNCA cae a Gemini tras haber construido el texto
 
     # A partir de acá: `narrativa` (mod/ben/ren, sin cambios), o
     # `dato_y_paso_a_paso` con `paso_a_paso=True` ("Explicame paso a paso")

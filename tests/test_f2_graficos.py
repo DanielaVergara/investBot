@@ -159,9 +159,9 @@ async def test_ca87_mensaje_final_identico_al_de_una_version_sin_grafico(monkeyp
     ctx = _texto_libre_context(scenarios=escenarios, precio_actual=550.0)
     assert ai_explain._build_grafico_vf({**ai_explain._build_explain_payload(ctx, "vf")}) is None
     respuesta = "💡 En simple\nNo hay datos suficientes para comparar los modelos entre sí."
-    con = _texto_final(await _correr_boton("vf", respuesta, ctx=ctx))
+    con = (await _correr_boton("vf", respuesta, ctx=ctx)).send_message.call_args.kwargs["text"]
     monkeypatch.setitem(ai_explain._GRAFICO_POR_PREGUNTA, "vf", lambda datos: None)
-    sin = _texto_final(await _correr_boton("vf", respuesta, ctx=ctx))
+    sin = (await _correr_boton("vf", respuesta, ctx=ctx)).send_message.call_args.kwargs["text"]
     assert con == sin
     assert "📊 Valor justo vs precio" not in con and _LLENO not in con
 
